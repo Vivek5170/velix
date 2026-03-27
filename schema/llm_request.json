@@ -1,0 +1,16 @@
+{
+  "request_id": "UUID-12345",
+  "priority": 1,
+  "inherit_key": null,
+  "messages": [
+    {"role": "system", "content": "Context from soul.md + user.md"},
+    {"role": "user", "content": "Past conversation fragment 1"},
+    {"role": "assistant", "content": "Past AI response"},
+    {"role": "user", "content": "Current message from Telegram"}
+  ],
+  "sampling_params": {
+    "temp": 0.7,
+    "top_p": 0.9,
+    "max_tokens": 512
+  }
+}

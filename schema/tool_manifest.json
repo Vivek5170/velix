@@ -1,0 +1,12 @@
+{
+  "name": "web_search",
+  "type": "skill|agent",
+  "description": "Searches the web for current info.",
+  "params": ["query"],
+  "exec_win": "python search.py",
+  "exec_linux": "python3 search.py",
+  "exec_mac": "python3 search.py",
+  "timeout_ms": 30000, 
+  "requires": []
+}
+  
