@@ -1,12 +1,14 @@
 {
   "name": "web_search",
-  "type": "skill|agent",
+  "type": "skill",
   "description": "Searches the web for current info.",
   "params": ["query"],
+  "entry": "search.py",
+  "language": "python",
   "exec_win": "python search.py",
   "exec_linux": "python3 search.py",
   "exec_mac": "python3 search.py",
-  "timeout_ms": 30000, 
-  "requires": []
+  "timeout_ms": 30000,
+  "requires": [],
+  "version": "1.0.0"
 }
-  

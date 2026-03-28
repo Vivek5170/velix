@@ -1,0 +1,13 @@
+{
+  "heartbeat_timeout_sec": 15,
+  "watchdog_interval_ms": 1000,
+  "require_auth_token": false,
+  "auth_token": "",
+  "exempt_system_tree_limits": true,
+  "limits": {
+    "max_processes_per_tree": 64,
+    "max_tree_runtime_sec": 3600,
+    "max_memory_per_tree_mb": 2048,
+    "max_llm_requests_per_tree": 1000
+  }
+}

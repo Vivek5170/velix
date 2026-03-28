@@ -1,0 +1,10 @@
+{
+  "message_type": "REGISTER_PID",
+  "tree_id": "TREE_01",
+  "pid": 1001,
+  "parent_pid": 0,
+  "source_module": "handler",
+  "target_module": "supervisor",
+  "payload": {},
+  "timestamp": "2026-03-28T12:00:00Z"
+}

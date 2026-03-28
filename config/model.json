@@ -3,8 +3,8 @@
 	"adapters": {
 		"llama.cpp": {
 			"api_style": "openai-chat-completions",
-			"base_url": "http://127.0.0.1:8080/v1",
-			"model": "local-model",
+			"base_url": "http://127.0.0.1:8033/v1",
+			"model": "qwen3.5:4b",
 			"api_key_env": null,
 			"stop_tokens": ["END_EXEC"]
 		},
@@ -21,6 +21,6 @@
 	"default_sampling_params": {
 		"temp": 0.7,
 		"top_p": 0.9,
-		"max_tokens": 512
+		"max_tokens": 4196
 	}
 }

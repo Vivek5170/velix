@@ -1,0 +1,12 @@
+{
+  "message_type": "EXEC_RESULT",
+  "tree_id": "TREE_02",
+  "pid": 1042,
+  "parent_pid": 1001,
+  "request_id": "UUID-12345",
+  "request_origin": "scheduler",
+  "status": "ok",
+  "result": {},
+  "error": null,
+  "timestamp": "2026-03-28T12:00:00Z"
+}

@@ -1,0 +1,37 @@
+[
+  {
+    "content": "You are an AI assistant with the following personality: [soul.md content]. User facts: [user.md content]",
+    "role": "system",
+    "timestamp": "2026-03-27T10:30:00Z"
+  },
+  {
+    "content": "What's the weather like today?",
+    "role": "user",
+    "timestamp": "2026-03-27T10:31:15Z"
+  },
+  {
+    "content": "I can help you check the weather. Let me search for current conditions.",
+    "role": "assistant",
+    "timestamp": "2026-03-27T10:31:30Z"
+  },
+  {
+    "content": "Weather for today: Sunny, 22°C, Wind 5mph",
+    "role": "tool",
+    "timestamp": "2026-03-27T10:31:45Z"
+  },
+  {
+    "content": "It looks like it will be a beautiful day! Expect sunny skies with temperatures around 22°C and light winds.",
+    "role": "assistant",
+    "timestamp": "2026-03-27T10:32:00Z"
+  },
+  {
+    "content": "Say hello in one short sentence.",
+    "role": "user",
+    "timestamp": "2026-03-28T05:43:29Z"
+  },
+  {
+    "content": "Hello there!",
+    "role": "assistant",
+    "timestamp": "2026-03-28T05:43:30Z"
+  }
+]

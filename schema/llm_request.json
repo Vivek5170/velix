@@ -1,16 +1,24 @@
 {
+  "message_type": "LLM_REQUEST",
   "request_id": "UUID-12345",
+  "tree_id": "TREE_01",
+  "source_pid": 1001,
   "priority": 1,
   "inherit_key": null,
   "messages": [
-    {"role": "system", "content": "Context from soul.md + user.md"},
-    {"role": "user", "content": "Past conversation fragment 1"},
-    {"role": "assistant", "content": "Past AI response"},
-    {"role": "user", "content": "Current message from Telegram"}
+    { "role": "system", "content": "Context from soul.md + user.md" },
+    { "role": "user", "content": "Past conversation fragment 1" },
+    { "role": "assistant", "content": "Past AI response" },
+    { "role": "user", "content": "Current message from Telegram" }
   ],
   "sampling_params": {
     "temp": 0.7,
     "top_p": 0.9,
     "max_tokens": 512
+  },
+  "metadata": {
+    "request_origin": "handler",
+    "trace_id": "TRACE-UUID-12345",
+    "timestamp": "2026-03-28T12:00:00Z"
   }
 }
