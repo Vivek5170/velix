@@ -52,6 +52,7 @@ env/
 
 # Distribution / packaging
 build/
+.tmpbuild/
 dist/
 *.egg-info/
 

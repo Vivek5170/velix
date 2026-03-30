@@ -6,7 +6,7 @@
 			"base_url": "http://127.0.0.1:8033/v1",
 			"model": "qwen3.5:4b",
 			"api_key_env": null,
-			"stop_tokens": ["END_EXEC"]
+			"stop_tokens": []
 		},
 		"ollama": {
 			"enabled": false,
@@ -14,10 +14,13 @@
 			"base_url": "http://127.0.0.1:11434/v1",
 			"model": "llama3",
 			"api_key_env": null,
-			"stop_tokens": ["END_EXEC"]
+			"stop_tokens": []
 		}
 	},
 	"request_timeout_ms": 60000,
+	"max_llm_keys": 5,
+	"max_simultaneous_llm_requests": 5,
+	"max_exec_iterations": 8,
 	"default_sampling_params": {
 		"temp": 0.7,
 		"top_p": 0.9,

@@ -1,24 +1,71 @@
 {
-  "message_type": "LLM_REQUEST",
-  "request_id": "UUID-12345",
-  "tree_id": "TREE_01",
-  "source_pid": 1001,
-  "priority": 1,
-  "inherit_key": null,
-  "messages": [
-    { "role": "system", "content": "Context from soul.md + user.md" },
-    { "role": "user", "content": "Past conversation fragment 1" },
-    { "role": "assistant", "content": "Past AI response" },
-    { "role": "user", "content": "Current message from Telegram" }
-  ],
-  "sampling_params": {
-    "temp": 0.7,
-    "top_p": 0.9,
-    "max_tokens": 512
+  "mode": "MODE_SELECTION",
+  "mode_examples": {
+    "simple": {
+      "message_type": "LLM_REQUEST",
+      "mode": "simple",
+      "request_id": "UUID-12345",
+      "tree_id": "TREE_01",
+      "source_pid": 1001,
+      "priority": 1,
+      "messages": [
+        { "role": "system", "content": "Context from soul.md + user.md" },
+        { "role": "user", "content": "Current message from Telegram" }
+      ],
+      "sampling_params": {
+        "temp": 0.7,
+        "top_p": 0.9,
+        "max_tokens": 512
+      },
+      "metadata": {
+        "request_origin": "handler",
+        "trace_id": "TRACE-UUID-12345",
+        "timestamp": "2026-03-28T12:00:00Z"
+      }
+    },
+    "conversation_user": {
+      "message_type": "LLM_REQUEST",
+      "mode": "conversation",
+      "request_id": "UUID-12346",
+      "user_id": "alice",
+      "source_pid": 1000,
+      "tree_id": "TREE_HANDLER",
+      "priority": 1,
+      "messages": [
+        { "role": "user", "content": "Hello, I am Alice." }
+      ],
+      "metadata": {
+        "request_origin": "handler"
+      }
+    },
+    "conversation_process": {
+      "message_type": "LLM_REQUEST",
+      "mode": "conversation",
+      "request_id": "UUID-12347",
+      "convo_id": "proc_1042_987654",
+      "source_pid": 1042,
+      "tree_id": "TREE_05",
+      "priority": 1,
+      "messages": [
+        { "role": "system", "content": "Transient tool context" },
+        { "role": "user", "content": "Help me extract this JSON." }
+      ],
+      "metadata": {
+        "request_origin": "process"
+      }
+    }
   },
-  "metadata": {
-    "request_origin": "handler",
-    "trace_id": "TRACE-UUID-12345",
-    "timestamp": "2026-03-28T12:00:00Z"
+  "field_definitions": {
+    "mode": "string, required: 'simple' (abstraction, transient) or 'conversation'",
+    "convo_id": "string, optional if user_id is provided. Required for process-type conversations.",
+    "convo_type": "string, generated internally by conversation manager ('user' or 'process')",
+    "user_id": "string, required to access or create a persistent user-type conversation.",
+    "request_id": "string, unique identifier for this request",
+    "tree_id": "string, required. User conversations MUST originate from TREE_HANDLER.",
+    "source_pid": "int, process sending this request (could be child process in EXEC scenario)",
+    "priority": "int, scheduling priority.",
+    "messages": "array of {role, content} message objects. For simple mode, this is standard abstraction. For conversation mode, these are appended to history.",
+    "tool_result": "string (optional), alias for a complete 'tool' role message in conversation mode.",
+    "sampling_params": "object with temp, top_p, max_tokens (may be overridden from config)"
   }
 }

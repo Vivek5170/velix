@@ -1,6 +1,9 @@
 {
   "heartbeat_timeout_sec": 15,
   "watchdog_interval_ms": 1000,
+  "terminate_grace_ms": 1500,
+  "max_client_threads": 256,
+  "max_message_bytes": 1048576,
   "require_auth_token": false,
   "auth_token": "",
   "exempt_system_tree_limits": true,
@@ -9,5 +12,16 @@
     "max_tree_runtime_sec": 3600,
     "max_memory_per_tree_mb": 2048,
     "max_llm_requests_per_tree": 1000
+  },
+  "conversation": {
+    "enabled": true,
+    "max_active_process_convos_per_pid": 100,
+    "process_convo_ttl_sec": 86400
+  },
+  "handler": {
+    "binary": "./handler",
+    "args": [],
+    "auto_restart": true,
+    "restart_delay_ms": 2000
   }
 }

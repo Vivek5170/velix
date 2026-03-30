@@ -33,5 +33,13 @@
     "content": "Hello there!",
     "role": "assistant",
     "timestamp": "2026-03-28T05:43:30Z"
+  },
+  {
+    "content": "E2E_SIMPLE_1774765987_hello",
+    "role": "user"
+  },
+  {
+    "content": "Hello! How can I assist you today?",
+    "role": "assistant"
   }
 ]

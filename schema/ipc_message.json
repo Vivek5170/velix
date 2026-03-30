@@ -1,10 +1,69 @@
 {
-  "message_type": "REGISTER_PID",
-  "tree_id": "TREE_01",
-  "pid": 1001,
-  "parent_pid": 0,
-  "source_module": "handler",
-  "target_module": "supervisor",
-  "payload": {},
-  "timestamp": "2026-03-28T12:00:00Z"
+  "register_pid_examples": {
+    "handler_registration": {
+      "message_type": "REGISTER_PID",
+      "source_pid": -1,
+      "payload": {
+        "register_intent": "NEW_TREE",
+        "role": "handler",
+        "status": "STARTING",
+        "os_pid": 1024,
+        "control_host": "127.0.0.1",
+        "control_port": 6200
+      }
+    },
+    "child_process": {
+      "message_type": "REGISTER_PID",
+      "source_pid": 1000,
+      "payload": {
+        "register_intent": "JOIN_PARENT_TREE",
+        "role": "skill",
+        "status": "STARTING",
+        "os_pid": 43210,
+        "control_host": "127.0.0.1",
+        "control_port": 6201
+      }
+    }
+  },
+
+  "heartbeat_example": {
+    "message_type": "HEARTBEAT",
+    "pid": 1042,
+    "payload": {
+      "status": "RUNNING",
+      "memory_mb": 45.2
+    }
+  },
+
+  "supervisor_llm_verification": {
+    "message_type": "LLM_REQUEST",
+    "request_id": "UUID-12345",
+    "tree_id": "TREE_HANDLER",
+    "source_pid": 1042,
+    "priority": 1,
+    "convo_id": "user_alice",
+    "convo_type": "user",
+    "user_id": "alice"
+  },
+
+  "process_terminate_example": {
+    "message_type": "PROCESS_TERMINATE",
+    "pid": 1042,
+    "reason": "watchdog_timeout"
+  },
+
+  "tree_kill_example": {
+    "message_type": "TREE_KILL",
+    "source_pid": 1000,
+    "payload": {
+      "tree_id": "TREE_05"
+    }
+  },
+
+  "tree_status_example": {
+    "message_type": "TREE_STATUS",
+    "payload": {
+      "tree_id": "TREE_HANDLER"
+    }
+  }
 }

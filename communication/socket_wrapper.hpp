@@ -346,6 +346,21 @@ namespace velix::communication
             return socket_handle != INVALID_SOCKET_HANDLE;
         }
 
+        bool has_data(int timeout_ms = 0) const
+        {
+            if (socket_handle == INVALID_SOCKET_HANDLE) return false;
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(socket_handle, &read_fds);
+
+            struct timeval tv;
+            tv.tv_sec = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+            int result = select(static_cast<int>(socket_handle) + 1, &read_fds, nullptr, nullptr, &tv);
+            return result > 0;
+        }
+
         SocketHandle get_handle() const
         {
             return socket_handle;
