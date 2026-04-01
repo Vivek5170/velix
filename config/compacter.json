@@ -5,7 +5,6 @@
   "summary_max_tokens": 300,
   "summary_temp": 0.2,
   "summary_top_p": 0.9,
-  "summary_priority": 2147483647,
   "scheduler_timeout_ms": 30000,
   "summary_tree_id": "TREE_HANDLER",
   "summary_source_pid": -2,

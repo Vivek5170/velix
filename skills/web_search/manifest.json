@@ -1,0 +1,23 @@
+{
+  "name": "web_search",
+  "type": "skill",
+  "description": "Search official web sources (Wikipedia and Crossref) and return cited results.",
+  "runtime": "python",
+  "entry": "skills/web_search/main.py",
+  "workdir": "../../",
+  "prepare": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Search query text"
+      },
+      "max_results": {
+        "type": "number",
+        "description": "Maximum number of results per source (1-8)"
+      }
+    },
+    "required": ["query"]
+  }
+}

@@ -53,8 +53,10 @@ env/
 # Distribution / packaging
 build/
 .tmpbuild/
+tests/
 dist/
 *.egg-info/
+.velix/
 
 # Logs
 *.log
@@ -72,3 +74,6 @@ Thumbs.db
 
 # Environment variables
 .env
+
+memory/conversations/
+memory/daily-summaries/

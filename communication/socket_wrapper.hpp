@@ -294,8 +294,14 @@ namespace velix::communication
                 throw SocketException("Send failed: " + get_socket_error());
             }
 #else
-            // Fix Issue #4: Use MSG_NOSIGNAL to prevent SIGPIPE on closed sockets
-            int result = ::send(socket_handle, data, len, MSG_NOSIGNAL);
+            // Use MSG_NOSIGNAL when available (Linux). On platforms where it
+            // is unavailable (e.g., macOS/BSD), SIGPIPE is already disabled by
+            // init_winsock_global() via signal(SIGPIPE, SIG_IGN).
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            flags = MSG_NOSIGNAL;
+#endif
+            int result = ::send(socket_handle, data, len, flags);
             if (result == -1)
             {
                 throw SocketException("Send failed: " + get_socket_error());

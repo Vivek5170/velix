@@ -7,6 +7,7 @@
 #include <queue>
 #include <thread>
 #include <vector>
+#include "logger.hpp"
 
 namespace velix {
 namespace utils {
@@ -76,7 +77,16 @@ private:
         tasks_.pop();
         --pending_count_;
       }
-      task();
+      
+      try {
+        if (task) {
+          task();
+        }
+      } catch (const std::exception& e) {
+        LOG_ERROR("ThreadPool worker caught exception: " + std::string(e.what()));
+      } catch (...) {
+        LOG_ERROR("ThreadPool worker caught unknown exception.");
+      }
     }
   }
 

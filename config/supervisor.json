@@ -19,9 +19,9 @@
     "process_convo_ttl_sec": 86400
   },
   "handler": {
-    "binary": "./handler",
-    "args": [],
-    "auto_restart": true,
+    "binary": "/home/vivek/miniforge3/bin/python3",
+    "args": ["tests/integration/sdk_python_test_handler.py"],
+    "auto_restart": false,
     "restart_delay_ms": 2000
   }
 }

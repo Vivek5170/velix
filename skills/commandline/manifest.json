@@ -1,0 +1,27 @@
+{
+  "name": "commandline",
+  "type": "skill",
+  "description": "Execute system commands securely via C++ SDK",
+  "runtime": "cpp",
+  "workdir": "../../build/skills/commandline",
+  "prepare": [],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "cmd": {
+        "type": "string",
+        "description": "The base command to execute (e.g., 'ls', 'echo')"
+      },
+      "args": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "List of arguments for the command"
+      }
+    },
+    "required": ["cmd"]
+  },
+  "run": {
+    "command": "./main",
+    "args": []
+  }
+}

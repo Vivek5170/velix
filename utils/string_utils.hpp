@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <random>
 
 namespace velix::utils {
 
@@ -101,6 +102,24 @@ inline bool ends_with(const std::string& s, const std::string& suffix) {
 
 inline bool contains(const std::string& s, const std::string& needle) {
     return s.find(needle) != std::string::npos;
+}
+
+/**
+ * Generates a simple 32-character random hex UUID string.
+ * Strictly 0-dependency (only uses standard random library).
+ */
+inline std::string generate_uuid() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, 15);
+    static const char* chars = "0123456789abcdef";
+    
+    std::string res;
+    res.reserve(32);
+    for (int i = 0; i < 32; ++i) {
+        res += chars[dis(gen)];
+    }
+    return res;
 }
 
 } // namespace velix::utils

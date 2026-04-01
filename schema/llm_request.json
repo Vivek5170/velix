@@ -17,9 +17,9 @@
         "top_p": 0.9,
         "max_tokens": 512
       },
+      "trace_id": "TRACE-UUID-12345",
       "metadata": {
         "request_origin": "handler",
-        "trace_id": "TRACE-UUID-12345",
         "timestamp": "2026-03-28T12:00:00Z"
       }
     },
@@ -27,6 +27,7 @@
       "message_type": "LLM_REQUEST",
       "mode": "conversation",
       "request_id": "UUID-12346",
+      "trace_id": "TRACE-UUID-12346",
       "user_id": "alice",
       "source_pid": 1000,
       "tree_id": "TREE_HANDLER",
@@ -42,6 +43,7 @@
       "message_type": "LLM_REQUEST",
       "mode": "conversation",
       "request_id": "UUID-12347",
+      "trace_id": "TRACE-UUID-12347",
       "convo_id": "proc_1042_987654",
       "source_pid": 1042,
       "tree_id": "TREE_05",
@@ -61,6 +63,7 @@
     "convo_type": "string, generated internally by conversation manager ('user' or 'process')",
     "user_id": "string, required to access or create a persistent user-type conversation.",
     "request_id": "string, unique identifier for this request",
+    "trace_id": "string, required. Unique ID for this specific network request turn; used for cancellation tracking by the Scheduler.",
     "tree_id": "string, required. User conversations MUST originate from TREE_HANDLER.",
     "source_pid": "int, process sending this request (could be child process in EXEC scenario)",
     "priority": "int, scheduling priority.",

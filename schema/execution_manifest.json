@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Velix Execution Manifest",
+  "type": "object",
+  "required": [
+    "name",
+    "type",
+    "description",
+    "runtime",
+    "parameters"
+  ],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "type": { "type": "string", "enum": ["skill", "agent"] },
+    "description": { "type": "string", "minLength": 1 },
+    "runtime": {
+      "type": "string",
+      "enum": ["python", "node", "go", "rust", "cpp", "c++"]
+    },
+    "entry": { "type": "string", "minLength": 1 },
+    "workdir": { "type": "string" },
+    "prepare": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+          "command": { "type": "string", "minLength": 1 },
+          "args": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "timeout_ms": { "type": "integer", "minimum": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "parameters": {
+      "type": "object",
+      "required": ["type", "properties"],
+      "properties": {
+        "type": { "type": "string", "const": "object" },
+        "properties": { "type": "object" },
+        "required": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "run": {
+      "type": "object",
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "anyOf": [
+    { "required": ["run"] },
+    { "required": ["entry"] }
+  ],
+  "additionalProperties": true
+}

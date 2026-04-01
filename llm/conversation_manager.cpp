@@ -31,7 +31,14 @@ std::string generate_request_id() {
 }
 
 bool is_valid_role(const std::string& role) {
-	return role == "system" || role == "user" || role == "assistant" || role == "tool";
+	return role == "system" || role == "user" || role == "assistant" || role == "tool" || role == "agent";
+}
+
+std::string canonicalize_role(std::string role) {
+	if (role == "agent") {
+		return "assistant";
+	}
+	return role;
 }
 
 // Keep only alphanumeric chars for safe filename embedding
@@ -46,6 +53,12 @@ std::string sanitize_for_filename(const std::string& s) {
 
 long load_process_convo_ttl_ms() {
 	std::ifstream f("config/supervisor.json");
+	if (!f.is_open()) {
+		f.open("../config/supervisor.json");
+	}
+	if (!f.is_open()) {
+		f.open("build/config/supervisor.json");
+	}
 	if (!f.is_open()) {
 		return 86400L * 1000L;
 	}
@@ -155,6 +168,12 @@ std::string ConversationManager::load_text_file(const std::string& path) const {
 json ConversationManager::load_sampling_params() const {
 	json defaults = {{"temp", 0.7}, {"top_p", 0.9}, {"max_tokens", 512}};
 	std::ifstream f("config/model.json");
+	if (!f.is_open()) {
+		f.open("../config/model.json");
+	}
+	if (!f.is_open()) {
+		f.open("build/config/model.json");
+	}
 	if (!f.is_open()) {
 		return defaults;
 	}
@@ -335,13 +354,14 @@ bool ConversationManager::append_message_unlocked(Conversation& convo,
                                                    const std::string& role,
                                                    const std::string& content,
                                                    uint64_t tokens_used) {
-	if (!is_valid_role(role) || content.empty()) {
+	const std::string canonical_role = canonicalize_role(role);
+	if (!is_valid_role(canonical_role) || content.empty()) {
 		return false;
 	}
 	const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	    std::chrono::system_clock::now().time_since_epoch()).count();
 	json msg;
-	msg["role"]         = role;
+	msg["role"]         = canonical_role;
 	msg["content"]      = content;
 	msg["timestamp_ms"] = now_ms;
 	convo.messages.push_back(msg);
@@ -552,7 +572,7 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 
 	json msgs = json::array();
 	for (const auto& msg : convo.messages) {
-		const std::string role    = msg.value("role", "");
+		const std::string role    = canonicalize_role(msg.value("role", ""));
 		const std::string content = msg.value("content", "");
 		if (!is_valid_role(role) || content.empty()) { continue; }
 		msgs.push_back({{"role", role}, {"content", content}});

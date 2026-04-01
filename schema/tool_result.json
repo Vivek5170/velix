@@ -1,9 +1,10 @@
 {
   "message_type": "EXEC_RESULT",
   "tree_id": "TREE_02",
+  "trace_id": "trace-9af3c1d8e7",
   "pid": 1042,
   "parent_pid": 1001,
-  "request_id": "UUID-12345",
+  "request_id": "req-uuid-12345",
   "request_origin": "scheduler",
   "status": "ok",
   "result": {},

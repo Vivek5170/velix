@@ -1,0 +1,8 @@
+{
+  "socket_timeout_ms": 5000,
+  "max_client_threads": 32,
+  "max_queue_size": 128,
+  "prepare_timeout_ms": 300000,
+  "run_timeout_ms": 0,
+  "cache_root": ".velix/build_cache"
+}
