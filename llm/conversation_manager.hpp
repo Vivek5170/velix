@@ -73,6 +73,13 @@ public:
 	bool persist_assistant_response(const json& normalized_request,
 	                                const std::string& assistant_text);
 
+	/**
+	 * Persist an assistant turn that includes tool_calls. Content may be empty.
+	 */
+	bool persist_assistant_tool_call(const json& normalized_request,
+	                                 const std::string& assistant_text,
+	                                 const json& tool_calls);
+
 	// ── CRUD ──────────────────────────────────────────────────────────────
 
 	/**
@@ -92,7 +99,8 @@ public:
 
 	/** Append a message; persists to disk. */
 	bool append_message(const std::string& convo_id, const std::string& role,
-	                    const std::string& content, uint64_t tokens_used = 0);
+	                    const std::string& content, uint64_t tokens_used = 0,
+	                    const json& extra_fields = json::object());
 
 	/** Persist a conversation object to disk. */
 	bool persist_conversation(const Conversation& convo);
@@ -156,7 +164,8 @@ private:
 
 
 	bool append_message_unlocked(Conversation& convo, const std::string& role,
-	                             const std::string& content, uint64_t tokens_used);
+	                             const std::string& content, uint64_t tokens_used,
+	                             const json& extra_fields = json::object());
 
 	/** Lock-free variant called while convo_mutex_ is already held. */
 	Conversation get_or_create_user_convo_unlocked(const std::string& user_id);

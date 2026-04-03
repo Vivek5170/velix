@@ -116,6 +116,42 @@ inline std::string get_service_host(const std::string &name, const std::string &
  * @brief Resolve service bind host from config/config.json key BIND_HOSTS.<name>.
  * Falls back to provided value when not configured.
  */
+inline std::unordered_map<std::string, std::string> load_dotenv(const std::string &path) {
+    std::unordered_map<std::string, std::string> map;
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        return map;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        auto trimmed = line;
+        while (!trimmed.empty() && isspace(static_cast<unsigned char>(trimmed.front()))) trimmed.erase(trimmed.begin());
+        while (!trimmed.empty() && isspace(static_cast<unsigned char>(trimmed.back()))) trimmed.pop_back();
+        if (trimmed.empty() || trimmed.front() == '#') continue;
+        auto eq = trimmed.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = trimmed.substr(0, eq);
+        std::string val = trimmed.substr(eq + 1);
+        while (!key.empty() && isspace(static_cast<unsigned char>(key.back()))) key.pop_back();
+        while (!val.empty() && isspace(static_cast<unsigned char>(val.front()))) val.erase(val.begin());
+        while (!val.empty() && isspace(static_cast<unsigned char>(val.back()))) val.pop_back();
+        if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+            val = val.substr(1, val.size() - 2);
+        }
+        map[key] = val;
+    }
+    return map;
+}
+
+inline std::string get_env_value(const std::string &name, const std::unordered_map<std::string, std::string> &dot_env) {
+    if (auto it = dot_env.find(name); it != dot_env.end() && !it->second.empty()) {
+        return it->second;
+    }
+    const char *v = std::getenv(name.c_str());
+    return v ? std::string(v) : std::string("");
+}
+
 inline std::string get_bind_host(const std::string &name, const std::string &fallback) {
     std::lock_guard<std::mutex> lock(detail::get_config_mutex());
     if (!detail::config_loaded()) {

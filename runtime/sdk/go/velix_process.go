@@ -203,6 +203,20 @@ func (p *VelixProcess) CallLLM(convoID, userMessage, systemMessage string) (stri
 func extractToolCalls(reply map[string]any) []map[string]any {
 	out := make([]map[string]any, 0)
 
+	if raw, ok := reply["exec_blocks"].([]any); ok {
+		for _, item := range raw {
+			switch block := item.(type) {
+			case map[string]any:
+				out = append(out, block)
+			case string:
+				var parsed map[string]any
+				if err := json.Unmarshal([]byte(block), &parsed); err == nil && parsed != nil {
+					out = append(out, parsed)
+				}
+			}
+		}
+	}
+
 	if raw, ok := reply["tool_calls"].([]any); ok {
 		for _, item := range raw {
 			if call, ok := item.(map[string]any); ok {

@@ -284,6 +284,25 @@ impl VelixProcess {
 fn extract_tool_calls(reply: &Value) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
 
+    if let Some(arr) = reply.get("exec_blocks").and_then(|v| v.as_array()) {
+        for item in arr {
+            if item.is_object() {
+                out.push(item.clone());
+                continue;
+            }
+            if let Some(raw) = item.as_str() {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                        if parsed.is_object() {
+                            out.push(parsed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(arr) = reply.get("tool_calls").and_then(|v| v.as_array()) {
         for item in arr {
             if item.is_object() {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "anthropic.hpp"
 #include "llama_cpp.hpp"
 #include "ollama.hpp"
 
@@ -25,6 +26,9 @@ inline std::unique_ptr<ProviderAdapter> make_adapter(const std::string &name) {
   }
   if (key == "ollama" || key == "ollama-chat" || key == "ollama_chat") {
     return std::make_unique<OllamaAdapter>();
+  }
+  if (key == "anthropic" || key == "claude" || key == "anthropic-messages") {
+    return std::make_unique<AnthropicAdapter>();
   }
   return std::make_unique<OpenAICompatibleAdapter>();
 }

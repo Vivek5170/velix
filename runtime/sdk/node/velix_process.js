@@ -146,6 +146,25 @@ class VelixProcess {
   #extractToolCalls(reply) {
     const out = [];
 
+    if (Array.isArray(reply?.exec_blocks)) {
+      for (const block of reply.exec_blocks) {
+        if (block && typeof block === 'object' && !Array.isArray(block)) {
+          out.push(block);
+          continue;
+        }
+        if (typeof block === 'string') {
+          const raw = block.trim();
+          if (!raw) continue;
+          try {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              out.push(parsed);
+            }
+          } catch (_) {}
+        }
+      }
+    }
+
     if (Array.isArray(reply?.tool_calls)) {
       for (const call of reply.tool_calls) {
         if (call && typeof call === 'object') {

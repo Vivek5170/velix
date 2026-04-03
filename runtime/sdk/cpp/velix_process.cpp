@@ -4,8 +4,10 @@
 
 #include <chrono>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 #include "../../../utils/config_utils.hpp"
 #include "../../../utils/logger.hpp"
@@ -163,6 +165,11 @@ void VelixProcess::start(int override_pid,
         throw;
       std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay * (i + 1)));
     }
+  }
+
+  if (!connected) {
+    throw std::runtime_error(
+        "VelixProcess SDK: Failed to connect to scheduler after retry attempts.");
   }
 
   if (!connected) {
@@ -362,11 +369,113 @@ VelixProcess::send_llm_request_stateless(const json &request_payload) {
   envelope["mode"] = envelope.value("mode", "simple");
 
   // 4. Dispatch and Wait
-  const int llm_timeout = velix::utils::get_config("SDK_LLM_TIMEOUT_MS", 120000);
+  const int llm_timeout = velix::utils::get_config("SDK_LLM_TIMEOUT_MS", 305000);
   scheduler_socket.set_timeout_ms(llm_timeout);
   velix::communication::send_json(scheduler_socket, envelope.dump());
 
   return velix::communication::recv_json(scheduler_socket);
+}
+
+std::string VelixProcess::send_llm_request_stateless_stream(
+    const json &request_payload,
+    const std::function<void(const std::string &)> &on_token) {
+  // 1. Generate unique Trace ID for this specific network attempt
+  const std::string trace_id = velix::utils::generate_uuid();
+  const int sched_port = resolve_port("SCHEDULER", 5171);
+
+  velix::communication::SocketWrapper scheduler_socket;
+
+  bool connected = false;
+  const int retry_limit = velix::utils::get_config("SDK_RETRY_LIMIT", 3);
+  const int retry_delay = velix::utils::get_config("SDK_RETRY_DELAY_MS", 500);
+
+  for (int i = 0; i < retry_limit; ++i) {
+    try {
+      scheduler_socket.create_tcp_socket();
+      scheduler_socket.connect(
+          velix::communication::resolve_service_host("SCHEDULER", "127.0.0.1"),
+          static_cast<uint16_t>(sched_port));
+      connected = true;
+      break;
+    } catch (...) {
+      if (i == retry_limit - 1)
+        throw std::runtime_error("VelixProcess SDK: Failed to connect to "
+                                 "scheduler after retry attempts.");
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(retry_delay * (i + 1)));
+    }
+  }
+
+  if (!connected) {
+    throw std::runtime_error("VelixProcess SDK: scheduler connect failed");
+  }
+
+  json envelope = request_payload;
+  envelope["message_type"] = "LLM_REQUEST";
+  envelope["request_id"] = "req_" + std::to_string(velix_pid) + "_" +
+                           velix::utils::generate_uuid().substr(0, 8);
+  envelope["trace_id"] = trace_id;
+  envelope["tree_id"] = tree_id;
+  envelope["source_pid"] = velix_pid;
+  envelope["priority"] = envelope.value("priority", 1);
+  envelope["mode"] = envelope.value("mode", "simple");
+
+  const int llm_timeout = velix::utils::get_config("SDK_LLM_TIMEOUT_MS", 305000);
+  scheduler_socket.set_timeout_ms(llm_timeout);
+  velix::communication::send_json(scheduler_socket, envelope.dump());
+
+  const int max_chunks = velix::utils::get_config("SDK_STREAM_MAX_CHUNKS", 100000);
+  int chunk_count = 0;
+  const auto stream_deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(llm_timeout + 10000);
+
+  while (chunk_count++ < max_chunks) {
+    if (!is_running.load()) {
+      throw std::runtime_error("process shutdown during streaming");
+    }
+
+    if (std::chrono::steady_clock::now() > stream_deadline) {
+      throw std::runtime_error("scheduler stream deadline exceeded");
+    }
+
+    std::string raw;
+    try {
+      raw = velix::communication::recv_json(scheduler_socket);
+    } catch (const velix::communication::SocketTimeoutException &) {
+      continue;
+    } catch (const std::exception &e) {
+      const std::string err = e.what();
+      if (err.find("timed out") != std::string::npos ||
+          err.find("timeout") != std::string::npos ||
+          err.find("errno 11") != std::string::npos ||
+          err.find("errno 35") != std::string::npos ||
+          err.find("errno 110") != std::string::npos ||
+          err.find("Resource temporarily unavailable") != std::string::npos) {
+        continue;
+      }
+      throw;
+    }
+
+    json message;
+    try {
+      message = json::parse(raw);
+    } catch (...) {
+      continue;
+    }
+
+    if (message.value("message_type", std::string("")) == "LLM_STREAM_CHUNK") {
+      const std::string delta = message.value("delta", std::string(""));
+      if (!delta.empty() && on_token) {
+        on_token(delta);
+      }
+      continue;
+    }
+
+    return raw;
+  }
+
+  throw std::runtime_error("scheduler stream chunk limit exceeded");
 }
 
 void VelixProcess::bus_listener_loop() {
@@ -387,6 +496,9 @@ void VelixProcess::bus_listener_loop() {
             queue_cv.notify_all();
           }
         }
+      } catch (const velix::communication::SocketTimeoutException &) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
       } catch (const std::exception &e) {
         const std::string err = e.what();
         // Socket timeout: keep looping so shutdown can flip is_running.
@@ -506,25 +618,72 @@ void VelixProcess::report_result(int target_pid, const json &data,
 
 std::string VelixProcess::call_llm(const std::string &convo_id,
                                    const std::string &user_message,
-                                   const std::string &system_message) {
+                                   const std::string &system_message,
+                                   const std::string &user_id) {
+  return call_llm_internal(convo_id, user_message, system_message, user_id,
+                           false, nullptr);
+}
+
+std::string VelixProcess::call_llm_stream(
+  const std::string &convo_id, const std::string &user_message,
+  const std::function<void(const std::string &)> &on_token,
+  const std::string &system_message, const std::string &user_id) {
+  return call_llm_internal(convo_id, user_message, system_message, user_id,
+                           true, on_token);
+}
+
+std::string VelixProcess::call_llm_internal(
+  const std::string &convo_id, const std::string &user_message,
+  const std::string &system_message, const std::string &user_id,
+  bool stream_requested,
+  const std::function<void(const std::string &)> &on_token) {
   status.store(ProcessStatus::WAITING_LLM);
 
-  json payload = {{"mode", "conversation"},
-                  {"convo_id", convo_id},
-                  {"owner_pid", velix_pid}};
+  json base_payload = {{"mode", "conversation"},
+                       {"convo_id", convo_id},
+                       {"owner_pid", velix_pid},
+                       {"owner_type", "process"},
+             {"stream", stream_requested}};
 
-  if (!user_message.empty() || !system_message.empty()) {
-    json messages = json::array();
-    if (!system_message.empty())
-      messages.push_back({{"role", "system"}, {"content", system_message}});
-    if (!user_message.empty())
-      messages.push_back({{"role", "user"}, {"content", user_message}});
-    payload["messages"] = messages;
+  if (!user_id.empty()) {
+    base_payload["user_id"] = user_id;
+    base_payload["owner_type"] = "user";
   }
+
+  std::string pending_user_message = user_message;
+  std::string pending_system_message = system_message;
+  json pending_tool_messages = json::array();
 
   int loop_count = 0;
   while (is_running && loop_count < 10) {
-    std::string raw_reply = send_llm_request_stateless(payload);
+    json payload = base_payload;
+
+    if (!pending_system_message.empty()) {
+      payload["system_message"] = pending_system_message;
+    }
+    if (!pending_user_message.empty()) {
+      payload["user_message"] = pending_user_message;
+    }
+
+    if (pending_tool_messages.is_array() && !pending_tool_messages.empty()) {
+      payload["stream"] = false;
+      if (pending_tool_messages.size() == 1) {
+        payload["tool_message"] = pending_tool_messages[0];
+      } else {
+        payload["tool_messages"] = pending_tool_messages;
+      }
+    } else {
+      payload["stream"] = stream_requested;
+    }
+
+    pending_system_message.clear();
+    pending_user_message.clear();
+    pending_tool_messages = json::array();
+
+    std::string raw_reply =
+        payload.value("stream", false)
+            ? send_llm_request_stateless_stream(payload, on_token)
+            : send_llm_request_stateless(payload);
     json reply = json::parse(raw_reply);
 
     if (reply.value("status", "error") != "ok") {
@@ -533,83 +692,77 @@ std::string VelixProcess::call_llm(const std::string &convo_id,
                                reply.value("error", ""));
     }
 
-    if (!reply.value("exec_required", false)) {
-      status.store(ProcessStatus::RUNNING);
-      return reply.value("response", "");
-    }
+    const std::string response_text = reply.value("response", "");
 
-    std::string response_text = reply.value("response", "");
-    const std::string trace_id = reply.value("trace_id", "");
-    bool tool_executed = false;
+    const json normalized_tool_calls =
+        (reply.contains("tool_calls") && reply["tool_calls"].is_array())
+            ? reply["tool_calls"]
+            : json::array();
 
-    // 🚨 NATIVE TAG-BASED TOOL EXTRACTION (EXEC ... END_EXEC)
-    // Optimized for small local LLMs that embed tool use in text.
-    size_t start_pos = response_text.find("EXEC");
-    while (start_pos != std::string::npos) {
-      size_t end_pos = response_text.find("END_EXEC", start_pos);
-      if (end_pos != std::string::npos) {
-        std::string tool_json_str =
-            response_text.substr(start_pos + 4, end_pos - (start_pos + 4));
-
-        try {
-          json tool_call = json::parse(tool_json_str);
-          std::string tool_name = tool_call.value("name", "");
-          json tool_args = tool_call.value("arguments", json::object());
-
-          if (!tool_name.empty()) {
-            status.store(ProcessStatus::RUNNING);
-            json tool_res = exec_velix_process(tool_name, tool_args, trace_id);
-            tool_executed = true;
-
-            payload["messages"].push_back({{"role", "tool"},
-                                           {"content", tool_res.dump()},
-                                           {"tool_call_id", trace_id}});
-          }
-        } catch (const std::runtime_error &re) {
-          status.store(ProcessStatus::ERROR);
-          throw; // propagate crash
-        } catch (const std::exception &e) {
-          LOG_WARN("Failed to execute tool between EXEC tags: " +
-                   std::string(e.what()));
-        }
-
-        start_pos = response_text.find("EXEC", end_pos);
-      } else {
-        break;
-      }
-    }
-
-    if (reply.contains("tool_calls") && reply["tool_calls"].is_array()) {
-      for (const auto &call : reply["tool_calls"]) {
-        std::string tool_name = call.value("name", "");
-        json tool_args = call.value("arguments", json::object());
-        if (!tool_name.empty()) {
-          try {
-            json tool_res = exec_velix_process(tool_name, tool_args, trace_id);
-            tool_executed = true;
-
-            if (!payload.contains("messages"))
-              payload["messages"] = json::array();
-            payload["messages"].push_back({{"role", "tool"},
-                                           {"content", tool_res.dump()},
-                                           {"tool_call_id", trace_id}});
-          } catch (const std::runtime_error &re) {
-            status.store(ProcessStatus::ERROR);
-            throw; // propagate crash
-          } catch (const std::exception &e) {
-            LOG_WARN("Failed to execute structured tool call: " +
-                     std::string(e.what()));
-          }
-        }
-      }
-    }
-
-    if (!tool_executed) {
+    if (normalized_tool_calls.empty()) {
       status.store(ProcessStatus::RUNNING);
       return response_text;
     }
 
-    payload.erase("messages");
+    if (!reply.contains("assistant_message") ||
+        !reply["assistant_message"].is_object()) {
+      status.store(ProcessStatus::ERROR);
+      throw std::runtime_error(
+          "Scheduler protocol violation: missing assistant_message object");
+    }
+
+    status.store(ProcessStatus::RUNNING);
+    std::vector<std::future<json>> tool_futures;
+    tool_futures.reserve(normalized_tool_calls.size());
+
+    for (const auto &tool_call : normalized_tool_calls) {
+      tool_futures.push_back(std::async(std::launch::async, [this, tool_call]() {
+        if (!tool_call.is_object()) {
+          throw std::runtime_error("Malformed tool_call: expected object");
+        }
+
+        const json fn = tool_call.value("function", json::object());
+        const std::string tool_name =
+            fn.value("name", std::string(""));
+        if (tool_name.empty()) {
+          throw std::runtime_error("Malformed tool_call: missing function.name");
+        }
+
+        const json tool_args =
+            fn.value("arguments", json::object());
+        const std::string tool_call_id = tool_call.value("id", std::string(""));
+        if (tool_call_id.empty()) {
+          throw std::runtime_error("Malformed tool_call: missing id");
+        }
+
+        const json tool_res = exec_velix_process(tool_name, tool_args, tool_call_id);
+
+        return json{{"role", "tool"},
+                    {"tool_call_id", tool_call_id},
+                    {"content", tool_res.dump()}};
+      }));
+    }
+
+    json tool_messages = json::array();
+    for (auto &future : tool_futures) {
+      try {
+        tool_messages.push_back(future.get());
+      } catch (const std::runtime_error &) {
+        status.store(ProcessStatus::ERROR);
+        throw;
+      } catch (const std::exception &e) {
+        LOG_WARN("Failed to execute structured tool call: " +
+                 std::string(e.what()));
+      }
+    }
+
+    if (tool_messages.empty()) {
+      status.store(ProcessStatus::RUNNING);
+      return response_text;
+    }
+
+    pending_tool_messages = tool_messages;
+
     loop_count++;
     status.store(ProcessStatus::WAITING_LLM);
   }

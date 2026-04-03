@@ -1,10 +1,12 @@
 #include "scheduler.hpp"
 #include "conversation_manager.hpp"
+#include "tools/registry.hpp"
 
 #include "../communication/network_config.hpp"
 #include "../communication/socket_wrapper.hpp"
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
+#include "../utils/string_utils.hpp"
 #include "../utils/timer.hpp"
 #include "../utils/thread_pool.hpp"
 #include "../vendor/nlohmann/json.hpp"
@@ -20,12 +22,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <fstream>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <queue>
-#include <sstream>
+#include <csignal>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -43,7 +46,6 @@ struct SchedulerConfig {
   adapters::AdapterConfig adapter_cfg;
   int max_llm_keys{5};
   int max_client_threads{64}; // Tier 1: Lobby Pool Size
-  int max_exec_iterations{8};
   int scheduler_wait_timeout_ms{65000};
   int executioner_port{5172};
   int supervisor_port{5173};
@@ -58,6 +60,7 @@ struct PendingRequest {
   int source_pid{0};
   int base_priority{1};
   json payload;
+  std::function<void(const std::string &)> stream_token_callback;
   std::chrono::steady_clock::time_point enqueued_at;
   std::shared_ptr<std::promise<json>> completion;
 };
@@ -88,6 +91,7 @@ std::priority_queue<TreeCandidate, std::vector<TreeCandidate>,
     ready_tree_queue;
 std::atomic<bool> shutting_down{false};
 ConversationManager conversation_manager;
+tools::ToolRegistry tool_registry;
 
 // Active Trace Set: Records trace_ids currently held by client lobby threads.
 // If a client disconnects, the lobby thread removes the trace_id.
@@ -95,22 +99,13 @@ ConversationManager conversation_manager;
 std::mutex trace_mutex;
 std::unordered_set<std::string> active_traces;
 
-std::string trim(const std::string &text) {
-  const auto is_space = [](char c) {
-    return c == ' ' || c == '\n' || c == '\r' || c == '\t';
-  };
+void shutdown_scheduler() {
+  shutting_down.store(true);
+  queue_cv.notify_all();
+}
 
-  std::size_t begin = 0;
-  while (begin < text.size() && is_space(text[begin])) {
-    ++begin;
-  }
-
-  std::size_t end = text.size();
-  while (end > begin && is_space(text[end - 1])) {
-    --end;
-  }
-
-  return text.substr(begin, end - begin);
+void handle_shutdown_signal(int) {
+  shutting_down.store(true);
 }
 
 bool load_json_with_fallback(const std::vector<std::string> &paths,
@@ -129,6 +124,7 @@ bool load_json_with_fallback(const std::vector<std::string> &paths,
   }
   return false;
 }
+
 
 SchedulerConfig load_scheduler_config() {
   SchedulerConfig cfg;
@@ -154,12 +150,32 @@ SchedulerConfig load_scheduler_config() {
     cfg.adapter_cfg.base_url =
       adapter.value("base_url", "http://127.0.0.1:8033/v1");
     cfg.adapter_cfg.model = adapter.value("model", "");
+
+    // env precedence (explicit config -> adapter api_key_env name -> .env fields -> process env)
+    std::string api_key = adapter.value("api_key", std::string(""));
+    std::string env_var_name = adapter.value("api_key_env", std::string(""));
+
+    auto dotenv_map = velix::utils::load_dotenv(".env");
+
+    if (api_key.empty() && !env_var_name.empty()) {
+      api_key = velix::utils::get_env_value(env_var_name, dotenv_map);
+    }
+    if (api_key.empty()) {
+      api_key = velix::utils::get_env_value("OPENAI_API_KEY", dotenv_map);
+    }
+    if (api_key.empty()) {
+      api_key = velix::utils::get_env_value("OLLAMA_API_KEY", dotenv_map);
+    }
+    cfg.adapter_cfg.api_key = api_key;
+
     cfg.adapter_cfg.host = adapter.value("host", std::string(""));
     cfg.adapter_cfg.port = adapter.value("port", cfg.adapter_cfg.port);
     cfg.adapter_cfg.use_https = adapter.value("use_https", false);
     cfg.adapter_cfg.base_path = adapter.value("base_path", std::string(""));
     cfg.adapter_cfg.chat_endpoint = adapter.value(
       "chat_completions_path", cfg.adapter_cfg.chat_endpoint);
+    cfg.adapter_cfg.enable_tools = adapter.value("enable_tools", true);
+    cfg.adapter_cfg.enable_streaming = adapter.value("enable_streaming", true);
 
     if (adapter.contains("stop_tokens") && adapter["stop_tokens"].is_array()) {
       for (const auto &token : adapter["stop_tokens"]) {
@@ -176,7 +192,6 @@ SchedulerConfig load_scheduler_config() {
     const int configured_max_simultaneous = model_json.value(
         "max_simultaneous_llm_requests", configured_max_llm_keys);
     cfg.max_llm_keys = configured_max_simultaneous;
-    cfg.max_exec_iterations = model_json.value("max_exec_iterations", 8);
     cfg.max_client_threads = model_json.value("max_client_threads", 64);
 
     if (model_json.contains("max_llm_keys") &&
@@ -195,90 +210,282 @@ SchedulerConfig load_scheduler_config() {
   if (cfg.max_llm_keys <= 0) {
     cfg.max_llm_keys = 1;
   }
-  if (cfg.max_exec_iterations <= 0) {
-    cfg.max_exec_iterations = 1;
-  }
 
   return cfg;
 }
 
-std::string call_llm(const json &messages, const json &sampling_params,
-                     const SchedulerConfig &cfg) {
-  auto adapter = adapters::make_adapter(cfg.active_adapter);
-  return adapter->call_chat(cfg.adapter_cfg, messages, sampling_params);
-}
+adapters::ChatRequest build_chat_request(const PendingRequest &req,
+                                         const SchedulerConfig &cfg,
+                                         const json &messages_override) {
+  adapters::ChatRequest request;
+  request.model = cfg.adapter_cfg.model;
+  request.messages = messages_override;
 
-struct ExecParseResult {
-  bool has_exec{false};
-  bool malformed{false};
-  std::string error;
-  std::vector<std::string> blocks;
-  std::string text_without_exec;
-};
+  // Provider compatibility: assistant tool_calls.function.arguments are often
+  // represented as JSON strings by OpenAI-compatible backends.
+  if (request.messages.is_array()) {
+    json system_messages = json::array();
+    json non_system_messages = json::array();
 
-ExecParseResult parse_exec_blocks(const std::string &text) {
-  ExecParseResult result;
-
-  std::istringstream input(text);
-  std::ostringstream output;
-  std::ostringstream current_block;
-  std::string line;
-  bool in_exec_block = false;
-
-  while (std::getline(input, line)) {
-    const std::string marker = trim(line);
-
-    if (!in_exec_block && marker == "EXEC") {
-      result.has_exec = true;
-      in_exec_block = true;
-      current_block.str("");
-      current_block.clear();
-      continue;
+    for (const auto &message : request.messages) {
+      if (!message.is_object()) {
+        continue;
+      }
+      const std::string role = message.value("role", std::string(""));
+      if (role == "system") {
+        system_messages.push_back(message);
+      } else {
+        non_system_messages.push_back(message);
+      }
     }
 
-    if (!in_exec_block && (marker == "EXEC_END" || marker == "END_EXEC")) {
-      result.malformed = true;
-      result.error = "EXEC_END/END_EXEC found without matching EXEC";
-      return result;
+    json normalized_messages = json::array();
+    for (const auto &m : system_messages) {
+      normalized_messages.push_back(m);
+    }
+    for (const auto &m : non_system_messages) {
+      normalized_messages.push_back(m);
     }
 
-    if (in_exec_block) {
-      if (marker == "EXEC_END" || marker == "END_EXEC") {
-        const std::string block_text = trim(current_block.str());
-        if (block_text.empty()) {
-          result.malformed = true;
-          result.error = "EXEC block cannot be empty";
-          return result;
-        }
+    request.messages = std::move(normalized_messages);
 
-        result.blocks.push_back(block_text);
-        in_exec_block = false;
-        current_block.str("");
-        current_block.clear();
+    for (auto &message : request.messages) {
+      if (!message.is_object()) {
+        continue;
+      }
+      if (message.value("role", std::string("")) != "assistant") {
+        continue;
+      }
+      if (!message.contains("tool_calls") || !message["tool_calls"].is_array()) {
         continue;
       }
 
-      if (marker == "EXEC") {
-        result.malformed = true;
-        result.error = "Nested EXEC block is not allowed";
-        return result;
+      for (auto &tool_call : message["tool_calls"]) {
+        if (!tool_call.is_object()) {
+          continue;
+        }
+        if (!tool_call.contains("function") || !tool_call["function"].is_object()) {
+          continue;
+        }
+        json &fn = tool_call["function"];
+        if (!fn.contains("arguments")) {
+          continue;
+        }
+        if (fn["arguments"].is_object() || fn["arguments"].is_array()) {
+          fn["arguments"] = fn["arguments"].dump();
+        }
+      }
+    }
+  }
+  request.sampling_params = req.payload.value("sampling_params", json::object());
+
+  request.max_tokens = req.payload.value(
+      "max_tokens", request.sampling_params.value("max_tokens", 0));
+
+  if (req.payload.contains("stop") && req.payload["stop"].is_array()) {
+    for (const auto &token : req.payload["stop"]) {
+      if (token.is_string()) {
+        request.stop.push_back(token.get<std::string>());
+      }
+    }
+  } else {
+    request.stop = cfg.adapter_cfg.stop_tokens;
+  }
+
+  if (req.payload.contains("tools") && req.payload["tools"].is_array()) {
+    request.tools = req.payload["tools"];
+  } else if (cfg.adapter_cfg.enable_tools) {
+    // Scheduler-owned default tool schema injection keeps SDKs portable.
+    request.tools = tool_registry.get_tool_schemas();
+  }
+
+  if (req.payload.contains("tool_choice")) {
+    request.tool_choice = req.payload["tool_choice"];
+  } else if (request.tools.is_array() && !request.tools.empty()) {
+    request.tool_choice = "auto";
+  }
+
+  const std::string mode = req.payload.value("mode", "simple");
+  const std::string owner_type = req.payload.value("owner_type", "");
+  const bool has_user_id = req.payload.contains("user_id") &&
+                           req.payload["user_id"].is_string() &&
+                           !req.payload["user_id"].get<std::string>().empty();
+  const bool owner_stream_eligible =
+      (owner_type == "process") || (owner_type == "user");
+  const bool stream_allowed =
+      (mode == "conversation") && (req.tree_id == "TREE_HANDLER") &&
+      owner_stream_eligible && has_user_id &&
+      cfg.adapter_cfg.enable_streaming;
+
+  request.stream = req.payload.value("stream", false) && stream_allowed;
+  request.extra_body = req.payload.value("extra_body", json::object());
+  return request;
+}
+
+adapters::ChatResponse run_chat_once(const adapters::ProviderAdapter &adapter,
+                                     const SchedulerConfig &cfg,
+                                     const adapters::ChatRequest &request,
+                                     const std::function<void(const std::string &)> &
+                                         on_token) {
+  if (!request.stream) {
+    return adapter.call_chat(cfg.adapter_cfg, request);
+  }
+
+  adapters::ChatResponse aggregated;
+  std::vector<json> partial_tool_calls;
+
+  auto merge_object = [](json &target, const json &delta, const auto &self_ref) -> void {
+    if (!delta.is_object()) {
+      return;
+    }
+    for (auto it = delta.begin(); it != delta.end(); ++it) {
+      const std::string key = it.key();
+      const json &value = it.value();
+
+      if (!target.contains(key)) {
+        target[key] = value;
+        continue;
       }
 
-      current_block << line << '\n';
-      continue;
+      json &existing = target[key];
+      if (existing.is_object() && value.is_object()) {
+        self_ref(existing, value, self_ref);
+        continue;
+      }
+
+      // Streaming providers often fragment function.arguments across deltas.
+      if (key == "arguments" && existing.is_string() && value.is_string()) {
+        existing = existing.get<std::string>() + value.get<std::string>();
+        continue;
+      }
+
+      if (key == "arguments" && existing.is_null()) {
+        existing = value;
+        continue;
+      }
+
+      if (existing.is_string() && value.is_string()) {
+        existing = value;
+        continue;
+      }
+
+      existing = value;
+    }
+  };
+
+  auto find_slot_for_delta = [&partial_tool_calls](const json &delta) -> std::size_t {
+    if (delta.contains("index") && delta["index"].is_number_integer()) {
+      const int idx = delta["index"].get<int>();
+      if (idx >= 0) {
+        return static_cast<std::size_t>(idx);
+      }
     }
 
-    output << line << '\n';
+    const std::string id = delta.value("id", std::string(""));
+    if (!id.empty()) {
+      for (std::size_t i = 0; i < partial_tool_calls.size(); ++i) {
+        if (partial_tool_calls[i].value("id", std::string("")) == id) {
+          return i;
+        }
+      }
+    }
+
+    if (partial_tool_calls.empty()) {
+      return 0;
+    }
+    return partial_tool_calls.size() - 1;
+  };
+  adapter.call_chat_stream(
+      cfg.adapter_cfg, request,
+      [&aggregated, &on_token, &partial_tool_calls, &find_slot_for_delta,
+       &merge_object](const adapters::StreamChunk &chunk) {
+        aggregated.content += chunk.delta_text;
+        if (!chunk.delta_text.empty() && on_token) {
+          on_token(chunk.delta_text);
+        }
+        if (!chunk.delta_tool_call.is_null() && chunk.delta_tool_call.is_object()) {
+          const std::size_t slot = find_slot_for_delta(chunk.delta_tool_call);
+          if (slot >= partial_tool_calls.size()) {
+            partial_tool_calls.resize(slot + 1, json::object());
+          }
+          merge_object(partial_tool_calls[slot], chunk.delta_tool_call, merge_object);
+        }
+        if (chunk.finished) {
+          if (aggregated.finish_reason.empty()) {
+            aggregated.finish_reason = "stop";
+          }
+        }
+      });
+
+  aggregated.tool_calls = json::array();
+  for (auto &tool_call : partial_tool_calls) {
+    if (!tool_call.is_object() || tool_call.empty()) {
+      continue;
+    }
+    if (tool_call.contains("index")) {
+      tool_call.erase("index");
+    }
+    if (!tool_call.contains("type") ||
+        !tool_call["type"].is_string() ||
+        tool_call["type"].get<std::string>().empty()) {
+      tool_call["type"] = "function";
+    }
+    aggregated.tool_calls.push_back(tool_call);
+  }
+  return aggregated;
+}
+
+json normalize_tool_arguments_object(const json &raw_arguments) {
+  if (raw_arguments.is_object()) {
+    return raw_arguments;
   }
 
-  if (in_exec_block) {
-    result.malformed = true;
-    result.error = "EXEC block missing END_EXEC/EXEC_END terminator";
-    return result;
+  if (raw_arguments.is_string()) {
+    const std::string raw = raw_arguments.get<std::string>();
+    if (raw.empty()) {
+      return json::object();
+    }
+
+    try {
+      const json parsed = json::parse(raw);
+      if (parsed.is_object()) {
+        return parsed;
+      }
+      return json{{"_raw", parsed.dump()}};
+    } catch (...) {
+      return json{{"_raw", raw}};
+    }
   }
 
-  result.text_without_exec = trim(output.str());
-  return result;
+  if (raw_arguments.is_null()) {
+    return json::object();
+  }
+
+  return json{{"_raw", raw_arguments.dump()}};
+}
+
+json normalize_tool_call(const json &tool_call, int fallback_index) {
+  const json fn = tool_call.value("function", json::object());
+  const std::string name = fn.value("name", tool_call.value("name", std::string("")));
+  if (name.empty()) {
+    throw std::runtime_error("tool_call missing function.name");
+  }
+
+  const json raw_arguments = fn.contains("arguments")
+                                 ? fn["arguments"]
+                                 : tool_call.value("arguments", json::object());
+
+  std::string id = tool_call.value("id", std::string(""));
+  if (id.empty()) {
+    id = "call_" + std::to_string(fallback_index) + "_" +
+         velix::utils::generate_uuid().substr(0, 8);
+  }
+
+  return json{{"id", id},
+              {"type", "function"},
+              {"function",
+               {{"name", name},
+                {"arguments", normalize_tool_arguments_object(raw_arguments)}}}};
 }
 
 json notify_supervisor_llm_request(const PendingRequest& req,
@@ -322,25 +529,37 @@ json process_llm_request_stateless(PendingRequest &req,
     throw std::runtime_error("LLM_REQUEST missing messages[]");
   }
 
-  const json sampling_params =
-      req.payload.value("sampling_params", json::object());
-  json messages = req.payload["messages"];
   const std::string mode = req.payload.value("mode", "simple");
 
   velix::utils::Timer timer;
   timer.start();
 
-  const std::string llm_output = call_llm(messages, sampling_params, cfg);
-  
-  const ExecParseResult exec_parse = parse_exec_blocks(llm_output);
-  if (exec_parse.malformed) {
-    throw std::runtime_error("invalid EXEC block format: " + exec_parse.error);
+  auto adapter = adapters::make_adapter(cfg.active_adapter);
+  const adapters::ChatRequest chat_request =
+      build_chat_request(req, cfg, req.payload["messages"]);
+  const adapters::ChatResponse final_response =
+      run_chat_once(*adapter, cfg, chat_request, req.stream_token_callback);
+
+  json normalized_tool_calls = json::array();
+  if (final_response.tool_calls.is_array()) {
+    int call_index = 0;
+    for (const auto &tool_call : final_response.tool_calls) {
+      normalized_tool_calls.push_back(normalize_tool_call(tool_call, call_index++));
+    }
   }
 
-  if (mode == "conversation") {
-    // We MUST persist the assistant's output into the conversation log whether
-    // it was plaintext or an EXEC block, so the LLM has context for the next turn.
-    if (!conversation_manager.persist_assistant_response(req.payload, llm_output)) {
+  if (mode == "conversation" && !normalized_tool_calls.empty()) {
+    if (!conversation_manager.persist_assistant_tool_call(
+            req.payload, final_response.content, normalized_tool_calls)) {
+      LOG_WARN("Failed to persist assistant tool-call turn for convo_id=" +
+               req.payload.value("convo_id", std::string("")));
+    }
+  }
+
+  if (mode == "conversation" && !final_response.content.empty() &&
+      normalized_tool_calls.empty()) {
+    if (!conversation_manager.persist_assistant_response(req.payload,
+                                                         final_response.content)) {
       LOG_WARN("Failed to persist assistant response for convo_id=" +
                req.payload.value("convo_id", std::string("")));
     }
@@ -348,6 +567,7 @@ json process_llm_request_stateless(PendingRequest &req,
 
   timer.stop();
   json response = {
+      {"message_type", "LLM_RESPONSE"},
       {"status", "ok"},           {"request_id", req.request_id},
       {"tree_id", req.tree_id},   {"mode", mode},
       {"latency_ms", timer.elapsed_ms()}};
@@ -356,22 +576,17 @@ json process_llm_request_stateless(PendingRequest &req,
     response["convo_id"] = req.payload.value("convo_id", "");
   }
 
-  if (exec_parse.has_exec) {
-    if (mode != "conversation") {
-      throw std::runtime_error(
-          "EXEC blocks are only allowed in conversation mode");
-    }
-    response["exec_required"] = true;
-    response["exec_blocks"] = exec_parse.blocks;
-    response["response"] = "EXEC dispatched; yielding GPU lock to orchestrator SDK";
-  } else {
-    std::string final_answer = exec_parse.text_without_exec;
-    if (final_answer.empty()) {
-      final_answer = llm_output;
-    }
-    response["exec_required"] = false;
-    response["response"] = final_answer;
+  response["response"] = final_response.content;
+  json assistant_message = {{"role", "assistant"},
+                            {"tool_calls", normalized_tool_calls}};
+  if (!final_response.content.empty()) {
+    assistant_message["content"] = final_response.content;
   }
+  response["assistant_message"] = assistant_message;
+  response["tool_calls"] = normalized_tool_calls;
+  response["finish_reason"] = final_response.finish_reason;
+  response["usage"] = final_response.usage;
+  response["raw_provider_response"] = final_response.raw;
 
   return response;
 }
@@ -500,6 +715,7 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
       }
     } catch (const std::exception &e) {
       response = {{"status", "error"},
+                  {"message_type", "LLM_RESPONSE"},
                   {"request_id", req.request_id},
                   {"tree_id", req.tree_id},
                   {"error", e.what()}};
@@ -511,7 +727,9 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
       req.completion->set_value(response);
     } else {
       // Client gone. Just unblock with a cancelled stub.
-      req.completion->set_value({{"status", "cancelled"}, {"trace_id", req.trace_id}});
+      req.completion->set_value({{"message_type", "LLM_RESPONSE"},
+                                 {"status", "cancelled"},
+                                 {"trace_id", req.trace_id}});
     }
 
     {
@@ -600,7 +818,8 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
     const bool has_alt_input = req.payload.contains("user_message") ||
                                req.payload.contains("system_message") ||
                                req.payload.contains("tool_result") ||
-                               req.payload.contains("tool_message");
+                               req.payload.contains("tool_message") ||
+                               req.payload.contains("tool_messages");
     if (!has_messages_array && !has_alt_input) {
       throw std::runtime_error(
           "conversation LLM_REQUEST requires messages[] or user_message/system_message/tool_result");
@@ -612,12 +831,34 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
 
 void handle_client_connection(velix::communication::SocketWrapper client_socket,
                 const SchedulerConfig &cfg) {
+  auto client_socket_ptr =
+      std::make_shared<velix::communication::SocketWrapper>(
+          std::move(client_socket));
+  auto client_send_mutex = std::make_shared<std::mutex>();
+
   std::string current_trace;
   try {
     const std::string raw_payload =
-        velix::communication::recv_json(client_socket);
+        velix::communication::recv_json(*client_socket_ptr);
     PendingRequest req = parse_request_payload(raw_payload);
     current_trace = req.trace_id;
+
+    req.stream_token_callback =
+        [client_socket_ptr, client_send_mutex,
+         request_id = req.request_id](const std::string &delta) {
+          if (delta.empty()) {
+            return;
+          }
+          try {
+            const json stream_chunk = {{"message_type", "LLM_STREAM_CHUNK"},
+                                       {"request_id", request_id},
+                                       {"delta", delta}};
+            std::lock_guard<std::mutex> lock(*client_send_mutex);
+            velix::communication::send_json(*client_socket_ptr,
+                                            stream_chunk.dump());
+          } catch (...) {
+          }
+        };
 
     // Register active trace for cancellation tracking
     {
@@ -644,7 +885,10 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
     }
 
     const json response = future.get();
-    velix::communication::send_json(client_socket, response.dump());
+    {
+      std::lock_guard<std::mutex> lock(*client_send_mutex);
+      velix::communication::send_json(*client_socket_ptr, response.dump());
+    }
     
     // Cleanup trace
     {
@@ -659,8 +903,11 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
       active_traces.erase(current_trace);
     }
     try {
-      const json error = {{"status", "error"}, {"error", e.what()}};
-      velix::communication::send_json(client_socket, error.dump());
+      const json error = {{"message_type", "LLM_RESPONSE"},
+                          {"status", "error"},
+                          {"error", e.what()}};
+      std::lock_guard<std::mutex> lock(*client_send_mutex);
+      velix::communication::send_json(*client_socket_ptr, error.dump());
     } catch (...) {}
   }
 }
@@ -668,6 +915,10 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
 } // namespace
 
 void start_scheduler(int port) {
+  shutting_down.store(false);
+  std::signal(SIGTERM, handle_shutdown_signal);
+  std::signal(SIGINT, handle_shutdown_signal);
+
   const SchedulerConfig cfg = load_scheduler_config();
   const std::string bind_host =
       velix::communication::resolve_bind_host("SCHEDULER", "127.0.0.1");
@@ -690,8 +941,11 @@ void start_scheduler(int port) {
 
   LOG_INFO("Scheduler listening on " + bind_host + ":" + std::to_string(port));
 
-  while (true) {
+  while (!shutting_down.load()) {
     try {
+      if (!server_socket.has_data(250)) {
+        continue;
+      }
       velix::communication::SocketWrapper client_socket = server_socket.accept();
       
       auto client_ptr = std::make_shared<velix::communication::SocketWrapper>(std::move(client_socket));
@@ -702,15 +956,22 @@ void start_scheduler(int port) {
       if (!submitted) {
         LOG_WARN("Scheduler lobby pool capacity reached; shedding load.");
         try {
-          json error = {{"status", "error"}, {"error", "scheduler_capacity_reached"}};
+          json error = {{"message_type", "LLM_RESPONSE"},
+                        {"status", "error"},
+                        {"error", "scheduler_capacity_reached"}};
           // Note: accessing *client_ptr is safe here as the lambda hasn't run yet or we own the only copy if it failed
           velix::communication::send_json(*client_ptr, error.dump());
         } catch (...) {}
       }
     } catch (const std::exception &e) {
+      if (shutting_down.load()) {
+        break;
+      }
       LOG_WARN(std::string("Scheduler accept error: ") + e.what());
     }
   }
+
+  shutdown_scheduler();
 
   for (auto &worker : workers) {
     if (worker.joinable()) {

@@ -353,9 +353,14 @@ Conversation ConversationManager::get_conversation(const std::string& convo_id) 
 bool ConversationManager::append_message_unlocked(Conversation& convo,
                                                    const std::string& role,
                                                    const std::string& content,
-                                                   uint64_t tokens_used) {
+												   uint64_t tokens_used,
+												   const json& extra_fields) {
 	const std::string canonical_role = canonicalize_role(role);
-	if (!is_valid_role(canonical_role) || content.empty()) {
+	const bool has_tool_calls =
+	    extra_fields.is_object() && extra_fields.contains("tool_calls") &&
+	    extra_fields["tool_calls"].is_array() &&
+	    !extra_fields["tool_calls"].empty();
+	if (!is_valid_role(canonical_role) || (content.empty() && !has_tool_calls)) {
 		return false;
 	}
 	const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -363,6 +368,14 @@ bool ConversationManager::append_message_unlocked(Conversation& convo,
 	json msg;
 	msg["role"]         = canonical_role;
 	msg["content"]      = content;
+	if (extra_fields.is_object() && extra_fields.contains("tool_call_id") &&
+	    extra_fields["tool_call_id"].is_string() &&
+	    !extra_fields["tool_call_id"].get<std::string>().empty()) {
+		msg["tool_call_id"] = extra_fields["tool_call_id"];
+	}
+	if (has_tool_calls) {
+		msg["tool_calls"] = extra_fields["tool_calls"];
+	}
 	msg["timestamp_ms"] = now_ms;
 	convo.messages.push_back(msg);
 	convo.turn_count        += 1;
@@ -374,7 +387,8 @@ bool ConversationManager::append_message_unlocked(Conversation& convo,
 bool ConversationManager::append_message(const std::string& convo_id,
                                          const std::string& role,
                                          const std::string& content,
-                                         uint64_t tokens_used) {
+                                         uint64_t tokens_used,
+                                         const json& extra_fields) {
 	std::lock_guard<std::mutex> lock(convo_mutex_);
 	auto it = convo_cache_.find(convo_id);
 	Conversation convo = (it != convo_cache_.end())
@@ -385,7 +399,7 @@ bool ConversationManager::append_message(const std::string& convo_id,
 		             "convo_mgr", "", -1, "not_found");
 		return false;
 	}
-	if (!append_message_unlocked(convo, role, content, tokens_used)) {
+	if (!append_message_unlocked(convo, role, content, tokens_used, extra_fields)) {
 		return false;
 	}
 	if (!persist_conversation(convo)) {
@@ -513,17 +527,71 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 	const bool skip_compaction = normalized_request.value("metadata", json::object())
 	                                               .value("compaction_request", false);
 
-	std::string input_text, input_role;
+	struct PendingInput {
+		std::string role;
+		std::string content;
+		json extra_fields = json::object();
+	};
+	std::vector<PendingInput> pending_inputs;
+
+	if (normalized_request.contains("system_message")) {
+		const std::string text = normalized_request.value("system_message", "");
+		if (!text.empty()) {
+			pending_inputs.push_back(PendingInput{"system", text, json::object()});
+		}
+	}
+
 	if (normalized_request.contains("user_message")) {
-		input_text = normalized_request.value("user_message", "");
-		input_role = "user";
-	} else if (normalized_request.contains("tool_result")) {
-		input_text = normalized_request.value("tool_result", "");
-		input_role = "tool";
-	} else if (normalized_request.contains("system_message")) {
-		input_text = normalized_request.value("system_message", "");
-		input_role = "system";
-	} else {
+		const std::string text = normalized_request.value("user_message", "");
+		if (!text.empty()) {
+			pending_inputs.push_back(PendingInput{"user", text, json::object()});
+		}
+	}
+
+	if (normalized_request.contains("tool_message") &&
+	    normalized_request["tool_message"].is_object()) {
+		const json tool_msg = normalized_request["tool_message"];
+		const std::string text = tool_msg.value("content", "");
+		if (!text.empty()) {
+			json extra = json::object();
+			if (tool_msg.contains("tool_call_id") && tool_msg["tool_call_id"].is_string()) {
+				extra["tool_call_id"] = tool_msg["tool_call_id"];
+			}
+			pending_inputs.push_back(PendingInput{"tool", text, extra});
+		}
+	}
+
+	if (normalized_request.contains("tool_messages") &&
+	    normalized_request["tool_messages"].is_array()) {
+		for (const auto &tool_msg : normalized_request["tool_messages"]) {
+			if (!tool_msg.is_object()) {
+				continue;
+			}
+			const std::string text = tool_msg.value("content", "");
+			if (text.empty()) {
+				continue;
+			}
+			json extra = json::object();
+			if (tool_msg.contains("tool_call_id") && tool_msg["tool_call_id"].is_string()) {
+				extra["tool_call_id"] = tool_msg["tool_call_id"];
+			}
+			pending_inputs.push_back(PendingInput{"tool", text, extra});
+		}
+	}
+
+	if (normalized_request.contains("tool_result")) {
+		const std::string text = normalized_request.value("tool_result", "");
+		if (!text.empty()) {
+			json extra = json::object();
+			if (normalized_request.contains("tool_call_id") &&
+			    normalized_request["tool_call_id"].is_string()) {
+				extra["tool_call_id"] = normalized_request["tool_call_id"];
+			}
+			pending_inputs.push_back(PendingInput{"tool", text, extra});
+		}
+	}
+
+	if (pending_inputs.empty()) {
 		throw std::runtime_error("conversation mode request missing input text");
 	}
 
@@ -563,8 +631,16 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 
 	{
 		std::lock_guard<std::mutex> lock(convo_mutex_);
-		if (!append_message_unlocked(convo, input_role, input_text, 0)) {
-			throw std::runtime_error("failed to append conversation input message");
+		for (const auto &input : pending_inputs) {
+			// Some providers (e.g., llama.cpp chat templates) require system
+			// to appear only at the very beginning of the conversation.
+			if (input.role == "system" && !convo.messages.empty()) {
+				continue;
+			}
+			if (!append_message_unlocked(convo, input.role, input.content, 0,
+			                            input.extra_fields)) {
+				throw std::runtime_error("failed to append conversation input message");
+			}
 		}
 		persist_conversation(convo);
 		convo_cache_[convo_id] = convo;
@@ -574,8 +650,20 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 	for (const auto& msg : convo.messages) {
 		const std::string role    = canonicalize_role(msg.value("role", ""));
 		const std::string content = msg.value("content", "");
-		if (!is_valid_role(role) || content.empty()) { continue; }
-		msgs.push_back({{"role", role}, {"content", content}});
+		const bool has_tool_calls = msg.contains("tool_calls") &&
+		                            msg["tool_calls"].is_array() &&
+		                            !msg["tool_calls"].empty();
+		if (!is_valid_role(role) || (content.empty() && !has_tool_calls)) { continue; }
+		json out = {{"role", role}, {"content", content}};
+		if (role == "assistant" && has_tool_calls) {
+			out["tool_calls"] = msg["tool_calls"];
+		}
+		if (role == "tool" && msg.contains("tool_call_id") &&
+		    msg["tool_call_id"].is_string() &&
+		    !msg["tool_call_id"].get<std::string>().empty()) {
+			out["tool_call_id"] = msg["tool_call_id"];
+		}
+		msgs.push_back(out);
 	}
 	return msgs;
 }
@@ -610,10 +698,20 @@ json ConversationManager::normalize_llm_request(const json& raw_request) {
 
 		Conversation convo;
 
-		if (convo_id.empty() && !user_id.empty()) {
-			// Client supplied user_id → find or create user convo
+		if (!user_id.empty()) {
+			// Canonical user mode: one deterministic conversation per user.
 			convo    = get_or_create_user_convo_unlocked(user_id);
 			convo_id = convo.convo_id;
+		} else if (!convo_id.empty() && convo_id.rfind("user_", 0) == 0) {
+			// If only a user-prefixed convo_id is supplied, derive the user and map
+			// to that user's canonical single conversation.
+			const std::string inferred_user_id = convo_id.substr(5);
+			if (inferred_user_id.empty()) {
+				throw std::runtime_error("invalid user convo_id: missing user suffix");
+			}
+			convo    = get_or_create_user_convo_unlocked(inferred_user_id);
+			convo_id = convo.convo_id;
+			user_id  = convo.user_id;
 		} else if (!convo_id.empty()) {
 			// Bug #1: Validate that proc_ convo_id matches source_pid
 			if (convo_id.rfind("proc_", 0) == 0 && source_pid > 0) {
@@ -674,9 +772,10 @@ json ConversationManager::normalize_llm_request(const json& raw_request) {
 		if (!raw_request.contains("messages") || !raw_request["messages"].is_array()) {
 			normalized["convo_id"] = convo.convo_id;
 			if (!raw_request.contains("tool_result") && !raw_request.contains("tool_message") &&
+				!raw_request.contains("tool_messages") &&
 				!raw_request.contains("user_message") && !raw_request.contains("system_message")) {
 				throw std::runtime_error(
-					"conversation mode requires messages[], user_message, system_message, or tool_result");
+					"conversation mode requires messages[], user_message, system_message, tool_message(s), or tool_result");
 			}
 		}
 
@@ -758,6 +857,41 @@ bool ConversationManager::persist_assistant_response(const json& normalized_requ
 
 	if (!append_message_unlocked(convo, "assistant", assistant_text, 0)) { return false; }
 	if (!persist_conversation(convo)) { return false; }
+	convo_cache_[convo_id] = convo;
+	return true;
+}
+
+bool ConversationManager::persist_assistant_tool_call(
+	    const json& normalized_request, const std::string& assistant_text,
+	    const json& tool_calls) {
+	if (normalized_request.value("mode", "simple") != "conversation") {
+		return true;
+	}
+	if (!tool_calls.is_array() || tool_calls.empty()) {
+		return true;
+	}
+
+	const std::string convo_id = normalized_request.value("convo_id", "");
+	if (convo_id.empty()) {
+		return false;
+	}
+
+	std::lock_guard<std::mutex> lock(convo_mutex_);
+	auto it = convo_cache_.find(convo_id);
+	Conversation convo = (it != convo_cache_.end())
+	                     ? it->second
+	                     : load_conversation_from_disk_unlocked(convo_id);
+	if (convo.convo_id.empty()) {
+		return false;
+	}
+
+	if (!append_message_unlocked(convo, "assistant", assistant_text, 0,
+	                           {{"tool_calls", tool_calls}})) {
+		return false;
+	}
+	if (!persist_conversation(convo)) {
+		return false;
+	}
 	convo_cache_[convo_id] = convo;
 	return true;
 }

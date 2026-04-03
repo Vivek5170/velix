@@ -60,6 +60,7 @@ dist/
 
 # Logs
 *.log
+.fuse_hidden000003ae0000000e
 
 # OS files
 .DS_Store

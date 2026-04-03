@@ -1,10 +1,10 @@
 {
   "name": "web_search",
   "type": "skill",
-  "description": "Search official web sources (Wikipedia and Crossref) and return cited results.",
+  "description": "Agent-grade web search with prioritized fallbacks and optional parallel aggregation.",
   "runtime": "python",
-  "entry": "skills/web_search/main.py",
-  "workdir": "../../",
+  "entry": "main.py",
+  "workdir": ".",
   "prepare": [],
   "parameters": {
     "type": "object",
@@ -16,8 +16,29 @@
       "max_results": {
         "type": "number",
         "description": "Maximum number of results per source (1-8)"
+      },
+      "timeout_sec": {
+        "type": "number",
+        "description": "Per-provider request timeout in seconds (1-20)"
+      },
+      "mode": {
+        "type": "string",
+        "description": "Pipeline mode: sequential or parallel"
+      },
+      "sources": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional provider subset from: brave, tavily, firecrawl, wikipedia, arxiv, duckduckgo"
+      },
+      "allow_firecrawl_scrape": {
+        "type": "boolean",
+        "description": "Allow Firecrawl markdown scraping mode"
       }
     },
     "required": ["query"]
+  },
+  "run": {
+    "command": "uv",
+    "args": ["run", "main.py"]
   }
 }

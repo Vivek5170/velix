@@ -79,22 +79,38 @@ class VelixProcess:
                 pass
             self._bus_sock = None
 
-    def call_llm(self, convo_id: str, user_message: str = "", system_message: str = "") -> str:
+    def call_llm(
+        self,
+        convo_id: str,
+        user_message: str = "",
+        system_message: str = "",
+        llm_params: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if llm_params is None:
+            llm_params = {}
+
         base_payload: Dict[str, Any] = {
             "message_type": "LLM_REQUEST",
             "mode": "conversation",
             "tree_id": self.tree_id,
             "source_pid": self.velix_pid,
-            "priority": 1,
+            "priority": int(llm_params.get("priority", 1)),
             "convo_id": convo_id,
             "owner_pid": self.velix_pid,
         }
 
-        next_messages = []
-        if system_message:
-            next_messages.append({"role": "system", "content": system_message})
-        if user_message:
-            next_messages.append({"role": "user", "content": user_message})
+        if "sampling_params" in llm_params and isinstance(llm_params["sampling_params"], dict):
+            base_payload["sampling_params"] = llm_params["sampling_params"]
+        if "metadata" in llm_params and isinstance(llm_params["metadata"], dict):
+            base_payload["metadata"] = llm_params["metadata"]
+        if "user_id" in llm_params and isinstance(llm_params["user_id"], str):
+            base_payload["user_id"] = llm_params["user_id"]
+        if "owner_type" in llm_params and isinstance(llm_params["owner_type"], str):
+            base_payload["owner_type"] = llm_params["owner_type"]
+
+        pending_system_message = system_message
+        pending_user_message = user_message
+        pending_tool_result = ""
 
         max_iterations = 10
         for _ in range(max_iterations):
@@ -103,15 +119,26 @@ class VelixProcess:
             payload = dict(base_payload)
             payload["request_id"] = f"req_{self.velix_pid}_{uuid.uuid4().hex[:8]}"
             payload["trace_id"] = uuid.uuid4().hex
-            if next_messages:
-                payload["messages"] = list(next_messages)
+            if pending_tool_result:
+                payload["tool_result"] = pending_tool_result
+            else:
+                if pending_system_message:
+                    payload["system_message"] = pending_system_message
+                if pending_user_message:
+                    payload["user_message"] = pending_user_message
+
+            pending_system_message = ""
+            pending_user_message = ""
 
             resp = self._request("LLM_SCHEDULER", payload, timeout_ms=120000)
             if resp.get("status") != "ok":
                 self.status = "ERROR"
                 raise RuntimeError(resp.get("error", "llm request failed"))
 
-            if not bool(resp.get("exec_required", False)):
+            tool_calls = self._extract_tool_calls(resp)
+            exec_required = bool(resp.get("exec_required", False))
+
+            if not exec_required and not tool_calls:
                 self.status = "RUNNING"
                 return str(resp.get("response", ""))
 
@@ -119,7 +146,7 @@ class VelixProcess:
             tool_messages = []
             tool_executed = False
 
-            for tool_call in self._extract_tool_calls(resp):
+            for tool_call in tool_calls:
                 name = str(tool_call.get("name", "")).strip()
                 if not name:
                     continue
@@ -142,15 +169,32 @@ class VelixProcess:
                 self.status = "RUNNING"
                 return str(resp.get("response", ""))
 
-            # Scheduler owns historical context; only send newly generated
-            # tool messages on next pass.
-            next_messages = tool_messages
+            # Feed tool output through conversation manager so the scheduler
+            # can rebuild complete history on the next turn.
+            pending_tool_result = json.dumps(tool_messages)
 
         self.status = "ERROR"
         return "Failure: Agent state machine exceeded max iterations."
 
     def _extract_tool_calls(self, scheduler_reply: Dict[str, Any]) -> list:
         tool_calls = []
+
+        exec_blocks = scheduler_reply.get("exec_blocks", [])
+        if isinstance(exec_blocks, list):
+            for block in exec_blocks:
+                if isinstance(block, dict):
+                    tool_calls.append(block)
+                    continue
+                if isinstance(block, str):
+                    raw = block.strip()
+                    if not raw:
+                        continue
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            tool_calls.append(parsed)
+                    except Exception:
+                        pass
 
         structured = scheduler_reply.get("tool_calls", [])
         if isinstance(structured, list):
@@ -323,11 +367,30 @@ class VelixProcess:
 
     @staticmethod
     def _get_port(service_name: str, fallback: int) -> int:
-        for path in ("config/ports.json", "../config/ports.json", "build/config/ports.json"):
+        alias_map = {
+            "SCHEDULER": ["LLM_SCHEDULER", "SCHEDULER"],
+            "LLM_SCHEDULER": ["LLM_SCHEDULER", "SCHEDULER"],
+        }
+        lookup_keys = alias_map.get(service_name, [service_name])
+
+        here = os.path.abspath(os.path.dirname(__file__))
+        repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+
+        candidate_paths = [
+            os.path.join(os.getcwd(), "config", "ports.json"),
+            os.path.join(os.getcwd(), "..", "config", "ports.json"),
+            os.path.join(os.getcwd(), "build", "config", "ports.json"),
+            os.path.join(repo_root, "config", "ports.json"),
+            os.path.join(repo_root, "build", "config", "ports.json"),
+        ]
+
+        for path in candidate_paths:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     ports = json.load(f)
-                    return int(ports.get(service_name, fallback))
+                for key in lookup_keys:
+                    if key in ports:
+                        return int(ports.get(key, fallback))
             except Exception:
                 continue
         return fallback

@@ -1,10 +1,15 @@
 {
   "name": "commandline",
   "type": "skill",
-  "description": "Execute system commands securely via C++ SDK",
+  "description": "Execute controlled commandline operations with sandboxed write policy.",
   "runtime": "cpp",
   "workdir": "../../build/skills/commandline",
-  "prepare": [],
+  "prepare": [
+    {
+      "command": "mkdir",
+      "args": ["-p", "agent_playground/tmp"]
+    }
+  ],
   "parameters": {
     "type": "object",
     "properties": {
@@ -16,6 +21,18 @@
         "type": "array",
         "items": { "type": "string" },
         "description": "List of arguments for the command"
+      },
+      "timeout_sec": {
+        "type": "number",
+        "description": "Execution timeout in seconds (1-600)"
+      },
+      "cwd_mode": {
+        "type": "string",
+        "description": "Start directory mode: playground (default), tmp, or repo"
+      },
+      "cwd": {
+        "type": "string",
+        "description": "Optional path under repo root to use as current directory"
       }
     },
     "required": ["cmd"]

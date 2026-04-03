@@ -32,6 +32,12 @@ namespace velix::communication
         explicit SocketException(const std::string &msg) : std::runtime_error(msg) {}
     };
 
+    class SocketTimeoutException : public SocketException
+    {
+    public:
+        explicit SocketTimeoutException(const std::string &msg) : SocketException(msg) {}
+    };
+
     /**
      * Initialize Winsock once at program startup (Windows only).
      * Call this exactly once before creating any sockets.
@@ -316,6 +322,11 @@ namespace velix::communication
             int result = ::recv(socket_handle, buffer, len, 0);
             if (result == SOCKET_ERROR)
             {
+                const int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK)
+                {
+                    throw SocketTimeoutException("Recv timeout: " + get_socket_error());
+                }
                 throw SocketException("Recv failed: " + get_socket_error());
             }
 #else
@@ -328,6 +339,10 @@ namespace velix::communication
 
             if (result == -1)
             {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)
+                {
+                    throw SocketTimeoutException("Recv timeout: " + get_socket_error());
+                }
                 throw SocketException("Recv failed: " + get_socket_error());
             }
 #endif

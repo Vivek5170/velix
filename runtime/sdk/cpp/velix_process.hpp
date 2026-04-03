@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <condition_variable>
 
@@ -40,12 +41,30 @@ public:
     // Catch exceptions in your run() only if you can recover locally.
     // Otherwise let them propagate so the Supervisor receives accurate state.
 
-    // Natively handles the LLM -> EXEC -> LLM loop synchronously
-    // by intercepting tool loops and offloading them to the Executioner
-    // without waking the developer's blocked logic block.
-    // Throws on scheduler rejection, timeout, malformed responses, or tool
-    // crash propagation.
-    std::string call_llm(const std::string& convo_id, const std::string& user_message = "", const std::string& system_message = "");
+    // Handles the requester-side LLM -> tool_calls -> LLM loop synchronously.
+    // Universal protocol contract (for all SDK languages):
+    // - Scheduler input envelope:   message_type="LLM_REQUEST"
+    // - Optional stream chunks:     message_type="LLM_STREAM_CHUNK", delta=string
+    // - Final scheduler envelope:   message_type="LLM_RESPONSE"
+    // - Final payload fields used by SDK: response, tool_calls, assistant_message
+    // - SDK must append ToolResultMessage objects:
+    //   {"role":"tool","tool_call_id":string,"content":string}
+    //
+    // Scheduler is source-of-truth for assistant_message and tool_call shape.
+    // Throws on scheduler rejection, timeout, malformed responses, or tool crash propagation.
+    std::string call_llm(const std::string& convo_id,
+                         const std::string& user_message = "",
+                         const std::string& system_message = "",
+                         const std::string& user_id = "");
+
+    // Streaming variant for terminal/process UX. The scheduler decides eligibility
+    // and emits token chunks when streaming is active; callback is invoked per token chunk.
+    std::string call_llm_stream(
+        const std::string& convo_id,
+        const std::string& user_message,
+        const std::function<void(const std::string&)>& on_token,
+        const std::string& system_message = "",
+        const std::string& user_id = "");
 
     // Allows the developer to explicitly force a tool payload without LLM.
     // Throws on executioner connectivity failure, spawn failure, timeout,
@@ -70,7 +89,7 @@ protected:
     int velix_pid{-1};
     int parent_pid{-1};
     bool is_root{false};
-    bool result_reported{false}; // Tracks if a final tool result was dispatched
+    std::atomic<bool> result_reported{false}; // Tracks if a final tool result was dispatched
     std::string entry_trace_id;  // The trace ID that launched this process
     std::atomic<ProcessStatus> status{ProcessStatus::STARTING};
 
@@ -123,6 +142,16 @@ protected:
     uint64_t get_current_memory_usage_mb() const;
     void send_heartbeat();
     std::string send_llm_request_stateless(const json& request_payload);
+    std::string send_llm_request_stateless_stream(
+        const json& request_payload,
+        const std::function<void(const std::string&)>& on_token);
+    std::string call_llm_internal(
+        const std::string& convo_id,
+        const std::string& user_message,
+        const std::string& system_message,
+        const std::string& user_id,
+        bool stream_requested,
+        const std::function<void(const std::string&)>& on_token);
     json exec_velix_process(const std::string& name, const json& params, const std::string& trace_id = "");
     void report_result(int target_pid, const json& data, const std::string& trace_id = "");
     static int resolve_port(const std::string& service_name, int fallback);
