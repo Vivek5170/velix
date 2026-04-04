@@ -1,0 +1,28 @@
+{
+  "name": "stress_test_executor",
+  "type": "skill",
+  "description": "Launches concurrent terminal skill calls and reports per-call latency and failures.",
+  "runtime": "cpp",
+  "workdir": ".",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "calls": {
+        "type": "number",
+        "description": "Number of concurrent terminal calls to launch (default 10, max 50)."
+      },
+      "cmd": {
+        "type": "string",
+        "description": "Terminal command to run for each call."
+      },
+      "timeout_sec": {
+        "type": "number",
+        "description": "Timeout in seconds for each terminal call."
+      }
+    }
+  },
+  "run": {
+    "command": "./build/main",
+    "args": []
+  }
+}

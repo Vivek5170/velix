@@ -27,7 +27,7 @@ struct CompacterConfig {
 	int summary_priority{2};
 	int scheduler_timeout_ms{30000};
 	std::string summary_tree_id{"TREE_HANDLER"};
-	int summary_source_pid{-2};
+	int summary_source_pid{1000};
 	std::string history_file{"memory/history.json"};
 };
 
@@ -87,6 +87,12 @@ CompacterConfig load_compacter_config() {
 		cfg.history_file = j.value("history_file", cfg.history_file);
 	} catch (const std::exception& e) {
 		LOG_ERROR(std::string("Failed parsing config/compacter.json: ") + e.what());
+	}
+
+	// Compaction requests must carry a valid positive source pid to satisfy
+	// scheduler/supervisor validation.
+	if (cfg.summary_source_pid <= 0) {
+		cfg.summary_source_pid = 1000;
 	}
 
 	if (cfg.keep_recent_turns == 0) {
@@ -216,6 +222,9 @@ std::string request_llm_summary(
 		{"request_id", random_id("COMPACT")},
 		{"tree_id", cfg.summary_tree_id},
 		{"source_pid", cfg.summary_source_pid},
+		{"mode", "simple"},
+		{"convo_id", ""},
+		{"user_id", ""},
 		{"priority", std::numeric_limits<int>::max()},
 		{"inherit_key", nullptr},
 		{"messages", nlohmann::json::array({

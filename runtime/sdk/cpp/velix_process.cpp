@@ -3,6 +3,7 @@
 #include "../../../communication/network_config.hpp"
 
 #include <chrono>
+#include <algorithm>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -172,6 +173,40 @@ std::string receive_scheduler_response(
   }
 
   throw std::runtime_error("scheduler stream chunk limit exceeded");
+}
+
+json receive_executioner_ack(
+    velix::communication::SocketWrapper &exec_socket,
+    int exec_timeout_ms,
+    const std::atomic<bool> &is_running) {
+  const int poll_timeout_ms =
+      std::max(250, std::min(exec_timeout_ms, 2000));
+  exec_socket.set_timeout_ms(poll_timeout_ms);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(exec_timeout_ms + 2000);
+
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!is_running.load()) {
+      throw std::runtime_error("process shutdown during executioner ack wait");
+    }
+
+    try {
+      const std::string raw = velix::communication::recv_json(exec_socket);
+      return json::parse(raw);
+    } catch (const velix::communication::SocketTimeoutException &) {
+      continue;
+    } catch (const std::exception &e) {
+      const std::string err = e.what();
+      if (is_transient_socket_error(err)) {
+        continue;
+      }
+      throw;
+    }
+  }
+
+  throw std::runtime_error("executioner ack deadline exceeded");
 }
 } // namespace
 
@@ -614,31 +649,66 @@ json VelixProcess::execute_tool_internal(
     }
 
     const int exec_port = resolve_port("EXECUTIONER", 5172);
-    velix::communication::SocketWrapper exec_socket;
-    try {
-      exec_socket.create_tcp_socket();
-      exec_socket.connect(
-          velix::communication::resolve_service_host("EXECUTIONER", "127.0.0.1"),
-          static_cast<uint16_t>(exec_port));
-      const int exec_timeout = velix::utils::get_config("SDK_EXEC_TIMEOUT_MS", 120000);
-      exec_socket.set_timeout_ms(exec_timeout);
-      velix::communication::send_json(exec_socket, launch_req.dump());
+    const int exec_timeout =
+        velix::utils::get_config("SDK_EXEC_TIMEOUT_MS", 120000);
+    const int exec_retry_limit =
+        velix::utils::get_config("SDK_EXEC_RETRY_LIMIT", 3);
+    const int exec_retry_delay =
+        velix::utils::get_config("SDK_EXEC_RETRY_DELAY_MS", 300);
+    const int connect_retry_limit = velix::utils::get_config("SDK_RETRY_LIMIT", 3);
+    const int connect_retry_delay = velix::utils::get_config("SDK_RETRY_DELAY_MS", 500);
 
-      // Phase 1: Wait for immediate launcher "ok"
-      const std::string raw = velix::communication::recv_json(exec_socket);
-      json ack = json::parse(raw);
-      if (ack.value("status", "") != "ok") {
-        throw std::runtime_error(
-            "Velix Launcher Failure: " +
-            ack.value("message", ack.value("error", "unknown rejection")));
+    std::string last_exec_error = "unknown";
+    bool launch_acked = false;
+
+    for (int attempt = 0; attempt < std::max(1, exec_retry_limit); ++attempt) {
+      try {
+        velix::communication::SocketWrapper exec_socket;
+        connect_with_retries(exec_socket, "EXECUTIONER", exec_port,
+                             connect_retry_limit, connect_retry_delay);
+
+        velix::communication::send_json(exec_socket, launch_req.dump());
+        json ack = receive_executioner_ack(exec_socket, exec_timeout, is_running);
+
+        if (ack.value("status", "") == "ok") {
+          launch_acked = true;
+          break;
+        }
+
+        const std::string launcher_error =
+            ack.value("message", ack.value("error", "unknown rejection"));
+        last_exec_error = "Velix Launcher Failure: " + launcher_error;
+
+        const bool retryable_busy =
+            launcher_error.find("busy") != std::string::npos;
+        if (retryable_busy && attempt + 1 < exec_retry_limit) {
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(exec_retry_delay * (attempt + 1)));
+          continue;
+        }
+
+        throw std::runtime_error(last_exec_error);
+      } catch (const std::exception &e) {
+        last_exec_error = e.what();
+        const bool retryable =
+            is_transient_socket_error(last_exec_error) ||
+            last_exec_error.find("executioner ack deadline exceeded") != std::string::npos ||
+            last_exec_error.find("busy") != std::string::npos;
+
+        if (attempt + 1 < exec_retry_limit && retryable) {
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(exec_retry_delay * (attempt + 1)));
+          continue;
+        }
+        break;
       }
-    } catch (const std::exception &e) {
-      if (std::string(e.what()).find("Velix Launcher Failure") !=
-          std::string::npos) {
-        throw;
+    }
+
+    if (!launch_acked) {
+      if (last_exec_error.find("Velix Launcher Failure") != std::string::npos) {
+        throw std::runtime_error(last_exec_error);
       }
-      throw std::runtime_error("Velix Executioner Link Failed: " +
-                               std::string(e.what()));
+      throw std::runtime_error("Velix Executioner Link Failed: " + last_exec_error);
     }
 
     // Phase 2: Reactive Wait on the Velix Bus for the actual skill output

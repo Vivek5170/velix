@@ -133,6 +133,28 @@ struct TerminalConfig {
 };
 
 static TerminalConfig g_cfg;
+static std::mutex g_skill_log_mx;
+
+static void skill_log(const std::string &stage,
+                      const json &fields = json::object()) {
+  try {
+    std::lock_guard<std::mutex> lock(g_skill_log_mx);
+    fs::create_directories("logs");
+    std::ofstream out("logs/approval_trace.log", std::ios::app);
+    if (!out.is_open()) {
+      return;
+    }
+    json record = {
+        {"ts_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count()},
+        {"stage", stage},
+        {"fields", fields}};
+    out << record.dump() << "\n";
+  } catch (...) {
+    // Best-effort logging only.
+  }
+}
 
 static std::string expand_home(const std::string &p) {
   if (p.empty() || p[0] != '~')
@@ -941,24 +963,38 @@ private:
   // ── Approval ──────────────────────────────────────────────────────────
 
   ApprovalResult check_approval(const std::string &full_cmd, bool force) {
-    if (force)
+    if (force) {
+      skill_log("approval_skip_force", {{"command", full_cmd}});
       return approved_ok("force flag set");
-    if (g_cfg.approval_mode == "off")
+    }
+    if (g_cfg.approval_mode == "off") {
+      skill_log("approval_skip_mode_off", {{"command", full_cmd}});
       return approved_ok("approval disabled");
+    }
 
     bool must_prompt = (g_cfg.approval_mode == "manual");
     DetectResult det;
     if (!must_prompt) {
       det = detect_dangerous(full_cmd);
-      if (!det.is_dangerous)
+      if (!det.is_dangerous) {
+        skill_log("approval_not_required", {{"command", full_cmd}});
         return approved_ok("");
+      }
     } else {
       det = {true, "manual_mode", "manual approval mode"};
     }
 
-    if (is_approved(det.pattern_key))
+    skill_log("approval_required",
+              {{"command", full_cmd},
+               {"pattern_key", det.pattern_key},
+               {"description", det.description}});
+
+    if (is_approved(det.pattern_key)) {
+      skill_log("approval_allowlist_hit",
+                {{"command", full_cmd}, {"pattern_key", det.pattern_key}});
       return {true, ApprovalScope::Session, "Previously approved",
               det.pattern_key, det.description};
+    }
 
     return ask_handler(full_cmd, det.pattern_key, det.description);
   }
@@ -980,6 +1016,11 @@ private:
                              const std::string &pattern_key,
                              const std::string &description) {
     std::string trace = velix::utils::generate_uuid();
+    skill_log("approval_request_created",
+          {{"approval_trace", trace},
+           {"command", full_cmd},
+           {"pattern_key", pattern_key},
+           {"description", description}});
 
     std::mutex approval_mx;
     std::condition_variable approval_cv;
@@ -1001,6 +1042,8 @@ private:
         std::lock_guard<std::mutex> ilk(approval_mx);
         reply_scope = pl.value("scope", "deny");
         got_reply = true;
+        skill_log("approval_reply_received",
+                  {{"approval_trace", trace}, {"scope", reply_scope}});
         approval_cv.notify_one();
         // Heavy work (allowlist writes etc.) happens on run() thread
         // after wait_for returns — not here.
@@ -1012,10 +1055,14 @@ private:
                   {"command", full_cmd},
                   {"description", description},
                   {"pattern_key", pattern_key}});
+    skill_log("approval_request_sent",
+          {{"approval_trace", trace},
+           {"timeout_sec", g_cfg.approval_timeout}});
 
     bool timed_out_flag;
     {
       std::unique_lock<std::mutex> lk(approval_mx);
+      skill_log("approval_wait_start", {{"approval_trace", trace}});
       timed_out_flag = !approval_cv.wait_for(
           lk, std::chrono::seconds(g_cfg.approval_timeout),
           [&] { return got_reply; });
@@ -1027,26 +1074,36 @@ private:
       on_bus_event = nullptr;
     }
 
-    if (timed_out_flag)
+    if (timed_out_flag) {
+      skill_log("approval_wait_timeout", {{"approval_trace", trace}});
       return {false, ApprovalScope::Deny,
               "Approval timed out after " +
                   std::to_string(g_cfg.approval_timeout) + "s — denied.",
               pattern_key, description};
+    }
 
     ApprovalScope scope = reply_scope == "once"      ? ApprovalScope::Once
                           : reply_scope == "session" ? ApprovalScope::Session
                           : reply_scope == "always"  ? ApprovalScope::Always
                                                      : ApprovalScope::Deny;
 
-    if (scope == ApprovalScope::Deny)
+    if (scope == ApprovalScope::Deny) {
+      skill_log("approval_denied",
+                {{"approval_trace", trace}, {"scope", reply_scope}});
       return {false, scope, "User denied: " + description, pattern_key,
               description};
+    }
 
     // Allowlist writes here, safely on run() thread
     if (scope == ApprovalScope::Session)
       approve_session(pattern_key);
     if (scope == ApprovalScope::Always)
       approve_permanent(pattern_key);
+
+    skill_log("approval_granted",
+              {{"approval_trace", trace},
+               {"scope", reply_scope},
+               {"pattern_key", pattern_key}});
 
     return {true, scope, "Approved (" + reply_scope + ")", pattern_key,
             description};
