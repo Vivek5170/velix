@@ -25,6 +25,156 @@
 namespace velix {
 namespace core {
 
+namespace {
+bool is_supported_intent_value(const std::string &intent) {
+  return intent == "JOIN_PARENT_TREE" || intent == "NEW_TREE";
+}
+
+// Helper function to parse environment variables
+void parse_environment_variables(int &parent_pid, std::string &entry_trace_id, std::string &launch_intent, json &params, std::string &user_id) {
+  char *env_parent_pid = std::getenv("VELIX_PARENT_PID");
+  if (env_parent_pid) {
+    parent_pid = std::atoi(env_parent_pid);
+  }
+
+  char *env_trace_id = std::getenv("VELIX_TRACE_ID");
+  if (env_trace_id) {
+    entry_trace_id = env_trace_id;
+  }
+
+  char *env_intent = std::getenv("VELIX_INTENT");
+  if (env_intent) {
+    launch_intent = env_intent;
+  }
+
+  char *env_params = std::getenv("VELIX_PARAMS");
+  if (env_params) {
+    try {
+      params = json::parse(env_params);
+    } catch (...) {
+      params = json::object();
+    }
+  }
+
+  char *env_user_id = std::getenv("VELIX_USER_ID");
+  if (env_user_id) {
+    user_id = env_user_id;
+  }
+}
+
+// Helper function for intent validation
+std::string validate_launch_intent(const std::string &role, int parent_pid, const std::string &launch_intent) {
+  if (launch_intent != "JOIN_PARENT_TREE" && launch_intent != "NEW_TREE") {
+    if (role == "handler") {
+      return "JOIN_PARENT_TREE";
+    }
+    return (parent_pid > 0) ? "JOIN_PARENT_TREE" : "NEW_TREE";
+  }
+  return launch_intent;
+}
+
+bool is_transient_socket_error(const std::string &err) {
+  return err.find("timed out") != std::string::npos ||
+         err.find("timeout") != std::string::npos ||
+         err.find("errno 11") != std::string::npos ||
+         err.find("errno 35") != std::string::npos ||
+         err.find("errno 110") != std::string::npos ||
+         err.find("Resource temporarily unavailable") != std::string::npos;
+}
+
+// Helper function for connection retries
+void connect_with_retries(velix::communication::SocketWrapper &socket, const std::string &service_name, int port, int retry_limit, int retry_delay) {
+  for (int i = 0; i < retry_limit; ++i) {
+    try {
+      socket.create_tcp_socket();
+      socket.connect(velix::communication::resolve_service_host(service_name, "127.0.0.1"), static_cast<uint16_t>(port));
+      return;
+    } catch (...) {
+      if (i == retry_limit - 1) {
+        throw;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay * (i + 1)));
+    }
+  }
+}
+
+std::string resolve_effective_mode(const std::string &mode,
+                                   const std::string &convo_id,
+                                   const std::string &effective_user_id,
+                                   bool is_handler) {
+  if (!mode.empty()) {
+    return mode;
+  }
+  if (convo_id.empty() && effective_user_id.empty()) {
+    return "simple";
+  }
+  if (!effective_user_id.empty() && is_handler) {
+    return "user_conversation";
+  }
+  return "conversation";
+}
+
+std::string receive_scheduler_response(
+    velix::communication::SocketWrapper &scheduler_socket,
+    bool request_streaming, int llm_timeout,
+    const std::atomic<bool> &is_running,
+    const std::function<void(const std::string &)> &on_token) {
+  if (!request_streaming) {
+    return velix::communication::recv_json(scheduler_socket);
+  }
+
+  const int max_chunks =
+      velix::utils::get_config("SDK_STREAM_MAX_CHUNKS", 100000);
+  int chunk_count = 0;
+  const auto stream_deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(llm_timeout + 10000);
+
+  while (chunk_count++ < max_chunks) {
+    if (!is_running.load()) {
+      throw std::runtime_error("process shutdown during streaming");
+    }
+
+    if (std::chrono::steady_clock::now() > stream_deadline) {
+      throw std::runtime_error("scheduler stream deadline exceeded");
+    }
+
+    std::string raw;
+    try {
+      raw = velix::communication::recv_json(scheduler_socket);
+    } catch (const velix::communication::SocketTimeoutException &) {
+      continue;
+    } catch (const std::exception &e) {
+      const std::string err = e.what();
+      if (is_transient_socket_error(err)) {
+        continue;
+      }
+      throw;
+    }
+
+    json message;
+    try {
+      message = json::parse(raw);
+    } catch (...) {
+      continue;
+    }
+
+    if (message.value("message_type", std::string("")) ==
+        "LLM_STREAM_CHUNK") {
+      const std::string delta = message.value("delta", std::string(""));
+      if (!delta.empty() && on_token) {
+        on_token(delta);
+      }
+      continue;
+    }
+
+    return raw;
+  }
+
+  throw std::runtime_error("scheduler stream chunk limit exceeded");
+}
+} // namespace
+
 VelixProcess *VelixProcess::instance_ = nullptr;
 
 #ifdef _WIN32
@@ -64,6 +214,14 @@ void VelixProcess::shutdown() {
   if (is_running.load()) {
     is_running.store(false);
     force_terminate.store(true);
+
+    try {
+      on_shutdown();
+    } catch (const std::exception &e) {
+      LOG_WARN("VelixProcess on_shutdown() failed: " + std::string(e.what()));
+    } catch (...) {
+      LOG_WARN("VelixProcess on_shutdown() failed with unknown exception");
+    }
 
     // Wake up the idle IO thread immediately so it can send the final heartbeat
     sleep_cv.notify_all();
@@ -143,72 +301,16 @@ void VelixProcess::start(int override_pid,
   params = json::object();
   user_id.clear();
 
-  char *env_parent_pid = std::getenv("VELIX_PARENT_PID");
-  if (env_parent_pid) {
-    parent_pid = std::atoi(env_parent_pid);
-  }
-  is_root = (parent_pid <= 0);
-
-  char *env_trace_id = std::getenv("VELIX_TRACE_ID");
-  if (env_trace_id) {
-    entry_trace_id = env_trace_id;
-  }
-
-  char *env_intent = std::getenv("VELIX_INTENT");
-  if (env_intent) {
-    launch_intent = env_intent;
-  }
-
-  if (launch_intent != "JOIN_PARENT_TREE" && launch_intent != "NEW_TREE") {
-    // No env context: handler is the bootstrap process and should join handler tree.
-    if (role == "handler") {
-      launch_intent = "JOIN_PARENT_TREE";
-      parent_pid = -1;
-    } else {
-      launch_intent = (parent_pid > 0) ? "JOIN_PARENT_TREE" : "NEW_TREE";
-    }
-  }
+  parse_environment_variables(parent_pid, entry_trace_id, launch_intent, params, user_id);
+  launch_intent = validate_launch_intent(role, parent_pid, launch_intent);
   is_root = (launch_intent == "NEW_TREE");
 
-  char *env_params = std::getenv("VELIX_PARAMS");
-  if (env_params) {
-    try {
-      params = json::parse(env_params);
-    } catch (...) {
-      params = json::object();
-    }
-  }
-
-  // Read user_id from environment variables
-  char *env_user_id = std::getenv("VELIX_USER_ID");
-  if (env_user_id) {
-    user_id = env_user_id;
-  }
-
   const int sup_port = resolve_port("SUPERVISOR", 5173);
-  bool connected = false;
   const int retry_limit = velix::utils::get_config("SDK_RETRY_LIMIT", 3);
   const int retry_delay = velix::utils::get_config("SDK_RETRY_DELAY_MS", 500);
 
-  for (int i = 0; i < retry_limit; ++i) {
-    try {
-      supervisor_socket.create_tcp_socket();
-        supervisor_socket.connect(
-          velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
-          static_cast<uint16_t>(sup_port));
-      connected = true;
-      break;
-    } catch (...) {
-      if (i == retry_limit - 1)
-        throw;
-      std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay * (i + 1)));
-    }
-  }
-
-  if (!connected) {
-    throw std::runtime_error(
-        "VelixProcess SDK: Failed to connect to supervisor after attempts.");
-  }
+  connect_with_retries(supervisor_socket, "SUPERVISOR", sup_port,
+                       retry_limit, retry_delay);
 
   // Register the agent explicitly with the OS kernel matching exact schema
   json payload = {
@@ -228,13 +330,11 @@ void VelixProcess::start(int override_pid,
   {
     std::lock_guard<std::mutex> lock(socket_mutex);
     velix::communication::send_json(supervisor_socket, reg_msg.dump());
-    const std::string raw_reply =
-        velix::communication::recv_json(supervisor_socket);
+    const std::string raw_reply = velix::communication::recv_json(supervisor_socket);
     const json reply = json::parse(raw_reply);
 
     if (reply.value("status", "") != "ok") {
-      throw std::runtime_error("VelixProcess supervisor registration failed: " +
-                               reply.value("error", "unknown"));
+      throw std::runtime_error("VelixProcess supervisor registration failed: " + reply.value("error", "unknown"));
     }
 
     // The Kernel dynamically assigns us our true Velix PID and Tree ID!
@@ -259,13 +359,14 @@ void VelixProcess::start(int override_pid,
   {
     const int bus_port = resolve_port("BUS", 5174);
     try {
-      bus_socket.create_tcp_socket();
-        bus_socket.connect(
-          velix::communication::resolve_service_host("BUS", "127.0.0.1"),
-          static_cast<uint16_t>(bus_port));
+      connect_with_retries(bus_socket, "BUS", bus_port, retry_limit,
+                           retry_delay);
       bus_socket.set_timeout_ms(1000);
 
-      json bus_reg = {{"message_type", "BUS_REGISTER"}, {"pid", velix_pid}};
+      json bus_reg = {{"message_type", "BUS_REGISTER"},
+              {"pid", velix_pid},
+              {"tree_id", tree_id},
+              {"is_root", is_root}};
       velix::communication::send_json(bus_socket, bus_reg.dump());
       velix::communication::recv_json(bus_socket); // OK ack
 
@@ -380,11 +481,25 @@ void VelixProcess::bus_listener_loop() {
         if (msg_type == "IPM_PUSH" || msg_type == "CHILD_TERMINATED") {
           const std::string trace_id = msg.value("trace_id", "");
           const json payload = msg.value("payload", json::object());
+          bool routed_to_rpc = false;
 
           if (!trace_id.empty()) {
             std::lock_guard<std::mutex> lock(queue_mutex);
-            response_map[trace_id] = payload;
-            queue_cv.notify_all();
+            if (pending_response_traces.count(trace_id) > 0) {
+              response_map[trace_id] = payload;
+              queue_cv.notify_all();
+              routed_to_rpc = true;
+            }
+          }
+
+          if (!routed_to_rpc && on_bus_event) {
+            try {
+              on_bus_event(msg);
+            } catch (const std::exception &e) {
+              LOG_WARN("on_bus_event hook failed: " + std::string(e.what()));
+            } catch (...) {
+              LOG_WARN("on_bus_event hook failed with unknown exception");
+            }
           }
         }
       } catch (const velix::communication::SocketTimeoutException &) {
@@ -393,10 +508,7 @@ void VelixProcess::bus_listener_loop() {
       } catch (const std::exception &e) {
         const std::string err = e.what();
         // Socket timeout: keep looping so shutdown can flip is_running.
-        if (err.find("errno 11") != std::string::npos ||
-            err.find("errno 35") != std::string::npos ||
-            err.find("timed out") != std::string::npos ||
-            err.find("timeout") != std::string::npos) {
+        if (is_transient_socket_error(err)) {
           std::this_thread::sleep_for(std::chrono::milliseconds(10));
           continue;
         }
@@ -430,15 +542,53 @@ json VelixProcess::execute_tool_internal(
     const std::string &instruction, const json &args,
     const std::optional<std::string> &user_id_override,
     const std::optional<std::string> &intent_override) {
+  auto call_on_tool_finish = [&](const json &tool_result = json::object()) {
+    if (!on_tool_finish) {
+      return;
+    }
+    try {
+      on_tool_finish(instruction, tool_result);
+    } catch (const std::exception &e) {
+      LOG_WARN("on_tool_finish hook failed: " + std::string(e.what()));
+    } catch (...) {
+      LOG_WARN("on_tool_finish hook failed with unknown exception");
+    }
+  };
+
+  std::string actual_trace;
+  bool pending_trace_registered = false;
+  auto clear_pending_trace = [&]() {
+    if (!pending_trace_registered || actual_trace.empty()) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    pending_response_traces.erase(actual_trace);
+    pending_trace_registered = false;
+  };
+
   try {
     status.store(ProcessStatus::RUNNING);
 
-    const std::string actual_trace = velix::utils::generate_uuid();
+    if (on_tool_start) {
+      try {
+        on_tool_start(instruction, args);
+      } catch (const std::exception &e) {
+        LOG_WARN("on_tool_start hook failed: " + std::string(e.what()));
+      } catch (...) {
+        LOG_WARN("on_tool_start hook failed with unknown exception");
+      }
+    }
+
+    actual_trace = velix::utils::generate_uuid();
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex);
+      pending_response_traces.insert(actual_trace);
+      pending_trace_registered = true;
+    }
 
     std::string effective_intent = "JOIN_PARENT_TREE";
     if (is_handler && intent_override.has_value() &&
-        (intent_override.value() == "JOIN_PARENT_TREE" ||
-         intent_override.value() == "NEW_TREE")) {
+      is_supported_intent_value(intent_override.value())) {
       effective_intent = intent_override.value();
     }
 
@@ -470,7 +620,7 @@ json VelixProcess::execute_tool_internal(
       exec_socket.connect(
           velix::communication::resolve_service_host("EXECUTIONER", "127.0.0.1"),
           static_cast<uint16_t>(exec_port));
-      const int exec_timeout = velix::utils::get_config("SDK_EXEC_TIMEOUT_MS", 5000);
+      const int exec_timeout = velix::utils::get_config("SDK_EXEC_TIMEOUT_MS", 120000);
       exec_socket.set_timeout_ms(exec_timeout);
       velix::communication::send_json(exec_socket, launch_req.dump());
 
@@ -502,6 +652,8 @@ json VelixProcess::execute_tool_internal(
           });
 
       if (!success) {
+        pending_response_traces.erase(actual_trace);
+        pending_trace_registered = false;
         throw std::runtime_error(
             "Velix Package Timeout: " + instruction +
             " exceeded reactive limit of " + std::to_string(bus_wait) + " mins");
@@ -509,6 +661,8 @@ json VelixProcess::execute_tool_internal(
 
       result = response_map[actual_trace];
       response_map.erase(actual_trace);
+      pending_response_traces.erase(actual_trace);
+      pending_trace_registered = false;
 
       // Reactive Fail-Fast for Terminal Kernel Events (Crashes/Killed)
       if (result.value("status", "") == "error" &&
@@ -521,9 +675,14 @@ json VelixProcess::execute_tool_internal(
       }
     }
 
+    call_on_tool_finish(result);
+
     return result;
   } catch (const std::exception &e) {
     status.store(ProcessStatus::ERROR);
+    clear_pending_trace();
+    json error_payload = {{"status", "error"}, {"message", e.what()}};
+    call_on_tool_finish(error_payload);
     throw;
   }
 }
@@ -543,6 +702,21 @@ void VelixProcess::report_result(int target_pid, const json &data,
 
   // Mark as reported to prevent the RAII guard from double-reporting on exit
   result_reported = true;
+}
+
+void VelixProcess::send_message(int target_pid, const std::string &purpose,
+                                const json &payload) {
+  if (!bus_socket.is_open())
+    return;
+
+  json relay = {{"message_type", "IPM_RELAY"}};
+  relay["target_pid"] = target_pid;
+  relay["purpose"] = purpose;
+  relay["user_id"] = user_id;
+  relay["payload"] = payload;
+
+  std::lock_guard<std::mutex> lock(bus_mutex);
+  velix::communication::send_json(bus_socket, relay.dump());
 }
 
 std::string VelixProcess::call_llm(const std::string &convo_id,
@@ -579,37 +753,12 @@ std::string VelixProcess::call_llm_internal(
       user_id.empty() ? this->user_id : user_id;
   const std::optional<std::string> effective_intent_override =
       (is_handler && intent_override.has_value() &&
-       (intent_override.value() == "JOIN_PARENT_TREE" ||
-        intent_override.value() == "NEW_TREE"))
+       is_supported_intent_value(intent_override.value()))
           ? intent_override
           : std::nullopt;
 
-  std::string effective_mode = mode;
-  if (effective_mode.empty()) {
-    if (convo_id.empty() && effective_user_id.empty()) {
-      effective_mode = "simple";
-    } else if (!effective_user_id.empty() && is_handler) {
-      effective_mode = "user_conversation";
-    } else {
-      effective_mode = "conversation";
-    }
-  }
-
-  if (effective_mode == "user_conversation") {
-    if (!is_handler) {
-      throw std::runtime_error(
-          "user_conversation mode is allowed only for handler process");
-    }
-    if (effective_user_id.empty()) {
-      throw std::runtime_error(
-          "user_conversation mode requires non-empty user_id");
-    }
-  }
-
-  if (effective_mode != "simple" && effective_mode != "conversation" &&
-      effective_mode != "user_conversation") {
-    throw std::runtime_error("unsupported mode: " + effective_mode);
-  }
+  const std::string effective_mode =
+      resolve_effective_mode(mode, convo_id, effective_user_id, is_handler);
 
   const std::string normalized_convo_id = convo_id;
   json base_payload = {{"mode", effective_mode},
@@ -628,31 +777,14 @@ std::string VelixProcess::call_llm_internal(
     const std::string trace_id = velix::utils::generate_uuid();
     const int sched_port = resolve_port("SCHEDULER", 5171);
     velix::communication::SocketWrapper scheduler_socket;
-
-    bool connected = false;
     const int retry_limit = velix::utils::get_config("SDK_RETRY_LIMIT", 3);
     const int retry_delay = velix::utils::get_config("SDK_RETRY_DELAY_MS", 500);
-
-    for (int i = 0; i < retry_limit; ++i) {
-      try {
-        scheduler_socket.create_tcp_socket();
-        scheduler_socket.connect(
-            velix::communication::resolve_service_host("SCHEDULER", "127.0.0.1"),
-            static_cast<uint16_t>(sched_port));
-        connected = true;
-        break;
-      } catch (...) {
-        if (i == retry_limit - 1) {
-          throw std::runtime_error("VelixProcess SDK: Failed to connect to "
-                                   "scheduler after retry attempts.");
-        }
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(retry_delay * (i + 1)));
-      }
-    }
-
-    if (!connected) {
-      throw std::runtime_error("VelixProcess SDK: scheduler connect failed");
+    try {
+      connect_with_retries(scheduler_socket, "SCHEDULER", sched_port,
+                           retry_limit, retry_delay);
+    } catch (...) {
+      throw std::runtime_error("VelixProcess SDK: Failed to connect to "
+                               "scheduler after retry attempts.");
     }
 
     json envelope = request_payload;
@@ -668,62 +800,8 @@ std::string VelixProcess::call_llm_internal(
     scheduler_socket.set_timeout_ms(llm_timeout);
     velix::communication::send_json(scheduler_socket, envelope.dump());
 
-    if (!request_streaming) {
-      return velix::communication::recv_json(scheduler_socket);
-    }
-
-    const int max_chunks = velix::utils::get_config("SDK_STREAM_MAX_CHUNKS", 100000);
-    int chunk_count = 0;
-    const auto stream_deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(llm_timeout + 10000);
-
-    while (chunk_count++ < max_chunks) {
-      if (!is_running.load()) {
-        throw std::runtime_error("process shutdown during streaming");
-      }
-
-      if (std::chrono::steady_clock::now() > stream_deadline) {
-        throw std::runtime_error("scheduler stream deadline exceeded");
-      }
-
-      std::string raw;
-      try {
-        raw = velix::communication::recv_json(scheduler_socket);
-      } catch (const velix::communication::SocketTimeoutException &) {
-        continue;
-      } catch (const std::exception &e) {
-        const std::string err = e.what();
-        if (err.find("timed out") != std::string::npos ||
-            err.find("timeout") != std::string::npos ||
-            err.find("errno 11") != std::string::npos ||
-            err.find("errno 35") != std::string::npos ||
-            err.find("errno 110") != std::string::npos ||
-            err.find("Resource temporarily unavailable") != std::string::npos) {
-          continue;
-        }
-        throw;
-      }
-
-      json message;
-      try {
-        message = json::parse(raw);
-      } catch (...) {
-        continue;
-      }
-
-      if (message.value("message_type", std::string("")) == "LLM_STREAM_CHUNK") {
-        const std::string delta = message.value("delta", std::string(""));
-        if (!delta.empty() && on_token) {
-          on_token(delta);
-        }
-        continue;
-      }
-
-      return raw;
-    }
-
-    throw std::runtime_error("scheduler stream chunk limit exceeded");
+    return receive_scheduler_response(scheduler_socket, request_streaming,
+                                      llm_timeout, is_running, on_token);
   };
 
   int loop_count = 0;
@@ -807,12 +885,20 @@ std::string VelixProcess::call_llm_internal(
           throw std::runtime_error("Malformed tool_call: missing id");
         }
 
-        const json tool_res = execute_tool_internal(
-          tool_name, tool_args,
-          effective_user_id.empty()
-            ? std::optional<std::string>{}
-            : std::optional<std::string>{effective_user_id},
-          effective_intent_override);
+        json tool_res;
+        try {
+          tool_res = execute_tool_internal(
+              tool_name, tool_args,
+              effective_user_id.empty()
+                  ? std::optional<std::string>{}
+                  : std::optional<std::string>{effective_user_id},
+              effective_intent_override);
+        } catch (const std::exception &e) {
+          tool_res = json{{"status", "error"},
+                          {"error", "tool_execution_failed"},
+                          {"message", e.what()},
+                          {"tool", tool_name}};
+        }
 
         return json{{"role", "tool"},
                     {"tool_call_id", tool_call_id},

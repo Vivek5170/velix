@@ -97,8 +97,30 @@ public:
   }
 
 private:
+  int resolve_target_pid(const json &msg, int requested_target_pid) {
+    if (requested_target_pid != -1) {
+      return requested_target_pid;
+    }
+
+    std::lock_guard<std::mutex> lock(registry_mutex_);
+    auto handler_it = tree_root_pid_map_.find("TREE_HANDLER");
+    if (handler_it != tree_root_pid_map_.end()) {
+      return handler_it->second;
+    }
+
+    const std::string tree_id = msg.value("tree_id", std::string(""));
+    auto tree_it = tree_root_pid_map_.find(tree_id);
+    if (tree_it != tree_root_pid_map_.end()) {
+      return tree_it->second;
+    }
+
+    return -1;
+  }
+
   void handle_session(velix::communication::SocketWrapper client_sock) {
     int registered_pid = -1;
+    std::string registered_tree_id;
+    bool registered_tree_root = false;
     auto socket_ptr = std::make_shared<velix::communication::SocketWrapper>(
         std::move(client_sock));
 
@@ -111,9 +133,14 @@ private:
 
         if (msg_type == "BUS_REGISTER") {
           registered_pid = msg.value("pid", -1);
+          registered_tree_id = msg.value("tree_id", std::string(""));
+          registered_tree_root = msg.value("is_root", false);
           if (registered_pid > 0) {
             std::lock_guard<std::mutex> lock(registry_mutex_);
             pid_sockets_[registered_pid] = socket_ptr;
+            if (registered_tree_root && !registered_tree_id.empty()) {
+              tree_root_pid_map_[registered_tree_id] = registered_pid;
+            }
             LOG_INFO_CTX("Process " + std::to_string(registered_pid) +
                              " connected to Bus",
                          "bus", "BUS", registered_pid, "register");
@@ -121,9 +148,14 @@ private:
                                             json({{"status", "ok"}}).dump());
           }
         } else if (msg_type == "IPM_RELAY") {
-          const int target_pid = msg.value("target_pid", -1);
+          const int requested_target_pid = msg.value("target_pid", -1);
+          const int target_pid = resolve_target_pid(msg, requested_target_pid);
           if (target_pid > 0) {
             relay_message(registered_pid, target_pid, msg);
+          } else {
+            LOG_WARN_CTX("Dropping relay due to unresolved target_pid=" +
+                             std::to_string(requested_target_pid),
+                         "bus", "", registered_pid, "relay_target_missing");
           }
         }
       }
@@ -135,6 +167,12 @@ private:
       std::lock_guard<std::mutex> lock(registry_mutex_);
       pid_sockets_.erase(registered_pid);
       delivery_mutexes_.erase(registered_pid);
+      if (!registered_tree_id.empty()) {
+        auto it = tree_root_pid_map_.find(registered_tree_id);
+        if (it != tree_root_pid_map_.end() && it->second == registered_pid) {
+          tree_root_pid_map_.erase(it);
+        }
+      }
     }
   }
 
@@ -187,6 +225,7 @@ private:
   std::unordered_map<int, std::shared_ptr<velix::communication::SocketWrapper>>
       pid_sockets_;
   std::unordered_map<int, std::shared_ptr<std::mutex>> delivery_mutexes_;
+  std::unordered_map<std::string, int> tree_root_pid_map_;
 };
 
 BusService &bus_instance() {

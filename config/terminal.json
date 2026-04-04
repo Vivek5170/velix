@@ -1,0 +1,38 @@
+{
+  "_comment": "Velix commandline skill configuration — loaded from ../../config/terminal.json",
+
+  "approval": {
+    "_comment_mode": "'smart' = pattern-match dangerous cmds and ask; 'off' = always allow; 'manual' = always ask",
+    "mode": "smart",
+
+    "_comment_timeout_sec": "Seconds to wait for handler approval reply before auto-denying",
+    "timeout_sec": 60
+  },
+
+  "execution": {
+    "_comment_default_timeout_sec": "Default command timeout if caller does not supply timeout_sec",
+    "default_timeout_sec": 30,
+
+    "_comment_max_timeout_sec": "Hard ceiling — caller cannot exceed this",
+    "max_timeout_sec": 600,
+
+    "_comment_max_output_chars": "stdout/stderr each truncated to this (head 40% + tail 60%)",
+    "max_output_chars": 50000
+  },
+
+  "sandbox": {
+    "_comment_playground_root": "Root directory for cwd_mode resolution (relative to skill workdir)",
+    "playground_root": "agent_playground",
+
+    "_comment_allow_path_escape": "If false, any cwd that escapes playground_root is rejected",
+    "allow_path_escape": true
+  },
+
+  "allowlist": {
+    "_comment_permanent_path": "Where permanent approvals are persisted. ~ is expanded.",
+    "permanent_path": "~/.velix/commandline_allowlist.txt",
+
+    "_comment_entries": "Patterns pre-approved at startup — no prompting needed for these",
+    "entries": []
+  }
+}

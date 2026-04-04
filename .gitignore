@@ -76,5 +76,6 @@ Thumbs.db
 # Environment variables
 .env
 
+memory/user.md
 memory/conversations/
-memory/daily-summaries/
+memory/daily_summaries/

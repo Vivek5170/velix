@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <optional>
+#include <unordered_set>
 
 #include "../../../communication/socket_wrapper.hpp"
 #include "../../../vendor/nlohmann/json.hpp"
@@ -74,6 +75,12 @@ public:
     // or child termination.
     json execute_tool(const std::string& instruction, const json& args);
 
+    // Send an event-style IPC message to another process. This message does
+    // not use trace_id routing and is delivered via on_bus_event on receiver.
+    void send_message(int target_pid,
+                      const std::string& purpose,
+                      const json& payload);
+
     // Main lifecycle initialization. Must be called by main() before process exit.
     // Connects to the Supervisor, sends REGISTER_PID, and spawns the heartbeat loop.
     // Throws if registration/connectivity contracts fail.
@@ -87,6 +94,18 @@ public:
     void request_forced_shutdown();
 
 protected:
+    // Optional lifecycle hook for SDK users to close custom resources cleanly
+    // before runtime threads and sockets are torn down.
+    virtual void on_shutdown() {}
+
+    // Optional developer hooks for tool execution lifecycle customization.
+    // Override by assigning lambdas/functions in derived process constructors.
+    std::function<void(const std::string&, const json&)> on_tool_start;
+    std::function<void(const std::string&, const json&)> on_tool_finish;
+
+    // Optional developer hook for non-RPC BUS events.
+    std::function<void(const json&)> on_bus_event;
+
     std::string process_name;
     std::string role; 
     std::string tree_id;
@@ -116,6 +135,7 @@ protected:
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
     std::map<std::string, json> response_map; // trace_id -> payload
+    std::unordered_set<std::string> pending_response_traces;
 
     // Two-Thread Architecture tracking
     std::thread runtime_io_thread;

@@ -1,0 +1,78 @@
+{
+  "name": "terminal",
+  "type": "skill",
+  "description": "Execute controlled terminal operations. Supports foreground, background (NOTIFY_HANDLER on completion), and PTY mode for interactive tools. Dangerous commands require handler approval.",
+  "runtime": "cpp",
+  "workdir": ".",
+  "prepare": [
+    {
+      "command": "mkdir",
+      "args": [
+        "-p",
+        "agent_playground/tmp"
+      ]
+    },
+    {
+      "command": "mkdir",
+      "args": [
+        "-p",
+        "agent_playground/repo"
+      ]
+    }
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "cmd": {
+        "type": "string",
+        "description": "Base command to execute (e.g. 'python3', 'git', 'npm')"
+      },
+      "args": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Argument list passed to cmd"
+      },
+      "timeout_sec": {
+        "type": "number",
+        "description": "Execution timeout in seconds (1–600, default from config). In background mode only applies to how long the background process is allowed to run."
+      },
+      "cwd_mode": {
+        "type": "string",
+        "enum": [
+          "playground",
+          "tmp",
+          "repo"
+        ],
+        "description": "Sandbox base directory. playground=agent_playground/, tmp=agent_playground/tmp/, repo=agent_playground/repo/"
+      },
+      "cwd": {
+        "type": "string",
+        "description": "Sub-path appended under cwd_mode root (e.g. 'src/utils'). Path escape via ../ is blocked."
+      },
+      "background": {
+        "type": "boolean",
+        "default": false,
+        "description": "Run detached. Returns immediately with status=background. Handler receives NOTIFY_HANDLER when the process exits."
+      },
+      "pty": {
+        "type": "boolean",
+        "default": false,
+        "description": "Allocate a pseudo-terminal (PTY). Required for interactive CLI tools (Python REPL, ncurses, etc.). Uses forkpty on Linux/macOS, ConPTY on Windows."
+      },
+      "force": {
+        "type": "boolean",
+        "default": false,
+        "description": "Skip dangerous-command approval check. Only set after explicit user confirmation."
+      }
+    },
+    "required": [
+      "cmd"
+    ]
+  },
+  "run": {
+    "command": "./build/main",
+    "args": []
+  }
+}
