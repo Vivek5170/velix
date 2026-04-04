@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <condition_variable>
+#include <optional>
 
 #include "../../../communication/socket_wrapper.hpp"
 #include "../../../vendor/nlohmann/json.hpp"
@@ -55,7 +56,8 @@ public:
     std::string call_llm(const std::string& convo_id,
                          const std::string& user_message = "",
                          const std::string& system_message = "",
-                         const std::string& user_id = "");
+                         const std::string& user_id = "",
+                         const std::string& mode = "");
 
     // Streaming variant for terminal/process UX. The scheduler decides eligibility
     // and emits token chunks when streaming is active; callback is invoked per token chunk.
@@ -64,7 +66,8 @@ public:
         const std::string& user_message,
         const std::function<void(const std::string&)>& on_token,
         const std::string& system_message = "",
-        const std::string& user_id = "");
+        const std::string& user_id = "",
+        const std::string& mode = "");
 
     // Allows the developer to explicitly force a tool payload without LLM.
     // Throws on executioner connectivity failure, spawn failure, timeout,
@@ -80,15 +83,18 @@ public:
     // Safe trigger to cleanly exit the `run()` loop and cleanly disconnect the OS socket.
     void shutdown();
 
+    // Signal-safe semantic entrypoint: mark forced termination then shutdown.
+    void request_forced_shutdown();
+
 protected:
     std::string process_name;
     std::string role; 
     std::string tree_id;
+    std::string user_id;
     json params; // Injected by Executioner on startup
     int os_pid{-1};
     int velix_pid{-1};
     int parent_pid{-1};
-    bool is_root{false};
     std::atomic<bool> result_reported{false}; // Tracks if a final tool result was dispatched
     std::string entry_trace_id;  // The trace ID that launched this process
     std::atomic<ProcessStatus> status{ProcessStatus::STARTING};
@@ -115,6 +121,7 @@ protected:
     std::thread runtime_io_thread;
     std::atomic<bool> is_running{false};
     std::atomic<bool> force_terminate{false}; // Tripped by OS Signal
+    std::atomic<bool> forced_by_signal{false};
 
     // Fast-waking Kernel IO Sleep Synchronization
     std::mutex sleep_mutex;
@@ -141,20 +148,27 @@ protected:
     void bus_listener_loop(); // Handles IPM_PUSH messages from the router
     uint64_t get_current_memory_usage_mb() const;
     void send_heartbeat();
-    std::string send_llm_request_stateless(const json& request_payload);
-    std::string send_llm_request_stateless_stream(
-        const json& request_payload,
-        const std::function<void(const std::string&)>& on_token);
     std::string call_llm_internal(
         const std::string& convo_id,
         const std::string& user_message,
         const std::string& system_message,
         const std::string& user_id,
+        const std::string& mode,
         bool stream_requested,
-        const std::function<void(const std::string&)>& on_token);
-    json exec_velix_process(const std::string& name, const json& params, const std::string& trace_id = "");
+        const std::function<void(const std::string&)>& on_token,
+        const std::optional<std::string>& intent_override = std::nullopt);
+    json execute_tool_internal(
+        const std::string& instruction,
+        const json& args,
+        const std::optional<std::string>& user_id_override,
+        const std::optional<std::string>& intent_override);
     void report_result(int target_pid, const json& data, const std::string& trace_id = "");
     static int resolve_port(const std::string& service_name, int fallback);
+
+private:
+    // Authoritative runtime identity from Supervisor; not user-overridable.
+    bool is_root{false};
+    bool is_handler{false};
 };
 
 } // namespace core

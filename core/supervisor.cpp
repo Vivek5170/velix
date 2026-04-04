@@ -240,7 +240,6 @@ bool is_valid_process_status_text(const std::string &status) {
 
 struct ConvMetadata {
   std::string convo_id;
-  std::string convo_type;
   std::string user_id;
   int creator_pid = -1;
   uint64_t created_at_ms = 0;  // FIX #8: Consistency - use uint64_t
@@ -404,6 +403,30 @@ public:
     }
 
     join_watchdog();
+
+    // Ensure no child process keeps running/listening after supervisor shutdown.
+    {
+      const auto snapshot = registry_->snapshot_for_watchdog();
+      std::vector<TerminationEngine::TerminationTarget> targets;
+      targets.reserve(snapshot.size());
+
+      for (const auto &entry : snapshot) {
+        TerminationEngine::TerminationTarget target;
+        target.velix_pid = entry.pid;
+        target.os_pid = entry.os_pid;
+        target.tree_id = entry.tree_id;
+        target.trace_id = entry.trace_id;
+        target.parent_pid = entry.parent_pid;
+        targets.push_back(target);
+      }
+
+      if (!targets.empty()) {
+        termination_engine_->kill_processes(
+            targets, "supervisor_shutdown", registry_,
+            config_.terminate_grace_ms);
+      }
+    }
+
     LOG_INFO_CTX("Supervisor stopped gracefully", "supervisor", "", -1,
                  "shutdown");
   }
@@ -599,7 +622,12 @@ private:
       const json payload = message.value("payload", json::object());
       const std::string register_intent =
           payload.value("register_intent", std::string(""));
+      const std::string role = payload.value("role", std::string("unknown"));
       if (register_intent == "JOIN_PARENT_TREE") {
+        // Bootstrap handler can join TREE_HANDLER without a parent velix pid.
+        if (role == "handler") {
+          return true;
+        }
         if (!message.contains("source_pid") ||
             !message["source_pid"].is_number_integer() ||
             message["source_pid"].get<int>() <= 0) {
@@ -720,11 +748,26 @@ private:
 
     std::string tree_id;
     bool is_tree_root = false;
+    bool is_handler_process = false;
 
-    if (role == "handler") {
+    const bool handler_tree_empty =
+        registry_->get_tree_processes("TREE_HANDLER").empty();
+
+    if (role == "handler" && handler_tree_empty) {
+      const int expected_handler_os_pid = handler_os_pid_.load();
+      if (expected_handler_os_pid > 0 && os_pid != expected_handler_os_pid) {
+        return {{"status", "error"},
+                {"error", "handler_os_pid_mismatch"},
+                {"expected_os_pid", expected_handler_os_pid},
+                {"actual_os_pid", os_pid}};
+      }
       tree_id = "TREE_HANDLER";
       source_pid = -1;
       is_tree_root = true;
+      is_handler_process = true;
+    } else if (role == "handler") {
+      return {{"status", "error"},
+              {"error", "handler_role_reserved_for_bootstrap"}};
     } else if (register_intent == "NEW_TREE") {
       tree_id = "";  // Let registry create it
       is_tree_root = true;
@@ -778,6 +821,8 @@ private:
     json response = {{"status", "ok"},
                      {"tree_id", result.tree_id},
                      {"register_intent", register_intent},
+                     {"is_root", is_tree_root},
+                     {"is_handler", is_handler_process},
                      {"process", build_process_json(*result.process)}};
 
     return response;
@@ -830,18 +875,57 @@ private:
   json handle_llm_request(const json &message) {
     // NOTE: Simplified implementation - full LLM request handling would be
     // more complex
+    const std::string mode = message.value("mode", "");
     const std::string tree_id = message.value("tree_id", "");
     const std::string convo_id = message.value("convo_id", "");
-    const std::string convo_type = message.value("convo_type", "process");
     const std::string user_id = message.value("user_id", "");
     const int source_pid = message.value("source_pid", -1);
 
-    if (!config_.conversation_enabled && !convo_id.empty()) {
+    if (mode != "simple" && mode != "conversation" &&
+        mode != "user_conversation") {
+      return {{"status", "error"},
+              {"error", "unsupported LLM mode"}};
+    }
+
+    if (!config_.conversation_enabled && mode != "simple") {
       return {{"status", "error"},
               {"error", "conversation mode is disabled"}};
     }
 
-    return {{"status", "ok"}};
+    if (source_pid <= 0) {
+      return {{"status", "error"},
+              {"error", "LLM_REQUEST requires valid source_pid"}};
+    }
+
+    auto source_process = registry_->get_process(source_pid);
+    if (!source_process) {
+      return {{"status", "error"},
+              {"error", "LLM_REQUEST source_pid not registered"}};
+    }
+
+    if (mode == "simple") {
+      if (!convo_id.empty() || !user_id.empty()) {
+        return {{"status", "error"},
+                {"error", "simple mode requires empty convo_id and user_id"}};
+      }
+    } else if (mode == "conversation") {
+      if (!user_id.empty()) {
+        return {{"status", "error"},
+                {"error", "conversation mode requires empty user_id"}};
+      }
+    } else if (mode == "user_conversation") {
+      if (source_process->role != "handler") {
+        return {{"status", "error"},
+                {"error", "user_conversation only allowed for handler process"}};
+      }
+      if (user_id.empty()) {
+        return {{"status", "error"},
+                {"error", "user_conversation requires user_id"}};
+      }
+    }
+
+        return {{"status", "ok"},
+          {"is_handler", source_process->role == "handler"}};
   }
 
   json handle_tree_status(const json &message) {

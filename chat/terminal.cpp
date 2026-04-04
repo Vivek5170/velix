@@ -2,6 +2,7 @@
 #include "../vendor/nlohmann/json.hpp"
 #include <iostream>
 #include <string>
+#include <csignal>
 
 using json = nlohmann::json;
 using namespace velix::communication;
@@ -22,15 +23,26 @@ void print_header() {
     std::cout << " Type 'exit' to quit.\n" << std::endl;
 }
 
+volatile std::sig_atomic_t is_running = 1;
+
+void signal_handler(int signal) {
+    if (signal == SIGINT) {
+        is_running = 0;
+        std::cout << "\n[Terminal] SIGINT received. Shutting down gracefully..." << std::endl;
+    }
+}
+
 int main() {
+    std::signal(SIGINT, signal_handler);
+
     SocketWrapper client;
     try {
         client.create_tcp_socket();
         client.connect("127.0.0.1", 6060);
-        
+
         print_header();
 
-        while (true) {
+        while (is_running) {
             std::cout << BOLD << GREEN << "[You] " << RESET << std::flush;
             std::string input;
             if (!std::getline(std::cin, input) || input == "exit") {
@@ -39,13 +51,16 @@ int main() {
 
             if (input.empty()) continue;
 
-            // Send user message
-            json msg = {{"message", input}};
+            // Ensure user_conversation mode with empty conversation_id
+            json msg = {
+                {"message", input},
+                {"conversation_id", ""},
+                {"user_id", "terminal_cli_user_1"}
+            };
             send_json(client, msg.dump());
 
             std::cout << BOLD << MAGENTA << "[Velix] " << RESET << std::flush;
 
-            // Listen for stream
             while (true) {
                 std::string response = recv_json(client);
                 if (response.empty()) break;

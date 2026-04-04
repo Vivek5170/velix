@@ -26,6 +26,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -141,13 +142,25 @@ public:
 
       while (running_) {
         try {
-          velix::communication::SocketWrapper client;
+#ifndef _WIN32
+          reap_dead_children();
+#endif
+
+          std::shared_ptr<velix::communication::SocketWrapper> server_socket;
           {
             std::lock_guard<std::mutex> lock(server_mutex_);
             if (!server_socket_ || !server_socket_->is_open())
               break;
-            client = server_socket_->accept();
+            server_socket = std::shared_ptr<velix::communication::SocketWrapper>(
+                server_socket_.get(), [](velix::communication::SocketWrapper *) {});
           }
+
+          if (!server_socket->has_data(250)) {
+            continue;
+          }
+
+          velix::communication::SocketWrapper client;
+          client = server_socket->accept();
 
           auto client_ptr =
               std::make_shared<velix::communication::SocketWrapper>(
@@ -175,9 +188,21 @@ public:
     if (server_socket_ && server_socket_->is_open()) {
       server_socket_->close();
     }
+
+#ifndef _WIN32
+    reap_dead_children();
+#endif
   }
 
 private:
+#ifndef _WIN32
+  void reap_dead_children() {
+    int status = 0;
+    while (::waitpid(-1, &status, WNOHANG) > 0) {
+    }
+  }
+#endif
+
   struct CachedPackage {
     std::string path;
     json manifest;
@@ -473,6 +498,8 @@ private:
     const std::string msg_type = request.value("message_type", "");
     const std::string trace_id = request.value("trace_id", "");
     const std::string tree_id = request.value("tree_id", "");
+    const std::string intent = request.value("intent", "JOIN_PARENT_TREE");
+    const bool is_handler = request.value("is_handler", false);
     const bool force_refresh = request.value("force_refresh", false);
 
     if (msg_type == "EXEC_CACHE_CLEAN") {
@@ -486,6 +513,24 @@ private:
       return {{"status", "error"},
               {"trace_id", trace_id},
               {"error", "Unsupported message type. Use EXEC_VELIX_PROCESS"}};
+    }
+
+    if (intent != "JOIN_PARENT_TREE" && intent != "NEW_TREE") {
+      return {{"status", "error"},
+              {"trace_id", trace_id},
+              {"error", "invalid_intent: must be JOIN_PARENT_TREE or NEW_TREE"}};
+    }
+
+    if (intent == "JOIN_PARENT_TREE" && request.value("source_pid", -1) <= 0) {
+      return {{"status", "error"},
+              {"trace_id", trace_id},
+              {"error", "invalid_source_pid_for_join_parent_tree"}};
+    }
+
+    if (intent == "NEW_TREE" && !is_handler) {
+      return {{"status", "error"},
+              {"trace_id", trace_id},
+              {"error", "intent_override_new_tree_allowed_only_for_handler"}};
     }
 
     std::string package_name = request.value("name", "");
@@ -567,8 +612,15 @@ private:
     // 6. Build Environment Context
     const std::string bus_port =
         std::to_string(velix::utils::get_port("BUS", 5174));
-    const std::string parent_pid =
-        std::to_string(request.value("source_pid", -1));
+    const int requested_source_pid = request.value("source_pid", -1);
+    if (requested_source_pid <= 0) {
+      return {{"status", "error"},
+              {"trace_id", trace_id},
+              {"error", "invalid_source_pid"}};
+    }
+    const bool join_parent_tree = (intent == "JOIN_PARENT_TREE");
+    const std::string parent_pid = std::to_string(requested_source_pid);
+    const std::string env_tree_id = join_parent_tree ? tree_id : "";
 
     fs::path workspace_root = fs::current_path();
     {
@@ -594,10 +646,13 @@ private:
 
     std::map<std::string, std::string> env = {
         {"VELIX_PARENT_PID", parent_pid}, {"VELIX_BUS_PORT", bus_port},
+        {"VELIX_INTENT", intent},
         {"VELIX_TRACE_ID", trace_id},     {"VELIX_PROCESS_NAME", package_name},
-        {"VELIX_TREE_ID", tree_id},       {"VELIX_PARAMS", params.dump()},
+      {"VELIX_TREE_ID", env_tree_id},   {"VELIX_PARAMS", params.dump()},
         {"PYTHONPATH", pythonpath}
     };
+    const std::string user_id = request.value("user_id", "");
+    env["VELIX_USER_ID"] = user_id;
     for (const auto &[k, v] : runtime.env_overrides) {
       env[k] = v;
     }

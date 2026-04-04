@@ -50,4 +50,11 @@ namespace velix::llm {
  */
 void start_scheduler(int port = 5171);
 
+/**
+ * Request scheduler shutdown.
+ *
+ * Safe to call from orchestration code during coordinated kernel teardown.
+ */
+void stop_scheduler();
+
 } // namespace velix::llm

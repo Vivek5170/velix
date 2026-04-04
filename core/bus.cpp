@@ -48,13 +48,25 @@ public:
 
       while (running_) {
         try {
-          velix::communication::SocketWrapper client;
+          velix::communication::SocketWrapper *server_socket = nullptr;
           {
             std::lock_guard<std::mutex> lock(server_mutex_);
-            if (!server_socket_ || !server_socket_->is_open())
+            if (!server_socket_ || !server_socket_->is_open()) {
               break;
-            client = server_socket_->accept();
+            }
+            server_socket = server_socket_.get();
           }
+
+          if (server_socket == nullptr || !server_socket->is_open()) {
+            break;
+          }
+
+          if (!server_socket->has_data(250)) {
+            continue;
+          }
+
+          velix::communication::SocketWrapper client;
+          client = server_socket->accept();
 
           auto client_ptr =
               std::make_shared<velix::communication::SocketWrapper>(

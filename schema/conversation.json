@@ -4,7 +4,6 @@
     "user": {
       "_comment": "One per user_id. Permanent — never auto-deleted. Any TREE_HANDLER process may use it.",
       "convo_id": "user_alice",
-      "convo_type": "user",
       "user_id": "alice",
       "creator_pid": -1,
       "state": "ACTIVE",
@@ -34,7 +33,6 @@
     "process": {
       "_comment": "Ephemeral. Bound to creator_pid — only that pid may use it. Deleted after TTL or process death.",
       "convo_id": "proc_123_456789",
-      "convo_type": "process",
       "user_id": "",
       "creator_pid": 123,
       "state": "ACTIVE",

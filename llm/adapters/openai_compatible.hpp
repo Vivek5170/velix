@@ -239,8 +239,6 @@ inline void post_json_stream_raw(
   res =
       cli.Post(endpoint, headers, dumped_payload, "application/json",
                [&](const char *data, std::size_t len) {
-                 std::cerr << "[Adapter] Raw Chunk Received (" << len
-                           << " bytes)" << std::endl;
                  bool ok = on_chunk(data, len);
                  if (!ok) {
                    std::cerr

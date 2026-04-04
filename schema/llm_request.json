@@ -23,15 +23,16 @@
         "timestamp": "2026-03-28T12:00:00Z"
       }
     },
-    "conversation_user": {
+    "user_conversation": {
       "message_type": "LLM_REQUEST",
-      "mode": "conversation",
+      "mode": "user_conversation",
       "request_id": "UUID-12346",
       "trace_id": "TRACE-UUID-12346",
       "user_id": "alice",
       "source_pid": 1000,
       "tree_id": "TREE_HANDLER",
       "priority": 1,
+      "convo_id": "",
       "messages": [
         { "role": "user", "content": "Hello, I am Alice." }
       ],
@@ -58,10 +59,9 @@
     }
   },
   "field_definitions": {
-    "mode": "string, required: 'simple' (abstraction, transient) or 'conversation'",
-    "convo_id": "string, optional if user_id is provided. Required for process-type conversations.",
-    "convo_type": "string, generated internally by conversation manager ('user' or 'process')",
-    "user_id": "string, required to access or create a persistent user-type conversation.",
+    "mode": "string, required: one of 'simple' | 'conversation' | 'user_conversation'",
+    "convo_id": "string. Must be empty in simple and user_conversation. In conversation mode: empty means create new process convo, non-empty means reuse existing convo.",
+    "user_id": "string. Must be empty in simple and conversation. Required in user_conversation.",
     "request_id": "string, unique identifier for this request",
     "trace_id": "string, required. Unique ID for this specific network request turn; used for cancellation tracking by the Scheduler.",
     "tree_id": "string, required. User conversations MUST originate from TREE_HANDLER.",

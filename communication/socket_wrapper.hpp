@@ -87,6 +87,27 @@ namespace velix::communication
     private:
         SocketHandle socket_handle;
 
+#ifndef _WIN32
+        static void set_close_on_exec(SocketHandle handle)
+        {
+            if (handle == INVALID_SOCKET_HANDLE)
+            {
+                return;
+            }
+
+            const int flags = fcntl(handle, F_GETFD);
+            if (flags == -1)
+            {
+                throw SocketException("fcntl(F_GETFD) failed: " + get_socket_error());
+            }
+
+            if (fcntl(handle, F_SETFD, flags | FD_CLOEXEC) == -1)
+            {
+                throw SocketException("fcntl(F_SETFD, FD_CLOEXEC) failed: " + get_socket_error());
+            }
+        }
+#endif
+
     public:
         SocketWrapper() : socket_handle(INVALID_SOCKET_HANDLE)
         {
@@ -130,6 +151,10 @@ namespace velix::communication
             {
                 throw SocketException("Failed to create TCP socket: " + get_socket_error());
             }
+
+#ifndef _WIN32
+            set_close_on_exec(socket_handle);
+#endif
         }
 
         void bind(const std::string &address, uint16_t port)
@@ -218,6 +243,9 @@ namespace velix::communication
 
             SocketWrapper client;
             client.socket_handle = client_socket;
+#ifndef _WIN32
+            set_close_on_exec(client.socket_handle);
+#endif
             return client;
         }
 

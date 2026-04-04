@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
 #include <random>
 #include <sstream>
 
@@ -112,7 +113,7 @@ std::string ConversationManager::process_convo_path(int creator_pid,
 }
 
 std::string ConversationManager::convo_path_from_struct(const Conversation& convo) const {
-	if (convo.convo_type == "user") {
+	if (convo.creator_pid <= 0) {
 		return user_convo_path(convo.user_id);
 	}
 	return process_convo_path(convo.creator_pid, convo.convo_id);
@@ -204,7 +205,6 @@ Conversation ConversationManager::load_convo_from_path(const std::string& path) 
 
 		Conversation convo;
 		convo.convo_id         = j.value("convo_id", "");
-		convo.convo_type       = j.value("convo_type", "process");
 		convo.user_id          = j.value("user_id", "");
 		convo.creator_pid      = j.value("creator_pid", -1);
 		convo.state            = j.value("state", "ACTIVE");
@@ -237,7 +237,6 @@ Conversation ConversationManager::load_conversation_from_disk_unlocked(const std
 bool ConversationManager::persist_conversation(const Conversation& convo) {
 	json j;
 	j["convo_id"]          = convo.convo_id;
-	j["convo_type"]        = convo.convo_type;
 	j["user_id"]           = convo.user_id;
 	j["creator_pid"]       = convo.creator_pid;
 	j["state"]             = convo.state;
@@ -296,7 +295,6 @@ Conversation ConversationManager::get_or_create_user_convo(const std::string& us
 	// Create new
 	Conversation convo;
 	convo.convo_id    = convo_id;
-	convo.convo_type  = "user";
 	convo.user_id     = user_id;
 	convo.creator_pid = -1;  // user convos have no single creator pid
 	convo.state       = "ACTIVE";
@@ -321,7 +319,6 @@ Conversation ConversationManager::create_process_convo(int creator_pid) {
 
 	Conversation convo;
 	convo.convo_id    = generate_process_convo_id(creator_pid);
-	convo.convo_type  = "process";
 	convo.creator_pid = creator_pid;
 	convo.state       = "ACTIVE";
 
@@ -431,7 +428,7 @@ void ConversationManager::delete_process_convos_for_pid(int creator_pid) {
 	{
 		std::lock_guard<std::mutex> lock(convo_mutex_);
 		for (auto it = convo_cache_.begin(); it != convo_cache_.end();) {
-			if (it->second.creator_pid == creator_pid && it->second.convo_type == "process") {
+			if (it->second.creator_pid == creator_pid) {
 				it = convo_cache_.erase(it);
 			} else {
 				++it;
@@ -506,8 +503,10 @@ std::string ConversationManager::find_convo_for_user(const std::string& user_id)
 json ConversationManager::build_simple_mode_messages(const std::string& user_message) {
 	const std::string soul       = load_text_file("memory/soul.md");
 	const std::string user_facts = load_text_file("memory/user.md");
+	const std::string general_guidelines = load_text_file("memory/general_guidelines.md");
 
 	std::string sys;
+	if (!general_guidelines.empty()) { sys += "General guidelines:\n" + general_guidelines + "\n\n"; }
 	if (!soul.empty())       { sys += "Personality constraints:\n" + soul + "\n\n"; }
 	if (!user_facts.empty()) { sys += "Known user facts:\n" + user_facts; }
 	if (sys.empty())         { sys  = "You are velix assistant."; }
@@ -524,6 +523,24 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 		throw std::runtime_error("convo_id missing when building messages");
 	}
 
+	const std::string explicit_system_prompt = [&]() {
+		if (normalized_request.contains("system_prompt") &&
+		    normalized_request["system_prompt"].is_string()) {
+			return normalized_request["system_prompt"].get<std::string>();
+		}
+		if (normalized_request.contains("system_message") &&
+		    normalized_request["system_message"].is_string()) {
+			return normalized_request["system_message"].get<std::string>();
+		}
+		return std::string("");
+	}();
+
+	const json metadata = normalized_request.value("metadata", json::object());
+	const bool system_prompt_override =
+	    normalized_request.value("system_prompt_override", false) ||
+	    normalized_request.value("replace_system_prompt", false) ||
+	    metadata.value("system_prompt_override", false);
+
 	const bool skip_compaction = normalized_request.value("metadata", json::object())
 	                                               .value("compaction_request", false);
 
@@ -533,13 +550,6 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 		json extra_fields = json::object();
 	};
 	std::vector<PendingInput> pending_inputs;
-
-	if (normalized_request.contains("system_message")) {
-		const std::string text = normalized_request.value("system_message", "");
-		if (!text.empty()) {
-			pending_inputs.push_back(PendingInput{"system", text, json::object()});
-		}
-	}
 
 	if (normalized_request.contains("user_message")) {
 		const std::string text = normalized_request.value("user_message", "");
@@ -631,12 +641,38 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 
 	{
 		std::lock_guard<std::mutex> lock(convo_mutex_);
-		for (const auto &input : pending_inputs) {
-			// Some providers (e.g., llama.cpp chat templates) require system
-			// to appear only at the very beginning of the conversation.
-			if (input.role == "system" && !convo.messages.empty()) {
-				continue;
+		if (!explicit_system_prompt.empty()) {
+			if (!convo.metadata.is_object()) {
+				convo.metadata = json::object();
 			}
+
+			if (system_prompt_override) {
+				convo.metadata["system_prompt"] = explicit_system_prompt;
+				convo.messages.erase(
+				    std::remove_if(convo.messages.begin(), convo.messages.end(),
+				                   [](const json& msg) {
+					                   return msg.is_object() && msg.value("role", "") == "system";
+				                   }),
+				    convo.messages.end());
+
+				if (!append_message_unlocked(convo, "system", explicit_system_prompt, 0,
+				                            json::object())) {
+					throw std::runtime_error("failed to set overriding system prompt");
+				}
+			} else if (convo.messages.empty()) {
+				convo.metadata["system_prompt"] = explicit_system_prompt;
+				if (!append_message_unlocked(convo, "system", explicit_system_prompt, 0,
+				                            json::object())) {
+					throw std::runtime_error("failed to append initial system prompt");
+				}
+			} else if (!convo.metadata.contains("system_prompt") ||
+			           !convo.metadata["system_prompt"].is_string() ||
+			           convo.metadata["system_prompt"].get<std::string>().empty()) {
+				convo.metadata["system_prompt"] = explicit_system_prompt;
+			}
+		}
+
+		for (const auto &input : pending_inputs) {
 			if (!append_message_unlocked(convo, input.role, input.content, 0,
 			                            input.extra_fields)) {
 				throw std::runtime_error("failed to append conversation input message");
@@ -647,6 +683,23 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 	}
 
 	json msgs = json::array();
+	const std::string stored_system_prompt =
+	    (convo.metadata.is_object() && convo.metadata.contains("system_prompt") &&
+	     convo.metadata["system_prompt"].is_string())
+	        ? convo.metadata["system_prompt"].get<std::string>()
+	        : std::string("");
+
+	bool history_has_system = false;
+	for (const auto& msg : convo.messages) {
+		if (msg.is_object() && msg.value("role", "") == "system") {
+			history_has_system = true;
+			break;
+		}
+	}
+	if (!stored_system_prompt.empty() && !history_has_system) {
+		msgs.push_back({{"role", "system"}, {"content", stored_system_prompt}});
+	}
+
 	for (const auto& msg : convo.messages) {
 		const std::string role    = canonicalize_role(msg.value("role", ""));
 		const std::string content = msg.value("content", "");
@@ -674,63 +727,38 @@ json ConversationManager::normalize_llm_request(const json& raw_request) {
 	std::lock_guard<std::mutex> lock(convo_mutex_);
 
 	json normalized = raw_request;
-	const std::string mode = raw_request.value("mode", "simple");
+	const std::string mode = raw_request.value("mode", "");
 
-
-
-	// Fill in defaults
-	if (normalized.value("request_id", "").empty()) {
-		normalized["request_id"] = generate_request_id();
-	}
-	if (normalized.value("tree_id", "").empty()) {
-		normalized["tree_id"] = "TREE_HANDLER";
-	}
-	if (!normalized.contains("source_pid")) { normalized["source_pid"] = -1; }
+	// Security-sensitive fields are validated by scheduler; no fallback defaults here.
 	if (!normalized.contains("priority"))   { normalized["priority"]   = 1; }
 	if (!normalized.contains("sampling_params") || !normalized["sampling_params"].is_object()) {
 		normalized["sampling_params"] = load_sampling_params();
 	}
 
 	if (mode == "conversation") {
-		const int    source_pid = raw_request.value("source_pid", -1);
-		std::string  convo_id   = raw_request.value("convo_id",  "");
-		std::string  user_id    = raw_request.value("user_id",   "");
-
-		Conversation convo;
+		const int source_pid = raw_request.value("source_pid", -1);
+		std::string convo_id = raw_request.value("convo_id", "");
+		const std::string user_id = raw_request.value("user_id", "");
 
 		if (!user_id.empty()) {
-			// Canonical user mode: one deterministic conversation per user.
-			convo    = get_or_create_user_convo_unlocked(user_id);
-			convo_id = convo.convo_id;
-		} else if (!convo_id.empty() && convo_id.rfind("user_", 0) == 0) {
-			// If only a user-prefixed convo_id is supplied, derive the user and map
-			// to that user's canonical single conversation.
-			const std::string inferred_user_id = convo_id.substr(5);
-			if (inferred_user_id.empty()) {
-				throw std::runtime_error("invalid user convo_id: missing user suffix");
-			}
-			convo    = get_or_create_user_convo_unlocked(inferred_user_id);
-			convo_id = convo.convo_id;
-			user_id  = convo.user_id;
-		} else if (!convo_id.empty()) {
-			// Bug #1: Validate that proc_ convo_id matches source_pid
-			if (convo_id.rfind("proc_", 0) == 0 && source_pid > 0) {
-				const size_t first_us = convo_id.find('_');
-				const size_t second_us = convo_id.find('_', first_us + 1);
-				if (first_us != std::string::npos && second_us != std::string::npos) {
-					try {
-						const int embedded_pid = std::stoi(convo_id.substr(first_us + 1, second_us - first_us - 1));
-						if (embedded_pid != source_pid) {
-							throw std::runtime_error("convo_id pid prefix (" + std::to_string(embedded_pid) + 
-													 ") does not match source_pid (" + std::to_string(source_pid) + ")");
-						}
-					} catch (const std::exception&) {
-						throw std::runtime_error("invalid convo_id PID format");
-					}
-				}
-			}
+			throw std::runtime_error("conversation mode requires empty user_id");
+		}
+		if (source_pid <= 0) {
+			throw std::runtime_error("conversation mode requires positive source_pid");
+		}
 
-			// Client supplied convo_id → load
+		Conversation convo;
+		if (convo_id.empty()) {
+			convo.convo_id = generate_process_convo_id(source_pid);
+			convo.creator_pid = source_pid;
+			convo.state = "ACTIVE";
+			const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			    std::chrono::system_clock::now().time_since_epoch()).count();
+			convo.created_at_ms = now_ms;
+			convo.last_activity_ms = now_ms;
+			persist_conversation(convo);
+			convo_id = convo.convo_id;
+		} else {
 			auto cache_it = convo_cache_.find(convo_id);
 			if (cache_it != convo_cache_.end()) {
 				convo = cache_it->second;
@@ -742,35 +770,14 @@ json ConversationManager::normalize_llm_request(const json& raw_request) {
 			}
 
 			if (convo.convo_id.empty()) {
-				// New process convo: create on the fly
-				if (source_pid <= 0) {
-					throw std::runtime_error(
-					    "conversation not found and source_pid missing to create one");
-				}
-				convo             = Conversation{};
-				convo.convo_id    = convo_id;
-				convo.convo_type  = "process";
-				convo.creator_pid = source_pid;
-				convo.state       = "ACTIVE";
-				const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-				    std::chrono::system_clock::now().time_since_epoch()).count();
-				convo.created_at_ms    = now_ms;
-				convo.last_activity_ms = now_ms;
-
-				// Issue #4: explicitly persist upon first creation
-				persist_conversation(convo);
+				throw std::runtime_error("conversation not found for provided convo_id");
 			}
-
-			user_id = convo.user_id;
-		} else {
-			throw std::runtime_error(
-			    "conversation mode requires convo_id or user_id");
+			if (convo.creator_pid != source_pid) {
+				throw std::runtime_error("process conversation is owned by a different source_pid");
+			}
 		}
 
-		// Text validation is deferred to build_conversation_messages_safely inside the scheduler worker_loop
-		// We just leave the request as is, except for ensuring convo_id is injected based on our lookup
 		if (!raw_request.contains("messages") || !raw_request["messages"].is_array()) {
-			normalized["convo_id"] = convo.convo_id;
 			if (!raw_request.contains("tool_result") && !raw_request.contains("tool_message") &&
 				!raw_request.contains("tool_messages") &&
 				!raw_request.contains("user_message") && !raw_request.contains("system_message")) {
@@ -779,20 +786,50 @@ json ConversationManager::normalize_llm_request(const json& raw_request) {
 			}
 		}
 
-		// Also update normalized with the final user_id and creator_pid for access validation by Supervisor
-		normalized["user_id"] = convo.user_id;
-		normalized["convo_type"] = convo.convo_type;
+		normalized["convo_id"] = convo.convo_id;
+		normalized["user_id"] = "";
+		convo_cache_[convo.convo_id] = convo;
+	} else if (mode == "user_conversation") {
+		const int source_pid = raw_request.value("source_pid", -1);
+		const bool is_handler = raw_request.value("is_handler", false);
+		const std::string convo_id = raw_request.value("convo_id", "");
+		const std::string user_id = raw_request.value("user_id", "");
 
+		if (source_pid <= 0) {
+			throw std::runtime_error("user_conversation mode requires positive source_pid");
+		}
+		if (!is_handler) {
+			throw std::runtime_error("user_conversation mode is allowed only for handler process");
+		}
+		if (user_id.empty()) {
+			throw std::runtime_error("user_conversation mode requires non-empty user_id");
+		}
+
+		Conversation convo = get_or_create_user_convo_unlocked(user_id);
+
+		if (!raw_request.contains("messages") || !raw_request["messages"].is_array()) {
+			if (!raw_request.contains("tool_result") && !raw_request.contains("tool_message") &&
+				!raw_request.contains("tool_messages") &&
+				!raw_request.contains("user_message") && !raw_request.contains("system_message")) {
+				throw std::runtime_error(
+					"user_conversation mode requires messages[], user_message, system_message, tool_message(s), or tool_result");
+			}
+		}
+		if (!convo_id.empty() && convo_id!=convo.convo_id) {
+			throw std::runtime_error("conversation_id does not belong to said user");
+		}
+
+		normalized["convo_id"] = convo.convo_id;
+		normalized["user_id"] = user_id;
 		convo_cache_[convo.convo_id] = convo;
 
-		// Set fields the scheduler passes to the supervisor for access validation
-		normalized["convo_id"]   = convo.convo_id;
-		normalized["convo_type"] = convo.convo_type;
-		normalized["user_id"]    = user_id;
-		// Keep source_pid as-is — supervisor validates access using it
-
-	} else {
+	} else if (mode == "simple") {
 		// Simple mode
+		const std::string convo_id = raw_request.value("convo_id", "");
+		const std::string user_id = raw_request.value("user_id", "");
+		if (!convo_id.empty() || !user_id.empty()) {
+			throw std::runtime_error("simple mode requires empty convo_id and empty user_id");
+		}
 		if (!raw_request.contains("messages") || !raw_request["messages"].is_array()) {
 			const std::string user_msg = raw_request.value("user_message", "");
 			if (user_msg.empty()) {
@@ -800,6 +837,8 @@ json ConversationManager::normalize_llm_request(const json& raw_request) {
 			}
 			normalized["messages"] = build_simple_mode_messages(user_msg);
 		}
+	} else {
+		throw std::runtime_error("unsupported mode: " + mode);
 	}
 
 	normalized["message_type"] = "LLM_REQUEST";
@@ -827,7 +866,6 @@ Conversation ConversationManager::get_or_create_user_convo_unlocked(const std::s
 	}
 	Conversation convo;
 	convo.convo_id    = convo_id;
-	convo.convo_type  = "user";
 	convo.user_id     = user_id;
 	convo.creator_pid = -1;
 	convo.state       = "ACTIVE";
@@ -843,7 +881,8 @@ Conversation ConversationManager::get_or_create_user_convo_unlocked(const std::s
 bool ConversationManager::persist_assistant_response(const json& normalized_request,
                                                       const std::string& assistant_text) {
 	if (assistant_text.empty()) { return true; }
-	if (normalized_request.value("mode", "simple") != "conversation") { return true; }
+	const std::string mode = normalized_request.value("mode", "simple");
+	if (mode != "conversation" && mode != "user_conversation") { return true; }
 
 	const std::string convo_id = normalized_request.value("convo_id", "");
 	if (convo_id.empty()) { return false; }
@@ -864,7 +903,8 @@ bool ConversationManager::persist_assistant_response(const json& normalized_requ
 bool ConversationManager::persist_assistant_tool_call(
 	    const json& normalized_request, const std::string& assistant_text,
 	    const json& tool_calls) {
-	if (normalized_request.value("mode", "simple") != "conversation") {
+	const std::string mode = normalized_request.value("mode", "simple");
+	if (mode != "conversation" && mode != "user_conversation") {
 		return true;
 	}
 	if (!tool_calls.is_array() || tool_calls.empty()) {

@@ -26,7 +26,6 @@ namespace velix::llm {
 //
 struct Conversation {
 	std::string convo_id;
-	std::string convo_type;    // "user" | "process"
 	std::string user_id;       // only for type="user" – the unique user identifier
 	int creator_pid = -1;      // for type="process": the only pid allowed to use this convo
 	std::string state = "ACTIVE";  // "ACTIVE" | "CLOSED"
@@ -53,15 +52,15 @@ public:
 	/**
 	 * Normalise an incoming LLM request so the scheduler can process it uniformly.
 	 *
-	 * Conversation mode forms accepted:
-	 *   { mode:"conversation", user_id:"alice", source_pid:N }
-	 *       → finds or creates the user convo for alice (idempotent)
-	 *   { mode:"conversation", convo_id:"user_alice", source_pid:N }
-	 *       → loads the user convo by id (any TREE_HANDLER pid may use it)
-	 *   { mode:"conversation", convo_id:"proc_N_XXXXX", source_pid:N }
-	 *       → loads or creates a process-owned temp convo
+	 * Supported modes (strict, non-overlapping):
+	 *   { mode:"simple", user_id:"", convo_id:"" }
+	 *       → stateless request
+	 *   { mode:"conversation", user_id:"", convo_id:""|"proc_N_XXXXX", source_pid:N }
+	 *       → process conversation; empty convo_id creates a new process convo
+	 *   { mode:"user_conversation", user_id:"alice", convo_id:"", source_pid:N, tree_id:"TREE_HANDLER" }
+	 *       → user conversation with deterministic id user_{sanitized_user_id}
 	 *
-	 * Always sets convo_type and user_id on the normalised output so the
+	 * Always sets resolved convo_id and user_id on the normalised output so the
 	 * scheduler can pass them to the supervisor for access validation.
 	 */
 	json normalize_llm_request(const json& raw_request);

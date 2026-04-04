@@ -1,5 +1,6 @@
 #include "../runtime/sdk/cpp/velix_process.hpp"
 #include <iostream>
+#include <optional>
 
 using namespace velix::core;
 using namespace velix::communication;
@@ -39,13 +40,19 @@ public:
                    !j["user_id"].get<std::string>().empty())
                       ? j["user_id"].get<std::string>()
                       : "terminal_cli_user";
-              const std::string terminal_convo_id = "user_" + terminal_user_id;
+                // Terminal handler always uses per-user conversation semantics.
+                const std::string requested_mode = "user_conversation";
+
               std::cout << "[Handler] Received: " << user_msg << std::endl;
 
               // Call the LLM with streaming enabled
               bool any_tokens_received = false;
-              std::string full_response = call_llm_stream(
-                  terminal_convo_id, user_msg,
+              std::string full_response = call_llm_internal(
+                  "", user_msg,
+                  "You are a helpful assistant in a Velix terminal.",
+                  terminal_user_id,
+                  requested_mode,
+                  true,
                   [&client, &any_tokens_received](const std::string &token) {
                     if (!client.is_open()) {
                       return;
@@ -58,9 +65,7 @@ public:
                       // Client disconnect during stream: stop emitting token frames.
                     }
                   },
-                  "You are a helpful assistant in a Velix terminal.",
-                  terminal_user_id 
-              );
+                  std::nullopt);
 
               // Robust fallback: if no tokens were received but we have a non-empty full response, send it.
               if (!any_tokens_received && !full_response.empty()) {
@@ -93,7 +98,6 @@ public:
 
 int main(int argc, char **argv) {
   Handler handler;
-  // Register with runtime - start() calls run() internally
   handler.start();
   return 0;
 }

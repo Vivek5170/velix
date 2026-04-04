@@ -41,7 +41,6 @@
     "source_pid": 1042,
     "priority": 1,
     "convo_id": "user_alice",
-    "convo_type": "user",
     "user_id": "alice"
   },
 

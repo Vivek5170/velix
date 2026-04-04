@@ -3,6 +3,7 @@
 #include "../utils/process_spawner.hpp"
 
 #include <fstream>
+#include <iostream>
 
 namespace velix::core::prepare_runner {
 
@@ -11,6 +12,7 @@ namespace {
 void append_prepare_log(const std::string &log_file, const std::string &text) {
   std::ofstream out(log_file, std::ios::app);
   if (!out.is_open()) {
+    std::cerr << "prepare_runner: failed to open log file '" << log_file << "'\n";
     return;
   }
   out << text << '\n';
@@ -70,8 +72,20 @@ json execute_prepare(const std::vector<PrepareStep> &steps,
     append_prepare_log(log_file, "[prepare] step=" + std::to_string(i) +
                                      " cmd=" + step.command);
 
-    auto res = velix::utils::ProcessSpawner::run_sync_with_timeout(
-        step.command, step.args, env, step.timeout_ms, workdir);
+    velix::utils::ProcessResult res;
+    try {
+      res = velix::utils::ProcessSpawner::run_sync_with_timeout(
+          step.command, step.args, env, step.timeout_ms, workdir);
+    } catch (const std::exception &e) {
+      append_prepare_log(log_file,
+                         std::string("[prepare] exception: ") + e.what());
+      return {{"status", "error"},
+              {"trace_id", trace_id},
+              {"phase", "prepare"},
+              {"step_index", static_cast<int>(i)},
+              {"command", step.command},
+              {"error", std::string("prepare_step_exception: ") + e.what()}};
+    }
 
     if (!res.stdout_content.empty()) {
       append_prepare_log(log_file, res.stdout_content);
