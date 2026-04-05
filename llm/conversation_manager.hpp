@@ -66,6 +66,21 @@ public:
 	json normalize_llm_request(const json& raw_request);
 
 	/**
+	 * Build the layered system prompt for a given mode.
+	 *
+	 * Assembly order (all sections separated by double newline):
+	 *   1. General guidelines   (memory/general_guidelines.md — always)
+	 *   2. Soul / personality   (memory/soul.md — only for user_conversation)
+	 *   3. caller_system_msg    (anything passed via system_message field — appended, never replaces)
+	 *
+	 * Returns the combined string, or an empty string if all sources are empty.
+	 */
+	static std::string build_layered_system_prompt(
+	    const std::string& mode,
+	    const std::string& caller_system_msg = "",
+	    const std::string& user_id = "");
+
+	/**
 	 * Persist the assistant reply into a conversation.
 	 * No-op for simple mode.
 	 */
@@ -158,7 +173,11 @@ private:
 	json load_sampling_params() const;
 	std::string load_text_file(const std::string& path) const;
 
-	json build_simple_mode_messages(const std::string& user_message);
+	json build_simple_mode_messages(const std::string& user_message,
+	                                const std::string& caller_system_msg = "");
+
+	/** Load a text file from several fallback paths relative to CWD. */
+	static std::string load_text_with_fallbacks(const std::vector<std::string>& paths);
 
 
 

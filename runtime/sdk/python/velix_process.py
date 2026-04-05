@@ -340,9 +340,11 @@ class VelixProcess:
             if pending_user_message:
                 payload["user_message"] = pending_user_message
 
-            # Tool messages suppress streaming (mirrors C++ stream=false during tool rounds)
+            # Honour stream_requested on tool-resume turns so the next assistant
+            # reply still streams token-by-token. The old `stream=False` caused
+            # the model's full response to be buffered silently after every tool call.
             if pending_tool_messages:
-                payload["stream"] = False
+                payload["stream"] = stream_requested
                 if len(pending_tool_messages) == 1:
                     payload["tool_message"] = pending_tool_messages[0]
                 else:
@@ -480,12 +482,19 @@ class VelixProcess:
     ) -> str:
         """Open a fresh scheduler connection, send the envelope, receive the response."""
         try:
+            # Connect timeout uses the full LLM deadline for the initial TCP handshake.
             sock = self._connect_with_retries("127.0.0.1", sched_port, llm_timeout_ms, retry_limit, retry_delay)
         except Exception:
             raise RuntimeError("VelixProcess SDK: Failed to connect to scheduler after retry attempts.")
 
         try:
             self._send_framed(sock, payload)
+            # Use a short per-read poll timeout for streaming so a stalled chunk
+            # is retried quickly. The stream_deadline inside
+            # _receive_scheduler_response() still caps the overall wall-clock time.
+            stream_poll_timeout_ms = _get_config("SDK_STREAM_POLL_TIMEOUT_MS", 30000)
+            if request_streaming:
+                sock.settimeout(stream_poll_timeout_ms / 1000.0)
             return self._receive_scheduler_response(sock, request_streaming, llm_timeout_ms, on_token)
         finally:
             sock.close()

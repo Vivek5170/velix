@@ -180,66 +180,109 @@ public:
     bool finished_sent = false;
     std::string stream_error;
 
+    auto process_line = [&callback, &finished_sent, &stream_error](std::string line) {
+      if (!stream_error.empty() || finished_sent) {
+        return;
+      }
+
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      if (line.empty()) {
+        return;
+      }
+
+      json chunk_json;
+      try {
+        chunk_json = json::parse(line);
+      } catch (...) {
+        return;
+      }
+
+      if (chunk_json.contains("error")) {
+        stream_error = extract_error_message(chunk_json["error"],
+                                             "Ollama stream provider error");
+        return;
+      }
+
+      const json message = chunk_json.value("message", json::object());
+      if (message.contains("content") && message["content"].is_string()) {
+        const std::string delta = message["content"].get<std::string>();
+        if (!delta.empty()) {
+          try {
+            callback(StreamChunk{delta, json::object(), false});
+          } catch (const std::exception &e) {
+            stream_error = std::string("Ollama stream callback error: ") + e.what();
+            return;
+          } catch (...) {
+            stream_error = "Ollama stream callback error";
+            return;
+          }
+        }
+      }
+
+      if (message.contains("tool_calls") && message["tool_calls"].is_array()) {
+        int idx = 0;
+        for (const auto &tc : message["tool_calls"]) {
+          if (tc.is_object()) {
+            try {
+              callback(StreamChunk{"", normalize_ollama_tool_call(tc, idx++), false});
+            } catch (const std::exception &e) {
+              stream_error = std::string("Ollama stream callback error: ") + e.what();
+              return;
+            } catch (...) {
+              stream_error = "Ollama stream callback error";
+              return;
+            }
+          }
+        }
+      }
+
+      if (chunk_json.value("done", false)) {
+        if (!finished_sent) {
+          try {
+            callback(StreamChunk{"", json::object(), true});
+            finished_sent = true;
+          } catch (const std::exception &e) {
+            stream_error = std::string("Ollama stream callback error: ") + e.what();
+            return;
+          } catch (...) {
+            stream_error = "Ollama stream callback error";
+            return;
+          }
+        }
+      }
+    };
+
     post_json_stream_raw(
         cfg, endpoint, payload,
-      [&line_buffer, &callback, &finished_sent,
-       &stream_error](const char *data, std::size_t len) {
+      [&line_buffer, &process_line](const char *data, std::size_t len) {
           line_buffer.reserve(line_buffer.size() + len);
           line_buffer.append(data, len);
           std::size_t newline_pos = std::string::npos;
           while ((newline_pos = line_buffer.find('\n')) != std::string::npos) {
             std::string line = line_buffer.substr(0, newline_pos);
             line_buffer.erase(0, newline_pos + 1);
-            if (!line.empty() && line.back() == '\r') {
-              line.pop_back();
-            }
-            if (line.empty()) {
-              continue;
-            }
-
-            json chunk_json;
-            try {
-              chunk_json = json::parse(line);
-            } catch (...) {
-              continue;
-            }
-
-            if (chunk_json.contains("error")) {
-              stream_error = extract_error_message(chunk_json["error"],
-                                                   "Ollama stream provider error");
-              return false;
-            }
-
-            const json message = chunk_json.value("message", json::object());
-            if (message.contains("content") && message["content"].is_string()) {
-              const std::string delta = message["content"].get<std::string>();
-              if (!delta.empty()) {
-                callback(StreamChunk{delta, json::object(), false});
-              }
-            }
-
-            if (message.contains("tool_calls") && message["tool_calls"].is_array()) {
-              int idx = 0;
-              for (const auto &tc : message["tool_calls"]) {
-                if (tc.is_object()) {
-                  callback(StreamChunk{"", normalize_ollama_tool_call(tc, idx++), false});
-                }
-              }
-            }
-
-            if (chunk_json.value("done", false)) {
-              if (!finished_sent) {
-                callback(StreamChunk{"", json::object(), true});
-                finished_sent = true;
-              }
-              return false; // Stop the stream
-            }
+            process_line(line);
           }
           return true;
         });
 
+    // Some servers close the stream without a trailing newline; process the
+    // final buffered JSON object so the last token and done flag are not lost.
+    if (!line_buffer.empty()) {
+      process_line(line_buffer);
+      line_buffer.clear();
+    }
+
     if (!stream_error.empty()) {
       throw std::runtime_error(stream_error);
+    }
+
+    // Some implementations may end the stream without a final done chunk.
+    // Emit completion here so callers don't wait indefinitely.
+    if (!finished_sent) {
+      callback(StreamChunk{"", json::object(), true});
     }
   }
 };

@@ -1,0 +1,36 @@
+{
+  "name": "update_memory",
+  "type": "skill",
+  "description": "Updates persistent user persona memory files (soul.md or user.md) based on conversation state. Use this to remember facts, preferences, or goals across sessions. The target context is extracted from the user_id.",
+  "runtime": "python",
+  "workdir": ".",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "user_id": {
+        "type": "string",
+        "description": "The target user id representing the active session (e.g. terminal_vivek_s1)"
+      },
+      "target_file": {
+        "type": "string",
+        "enum": ["user.md", "soul.md"],
+        "description": "Which memory file to update. 'user.md' is for user preferences, facts, and tasks. 'soul.md' is for core agent persona."
+      },
+      "update_mode": {
+        "type": "string",
+        "enum": ["append", "overwrite"],
+        "description": "Whether to append the new content to the existing file or overwrite it entirely. Default is append.",
+        "default": "append"
+      },
+      "content": {
+        "type": "string",
+        "description": "The new information or fully overwritten content to write to the memory file."
+      }
+    },
+    "required": ["user_id", "target_file", "content"]
+  },
+  "run": {
+    "command": "python3",
+    "args": ["update.py"]
+  }
+}

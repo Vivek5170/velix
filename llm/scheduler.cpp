@@ -1,5 +1,6 @@
 #include "scheduler.hpp"
 #include "conversation_manager.hpp"
+#include "session_manager.hpp"
 #include "tools/registry.hpp"
 
 #include "../communication/network_config.hpp"
@@ -7,28 +8,26 @@
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
 #include "../utils/string_utils.hpp"
-#include "../utils/timer.hpp"
 #include "../utils/thread_pool.hpp"
+#include "../utils/timer.hpp"
 #include "../vendor/nlohmann/json.hpp"
 
-#define CPPHTTPLIB_IMPLEMENTATION
-#include "../vendor/httplib.h"
 
 #include "adapters/factory.hpp"
 
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
-#include <functional>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <queue>
-#include <csignal>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -52,7 +51,7 @@ struct SchedulerConfig {
 
 struct PendingRequest {
   std::string request_id;
-  std::string trace_id;   // for client cancellation tracking
+  std::string trace_id;  // for client cancellation tracking
   std::string tree_id;   // used only for supervisor notifications
   std::string queue_key; // serialization key: convo_id for conversation mode,
                          // tree_id for simple
@@ -94,10 +93,12 @@ std::priority_queue<TreeCandidate, std::vector<TreeCandidate>,
     ready_tree_queue;
 std::atomic<bool> shutting_down{false};
 ConversationManager conversation_manager;
+SessionManager      session_manager;   // default storage_root = "memory"
 tools::ToolRegistry tool_registry;
 
 // Active request tracking keyed by trace_id.
-// A trace_id can be retried, so workers must match both trace_id and request_id.
+// A trace_id can be retried, so workers must match both trace_id and
+// request_id.
 std::mutex trace_mutex;
 std::unordered_map<std::string, ActiveRequest> active_requests;
 
@@ -168,8 +169,7 @@ void handle_shutdown_signal(int signum) {
   }
 }
 
-bool load_json_with_fallback(const std::vector<std::string> &paths,
-                             json &out) {
+bool load_json_with_fallback(const std::vector<std::string> &paths, json &out) {
   for (const auto &path : paths) {
     std::ifstream in(path);
     if (!in.is_open()) {
@@ -198,80 +198,14 @@ std::string load_text_with_fallback(const std::vector<std::string> &paths) {
   return "";
 }
 
-struct PromptLayerCache {
-  std::string soul;
-  std::string general_guidelines;
-};
-
-const PromptLayerCache &get_prompt_layer_cache() {
-  static PromptLayerCache cache;
-  static std::once_flag loaded;
-  std::call_once(loaded, []() {
-    cache.soul = load_text_with_fallback(
-        {"memory/soul.md", "../memory/soul.md", "build/memory/soul.md"});
-    cache.general_guidelines = load_text_with_fallback(
-        {"memory/general_guidelines.md",
-         "../memory/general_guidelines.md",
-         "build/memory/general_guidelines.md"});
-  });
-  return cache;
-}
-
-json inject_scheduler_prompt_layers(const json &messages, const std::string &mode) {
-  json layered = json::array();
-  const PromptLayerCache &cache = get_prompt_layer_cache();
-
-  std::string combined_system;
-  if (!cache.general_guidelines.empty()) {
-    combined_system += "General guidelines:\n" + cache.general_guidelines + "\n\n";
-  }
-  if (mode == "user_conversation" && !cache.soul.empty()) {
-    combined_system += "Personality constraints:\n" + cache.soul + "\n\n";
-  }
-
-  if (messages.is_array()) {
-    for (const auto &m : messages) {
-      if (!m.is_object()) {
-        continue;
-      }
-
-      const std::string role = m.value("role", std::string(""));
-      if (role == "system") {
-        if (m.contains("content")) {
-          if (m["content"].is_string()) {
-            const std::string content = m["content"].get<std::string>();
-            if (!content.empty()) {
-              combined_system += content + "\n\n";
-            }
-          } else if (!m["content"].is_null()) {
-            combined_system += m["content"].dump() + "\n\n";
-          }
-        }
-        continue;
-      }
-
-      layered.push_back(m);
-    }
-  }
-
-  if (!combined_system.empty()) {
-    layered.insert(layered.begin(),
-                   {{"role", "system"}, {"content", combined_system}});
-  }
-
-  return layered;
-}
-
-
 SchedulerConfig load_scheduler_config() {
   SchedulerConfig cfg;
 
   {
     json model_json;
-    if (!load_json_with_fallback(
-            {"config/model.json", "../config/model.json",
-             "build/config/model.json"},
-            model_json)) {
+    if (!load_json_with_fallback({"config/model.json", "../config/model.json",
+                                  "build/config/model.json"},
+                                 model_json)) {
       throw std::runtime_error("Missing config/model.json");
     }
 
@@ -285,10 +219,11 @@ SchedulerConfig load_scheduler_config() {
     const json adapter = adapters[cfg.active_adapter];
     cfg.adapter_cfg.active_adapter = cfg.active_adapter;
     cfg.adapter_cfg.base_url =
-      adapter.value("base_url", "http://127.0.0.1:8033/v1");
+        adapter.value("base_url", "http://127.0.0.1:8033/v1");
     cfg.adapter_cfg.model = adapter.value("model", "");
 
-    // env precedence (explicit config -> adapter api_key_env name -> .env fields -> process env)
+    // env precedence (explicit config -> adapter api_key_env name -> .env
+    // fields -> process env)
     std::string api_key = adapter.value("api_key", std::string(""));
     std::string env_var_name = adapter.value("api_key_env", std::string(""));
 
@@ -309,8 +244,8 @@ SchedulerConfig load_scheduler_config() {
     cfg.adapter_cfg.port = adapter.value("port", cfg.adapter_cfg.port);
     cfg.adapter_cfg.use_https = adapter.value("use_https", false);
     cfg.adapter_cfg.base_path = adapter.value("base_path", std::string(""));
-    cfg.adapter_cfg.chat_endpoint = adapter.value(
-      "chat_completions_path", cfg.adapter_cfg.chat_endpoint);
+    cfg.adapter_cfg.chat_endpoint =
+        adapter.value("chat_completions_path", cfg.adapter_cfg.chat_endpoint);
     cfg.adapter_cfg.enable_tools = adapter.value("enable_tools", true);
     cfg.adapter_cfg.enable_streaming = adapter.value("enable_streaming", true);
 
@@ -324,7 +259,7 @@ SchedulerConfig load_scheduler_config() {
 
     cfg.adapter_cfg.timeout_ms = model_json.value("request_timeout_ms", 60000);
     cfg.scheduler_wait_timeout_ms =
-      model_json.value("request_timeout_ms", 60000) + 5000;
+        model_json.value("request_timeout_ms", 60000) + 5000;
     const int configured_max_llm_keys = model_json.value("max_llm_keys", 5);
     const int configured_max_simultaneous = model_json.value(
         "max_simultaneous_llm_requests", configured_max_llm_keys);
@@ -393,7 +328,8 @@ adapters::ChatRequest build_chat_request(const PendingRequest &req,
       if (message.value("role", std::string("")) != "assistant") {
         continue;
       }
-      if (!message.contains("tool_calls") || !message["tool_calls"].is_array()) {
+      if (!message.contains("tool_calls") ||
+          !message["tool_calls"].is_array()) {
         continue;
       }
 
@@ -401,7 +337,8 @@ adapters::ChatRequest build_chat_request(const PendingRequest &req,
         if (!tool_call.is_object()) {
           continue;
         }
-        if (!tool_call.contains("function") || !tool_call["function"].is_object()) {
+        if (!tool_call.contains("function") ||
+            !tool_call["function"].is_object()) {
           continue;
         }
         json &fn = tool_call["function"];
@@ -414,7 +351,8 @@ adapters::ChatRequest build_chat_request(const PendingRequest &req,
       }
     }
   }
-  request.sampling_params = req.payload.value("sampling_params", json::object());
+  request.sampling_params =
+      req.payload.value("sampling_params", json::object());
 
   request.max_tokens = req.payload.value(
       "max_tokens", request.sampling_params.value("max_tokens", 0));
@@ -442,25 +380,23 @@ adapters::ChatRequest build_chat_request(const PendingRequest &req,
     request.tool_choice = "auto";
   }
 
-    const std::string mode = req.payload.value("mode", "simple");
+  const std::string mode = req.payload.value("mode", "simple");
   const bool has_user_id = req.payload.contains("user_id") &&
                            req.payload["user_id"].is_string() &&
                            !req.payload["user_id"].get<std::string>().empty();
-  const bool stream_allowed =
-      (mode == "user_conversation") && (req.tree_id == "TREE_HANDLER") &&
-      has_user_id &&
-      cfg.adapter_cfg.enable_streaming;
+  const bool stream_allowed = (mode == "user_conversation") &&
+                              (req.tree_id == "TREE_HANDLER") && has_user_id &&
+                              cfg.adapter_cfg.enable_streaming;
 
   request.stream = req.payload.value("stream", false) && stream_allowed;
   request.extra_body = req.payload.value("extra_body", json::object());
   return request;
 }
 
-adapters::ChatResponse run_chat_once(const adapters::ProviderAdapter &adapter,
-                                     const SchedulerConfig &cfg,
-                                     const adapters::ChatRequest &request,
-                                     const std::function<void(const std::string &)> &
-                                         on_token) {
+adapters::ChatResponse
+run_chat_once(const adapters::ProviderAdapter &adapter,
+              const SchedulerConfig &cfg, const adapters::ChatRequest &request,
+              const std::function<void(const std::string &)> &on_token) {
   if (!request.stream) {
     return adapter.call_chat(cfg.adapter_cfg, request);
   }
@@ -468,7 +404,8 @@ adapters::ChatResponse run_chat_once(const adapters::ProviderAdapter &adapter,
   adapters::ChatResponse aggregated;
   std::vector<json> partial_tool_calls;
 
-  auto merge_object = [](json &target, const json &delta, const auto &self_ref) -> void {
+  auto merge_object = [](json &target, const json &delta,
+                         const auto &self_ref) -> void {
     if (!delta.is_object()) {
       return;
     }
@@ -507,7 +444,8 @@ adapters::ChatResponse run_chat_once(const adapters::ProviderAdapter &adapter,
     }
   };
 
-  auto find_slot_for_delta = [&partial_tool_calls](const json &delta) -> std::size_t {
+  auto find_slot_for_delta =
+      [&partial_tool_calls](const json &delta) -> std::size_t {
     if (delta.contains("index") && delta["index"].is_number_integer()) {
       const int idx = delta["index"].get<int>();
       if (idx >= 0) {
@@ -537,12 +475,14 @@ adapters::ChatResponse run_chat_once(const adapters::ProviderAdapter &adapter,
         if (!chunk.delta_text.empty() && on_token) {
           on_token(chunk.delta_text);
         }
-        if (!chunk.delta_tool_call.is_null() && chunk.delta_tool_call.is_object()) {
+        if (!chunk.delta_tool_call.is_null() &&
+            chunk.delta_tool_call.is_object()) {
           const std::size_t slot = find_slot_for_delta(chunk.delta_tool_call);
           if (slot >= partial_tool_calls.size()) {
             partial_tool_calls.resize(slot + 1, json::object());
           }
-          merge_object(partial_tool_calls[slot], chunk.delta_tool_call, merge_object);
+          merge_object(partial_tool_calls[slot], chunk.delta_tool_call,
+                       merge_object);
         }
         if (chunk.finished) {
           if (aggregated.finish_reason.empty()) {
@@ -559,8 +499,7 @@ adapters::ChatResponse run_chat_once(const adapters::ProviderAdapter &adapter,
     if (tool_call.contains("index")) {
       tool_call.erase("index");
     }
-    if (!tool_call.contains("type") ||
-        !tool_call["type"].is_string() ||
+    if (!tool_call.contains("type") || !tool_call["type"].is_string() ||
         tool_call["type"].get<std::string>().empty()) {
       tool_call["type"] = "function";
     }
@@ -600,7 +539,8 @@ json normalize_tool_arguments_object(const json &raw_arguments) {
 
 json normalize_tool_call(const json &tool_call, int fallback_index) {
   const json fn = tool_call.value("function", json::object());
-  const std::string name = fn.value("name", tool_call.value("name", std::string("")));
+  const std::string name =
+      fn.value("name", tool_call.value("name", std::string("")));
   if (name.empty()) {
     throw std::runtime_error("tool_call missing function.name");
   }
@@ -615,32 +555,32 @@ json normalize_tool_call(const json &tool_call, int fallback_index) {
          velix::utils::generate_uuid().substr(0, 8);
   }
 
-  return json{{"id", id},
-              {"type", "function"},
-              {"function",
-               {{"name", name},
-                {"arguments", normalize_tool_arguments_object(raw_arguments)}}}};
+  return json{
+      {"id", id},
+      {"type", "function"},
+      {"function",
+       {{"name", name},
+        {"arguments", normalize_tool_arguments_object(raw_arguments)}}}};
 }
 
-json notify_supervisor_llm_request(const PendingRequest& req,
-                                   const SchedulerConfig& cfg) {
-  json event = {{"message_type", "LLM_REQUEST"},
-                {"request_id",  req.request_id},
-                {"tree_id",     req.tree_id},
-                {"source_pid",  req.source_pid},
-                {"priority",    req.base_priority},
-                {"mode",        req.payload.value("mode", "")}};
+json notify_supervisor_llm_request(const PendingRequest &req,
+                                   const SchedulerConfig &cfg) {
+  json event = {
+      {"message_type", "LLM_REQUEST"}, {"request_id", req.request_id},
+      {"tree_id", req.tree_id},        {"source_pid", req.source_pid},
+      {"priority", req.base_priority}, {"mode", req.payload.value("mode", "")}};
 
   const std::string mode = req.payload.value("mode", "simple");
   if (mode == "conversation" || mode == "user_conversation") {
-    event["convo_id"]   = req.payload.value("convo_id",   "");
-    event["user_id"]    = req.payload.value("user_id",    "");
+    event["convo_id"] = req.payload.value("convo_id", "");
+    event["user_id"] = req.payload.value("user_id", "");
   }
 
   velix::communication::SocketWrapper socket;
   socket.create_tcp_socket();
-  socket.connect(velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
-                 static_cast<uint16_t>(cfg.supervisor_port));
+  socket.connect(
+      velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
+      static_cast<uint16_t>(cfg.supervisor_port));
   socket.set_timeout_ms(2000);
   velix::communication::send_json(socket, event.dump());
 
@@ -657,23 +597,26 @@ json notify_supervisor_llm_request(const PendingRequest& req,
 }
 
 json process_llm_request_stateless(
-  PendingRequest &req, const SchedulerConfig &cfg,
-  const std::function<bool()> &is_attempt_current) {
+    PendingRequest &req, const SchedulerConfig &cfg,
+    const std::function<bool()> &is_attempt_current) {
   if (!req.payload.contains("messages") ||
       !req.payload["messages"].is_array()) {
     throw std::runtime_error("LLM_REQUEST missing messages[]");
   }
 
+  // The conversation manager already produced a fully layered system prompt
+  // (guidelines → soul → caller system_message) inside
+  // build_conversation_messages_safely and build_simple_mode_messages. We use
+  // the messages as-is.
   const std::string mode = req.payload.value("mode", "simple");
-    const json layered_messages =
-      inject_scheduler_prompt_layers(req.payload["messages"], mode);
 
   velix::utils::Timer timer;
   timer.start();
 
   auto adapter = adapters::make_adapter(cfg.active_adapter);
   const adapters::ChatRequest chat_request =
-      build_chat_request(req, cfg, layered_messages);
+      build_chat_request(req, cfg, req.payload["messages"]);
+
   const adapters::ChatResponse final_response =
       run_chat_once(*adapter, cfg, chat_request, req.stream_token_callback);
 
@@ -687,7 +630,8 @@ json process_llm_request_stateless(
   if (final_response.tool_calls.is_array()) {
     int call_index = 0;
     for (const auto &tool_call : final_response.tool_calls) {
-      normalized_tool_calls.push_back(normalize_tool_call(tool_call, call_index++));
+      normalized_tool_calls.push_back(
+          normalize_tool_call(tool_call, call_index++));
     }
   }
 
@@ -701,24 +645,29 @@ json process_llm_request_stateless(
   }
 
   if ((mode == "conversation" || mode == "user_conversation") &&
-      !final_response.content.empty() &&
-      normalized_tool_calls.empty()) {
-    if (!conversation_manager.persist_assistant_response(req.payload,
-                                                         final_response.content)) {
+      !final_response.content.empty() && normalized_tool_calls.empty()) {
+    if (!conversation_manager.persist_assistant_response(
+            req.payload, final_response.content)) {
       LOG_WARN("Failed to persist assistant response for convo_id=" +
                req.payload.value("convo_id", std::string("")));
     }
   }
 
   timer.stop();
-  json response = {
-      {"message_type", "LLM_RESPONSE"},
-      {"status", "ok"},           {"request_id", req.request_id},
-      {"tree_id", req.tree_id},   {"mode", mode},
-      {"latency_ms", timer.elapsed_ms()}};
+  json response = {{"message_type", "LLM_RESPONSE"},
+                   {"status", "ok"},
+                   {"request_id", req.request_id},
+                   {"tree_id", req.tree_id},
+                   {"mode", mode},
+                   {"latency_ms", timer.elapsed_ms()}};
 
   if (mode == "conversation" || mode == "user_conversation") {
     response["convo_id"] = req.payload.value("convo_id", "");
+    if (req.payload.value("session_compacted", false)) {
+      response["session_compacted"] = true;
+      response["tokens_before"] = req.payload.value("tokens_before", 0);
+      response["tokens_after"] = req.payload.value("tokens_after", 0);
+    }
   }
 
   response["response"] = final_response.content;
@@ -830,28 +779,76 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
     json response;
     try {
       // Worker Check: Is the client still alive in the lobby?
-      const bool client_alive = is_request_current(req.trace_id, req.request_id);
+      const bool client_alive =
+          is_request_current(req.trace_id, req.request_id);
 
       if (!client_alive) {
-        LOG_INFO("Skipping LLM inference for cancelled trace_id: " + req.trace_id);
+        LOG_INFO("Skipping LLM inference for cancelled trace_id: " +
+                 req.trace_id);
       } else {
-        const json supervisor_response = notify_supervisor_llm_request(req, cfg);
-        req.payload["is_handler"] = supervisor_response.value("is_handler", false);
+        const json supervisor_response =
+            notify_supervisor_llm_request(req, cfg);
+        req.payload["is_handler"] =
+            supervisor_response.value("is_handler", false);
         req.payload = conversation_manager.normalize_llm_request(req.payload);
-        const std::string mode = req.payload.value("mode", std::string("simple"));
+        const std::string mode =
+            req.payload.value("mode", std::string("simple"));
         if (mode == "conversation" || mode == "user_conversation") {
           if (req.payload.value("owner_pid", -1) <= 0 && req.source_pid > 0) {
             req.payload["owner_pid"] = req.source_pid;
           }
 
-          if (!req.payload.contains("messages") || !req.payload["messages"].is_array()) {
+          if (!req.payload.contains("messages") ||
+              !req.payload["messages"].is_array()) {
             req.payload["messages"] =
-                conversation_manager.build_conversation_messages_safely(req.payload);
+                conversation_manager.build_conversation_messages_safely(
+                    req.payload);
+
+            const std::string session_id = req.payload.value("convo_id", "");
+            if (!session_id.empty() && SessionManager::is_session_id(session_id)) {
+              int total_chars = 0;
+              for (const auto &m : req.payload["messages"]) {
+                if (m.is_object()) {
+                  total_chars += m.value("content", std::string("")).size();
+                }
+              }
+              int estimated_tokens = total_chars / 4;
+
+              float context_threshold = 0.70f;
+              int max_tokens = 8192;
+              try {
+                std::ifstream f("config/compacter.json");
+                if (f.is_open()) {
+                  json comp; f >> comp;
+                  if (comp.contains("context_pressure_threshold"))
+                    context_threshold = comp["context_pressure_threshold"].get<float>();
+                  if (comp.contains("max_context_tokens"))
+                    max_tokens = comp["max_context_tokens"].get<int>();
+                }
+              } catch (...) {}
+
+              if (estimated_tokens > context_threshold * max_tokens) {
+                const Conversation convo = conversation_manager.get_conversation(session_id);
+                json history = json::array();
+                for (const auto& m : convo.messages) {
+                  if (m.is_object()) history.push_back(m);
+                }
+                const auto cr = session_manager.compact(session_id, history, true /*is_auto*/);
+                
+                req.payload["messages"] =
+                    conversation_manager.build_conversation_messages_safely(req.payload);
+                
+                req.payload["session_compacted"] = true;
+                req.payload["tokens_before"] = cr.tokens_before;
+                req.payload["tokens_after"] = cr.tokens_after;
+              }
+            }
           }
+
         }
-        response = process_llm_request_stateless(
-            req, cfg,
-            [&req]() { return is_request_current(req.trace_id, req.request_id); });
+        response = process_llm_request_stateless(req, cfg, [&req]() {
+          return is_request_current(req.trace_id, req.request_id);
+        });
       }
     } catch (const std::exception &e) {
       response = {{"status", "error"},
@@ -893,7 +890,8 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
     request_json["message_type"] = "LLM_REQUEST";
 
     // Preserve envelope metadata if payload omitted them.
-    if (!request_json.contains("request_id") && envelope.contains("request_id")) {
+    if (!request_json.contains("request_id") &&
+        envelope.contains("request_id")) {
       request_json["request_id"] = envelope["request_id"];
     }
     if (!request_json.contains("trace_id") && envelope.contains("trace_id")) {
@@ -902,7 +900,8 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
     if (!request_json.contains("tree_id") && envelope.contains("tree_id")) {
       request_json["tree_id"] = envelope["tree_id"];
     }
-    if (!request_json.contains("source_pid") && envelope.contains("source_pid")) {
+    if (!request_json.contains("source_pid") &&
+        envelope.contains("source_pid")) {
       request_json["source_pid"] = envelope["source_pid"];
     }
     if (!request_json.contains("priority") && envelope.contains("priority")) {
@@ -913,17 +912,22 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
     }
   }
 
-  if (!request_json.contains("request_id") || !request_json["request_id"].is_string() ||
+  if (!request_json.contains("request_id") ||
+      !request_json["request_id"].is_string() ||
       request_json["request_id"].get<std::string>().empty()) {
-    throw std::runtime_error("LLM_REQUEST requires non-empty string request_id");
+    throw std::runtime_error(
+        "LLM_REQUEST requires non-empty string request_id");
   }
-  if (!request_json.contains("tree_id") || !request_json["tree_id"].is_string() ||
+  if (!request_json.contains("tree_id") ||
+      !request_json["tree_id"].is_string() ||
       request_json["tree_id"].get<std::string>().empty()) {
     throw std::runtime_error("LLM_REQUEST requires non-empty string tree_id");
   }
-  if (!request_json.contains("source_pid") || !request_json["source_pid"].is_number_integer() ||
+  if (!request_json.contains("source_pid") ||
+      !request_json["source_pid"].is_number_integer() ||
       request_json["source_pid"].get<int>() <= 0) {
-    throw std::runtime_error("LLM_REQUEST requires positive integer source_pid");
+    throw std::runtime_error(
+        "LLM_REQUEST requires positive integer source_pid");
   }
   if (!request_json.contains("mode") || !request_json["mode"].is_string()) {
     throw std::runtime_error("LLM_REQUEST requires mode");
@@ -939,17 +943,19 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
   req.completion = std::make_shared<std::promise<json>>();
 
   // Fix: Queue Limits vs Fairness
-  // Human users via the Telegram handler reside in 'TREE_HANDLER'. To prevent 
-  // one human's slow generation from blocking all other human users, TREE_HANDLER 
-  // requests are parallelized using their unique `convo_id`. 
-  // However, autonomous background agents (like a Research Agent) must be strictly 
-  // limited to ONE concurrent LLM request per tree to prevent a single agent from 
-  // monopolizing all GPU slots. We enforce this by queueing them strictly by `tree_id`.
+  // Human users via the Telegram handler reside in 'TREE_HANDLER'. To prevent
+  // one human's slow generation from blocking all other human users,
+  // TREE_HANDLER requests are parallelized using their unique `convo_id`.
+  // However, autonomous background agents (like a Research Agent) must be
+  // strictly limited to ONE concurrent LLM request per tree to prevent a single
+  // agent from monopolizing all GPU slots. We enforce this by queueing them
+  // strictly by `tree_id`.
   {
     const std::string mode = request_json.value("mode", "simple");
     const std::string user_id = request_json.value("user_id", "");
 
-    if (req.tree_id == "TREE_HANDLER" && mode == "user_conversation" && !user_id.empty()) {
+    if (req.tree_id == "TREE_HANDLER" && mode == "user_conversation" &&
+        !user_id.empty()) {
       req.queue_key = "user_" + user_id;
     } else {
       req.queue_key = req.tree_id; // Strict 1-key-per-tree GPU Lock
@@ -962,13 +968,15 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
   if (mode == "simple") {
     if (req.payload.value("convo_id", std::string("")).size() > 0 ||
         req.payload.value("user_id", std::string("")).size() > 0) {
-      throw std::runtime_error("simple mode requires empty convo_id and user_id");
+      throw std::runtime_error(
+          "simple mode requires empty convo_id and user_id");
     }
     const bool has_messages_array =
         req.payload.contains("messages") && req.payload["messages"].is_array();
-    const bool has_user_message = req.payload.contains("user_message") &&
-                                  req.payload["user_message"].is_string() &&
-                                  !req.payload["user_message"].get<std::string>().empty();
+    const bool has_user_message =
+        req.payload.contains("user_message") &&
+        req.payload["user_message"].is_string() &&
+        !req.payload["user_message"].get<std::string>().empty();
     if (!has_messages_array && !has_user_message) {
       throw std::runtime_error(
           "simple mode requires messages[] or user_message");
@@ -982,8 +990,8 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
                                req.payload.contains("tool_message") ||
                                req.payload.contains("tool_messages");
     if (!has_messages_array && !has_alt_input) {
-      throw std::runtime_error(
-          "conversation modes require messages[] or user_message/system_message/tool_result");
+      throw std::runtime_error("conversation modes require messages[] or "
+                               "user_message/system_message/tool_result");
     }
 
     if (mode == "conversation") {
@@ -1003,7 +1011,7 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
 }
 
 void handle_client_connection(velix::communication::SocketWrapper client_socket,
-                const SchedulerConfig &cfg) {
+                              const SchedulerConfig &cfg) {
   auto client_socket_ptr =
       std::make_shared<velix::communication::SocketWrapper>(
           std::move(client_socket));
@@ -1014,26 +1022,88 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
   try {
     const std::string raw_payload =
         velix::communication::recv_json(*client_socket_ptr);
+
+    // ── SESSION_CONTROL ────────────────────────────────────────────────────────
+    // Lightweight session lifecycle commands from the handler (or any other
+    // client). Handled synchronously — no LLM worker queue needed.
+    // ───────────────────────────────────────────────────────────────────
+    {
+      const json envelope = json::parse(raw_payload);
+      if (envelope.value("message_type", "") == "SESSION_CONTROL") {
+        const std::string action  = envelope.value("action",  "");
+        const std::string user_id = envelope.value("user_id", "");
+        json reply = {{"message_type", "SESSION_RESPONSE"}, {"action", action}};
+
+        try {
+          const std::string super_user =
+              SessionManager::is_session_id(user_id)
+                  ? SessionManager::extract_super_user(user_id)
+                  : user_id;
+
+          if (action == "get_or_create") {
+            const std::string sid =
+                session_manager.get_or_create_active_session(super_user);
+            reply["session_id"] = sid;
+          } else if (action == "new") {
+            const std::string sid = session_manager.new_session(super_user);
+            reply["session_id"] = sid;
+          } else if (action == "compact") {
+            // Fetch current history from CM, run compact (saves snapshot +
+            // resets live convo with pre-seeded tool-call history).
+            const std::string session_id =
+                session_manager.get_or_create_active_session(super_user);
+            const Conversation convo =
+                conversation_manager.get_conversation(session_id);
+            json history = json::array();
+            for (const auto& m : convo.messages) {
+              if (m.is_object()) history.push_back(m);
+            }
+            const auto cr =
+                session_manager.compact(session_id, history, /*is_auto=*/false);
+            reply["session_id"]      = cr.session_id;
+            reply["summary"]         = cr.summary;
+            reply["tokens_before"]   = cr.tokens_before;
+            reply["tokens_after"]    = cr.tokens_after;
+            reply["session_compacted"] = true;
+          } else if (action == "list") {
+            const auto ids = session_manager.list_sessions(super_user);
+            std::string listing = "Sessions for " + super_user + ":\n";
+            for (const auto& id : ids) {
+              listing += "  " + id + "\n";
+            }
+            reply["listing"] = listing;
+          } else {
+            reply["error"] = "unknown SESSION_CONTROL action: " + action;
+          }
+        } catch (const std::exception& e) {
+          reply["error"] = e.what();
+        }
+
+        velix::communication::send_json(*client_socket_ptr, reply.dump());
+        return;  // Done — no LLM work needed.
+      }
+    }
+    // ── LLM_REQUEST (normal path) ─────────────────────────────────────────────────
     PendingRequest req = parse_request_payload(raw_payload);
     current_trace = req.trace_id;
     current_request_id = req.request_id;
 
-    req.stream_token_callback =
-        [client_socket_ptr, client_send_mutex,
-         request_id = req.request_id](const std::string &delta) {
-          if (delta.empty()) {
-            return;
-          }
-          try {
-            const json stream_chunk = {{"message_type", "LLM_STREAM_CHUNK"},
-                                       {"request_id", request_id},
-                                       {"delta", delta}};
-            std::lock_guard<std::mutex> lock(*client_send_mutex);
-            velix::communication::send_json(*client_socket_ptr,
-                                            stream_chunk.dump());
-          } catch (...) {
-          }
-        };
+    req.stream_token_callback = [client_socket_ptr, client_send_mutex,
+                                 request_id =
+                                     req.request_id](const std::string &delta) {
+      if (delta.empty()) {
+        return;
+      }
+      try {
+        const json stream_chunk = {{"message_type", "LLM_STREAM_CHUNK"},
+                                   {"request_id", request_id},
+                                   {"delta", delta}};
+        std::lock_guard<std::mutex> lock(*client_send_mutex);
+        velix::communication::send_json(*client_socket_ptr,
+                                        stream_chunk.dump());
+      } catch (...) {
+      }
+    };
 
     mark_request_active(req.trace_id, req.request_id);
 
@@ -1051,9 +1121,8 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
     }
     queue_cv.notify_one();
 
-    if (future.wait_for(
-            std::chrono::milliseconds(cfg.scheduler_wait_timeout_ms)) !=
-        std::future_status::ready) {
+    if (future.wait_for(std::chrono::milliseconds(
+            cfg.scheduler_wait_timeout_ms)) != std::future_status::ready) {
       throw std::runtime_error("scheduler_request_deadline_exceeded");
     }
 
@@ -1074,7 +1143,8 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
                           {"error", e.what()}};
       std::lock_guard<std::mutex> lock(*client_send_mutex);
       velix::communication::send_json(*client_socket_ptr, error.dump());
-    } catch (...) {}
+    } catch (...) {
+    }
   }
 }
 
@@ -1114,9 +1184,11 @@ void start_scheduler(int port) {
       if (!server_socket.has_data(250)) {
         continue;
       }
-      velix::communication::SocketWrapper client_socket = server_socket.accept();
-      
-      auto client_ptr = std::make_shared<velix::communication::SocketWrapper>(std::move(client_socket));
+      velix::communication::SocketWrapper client_socket =
+          server_socket.accept();
+
+      auto client_ptr = std::make_shared<velix::communication::SocketWrapper>(
+          std::move(client_socket));
       bool submitted = lobby_pool.try_submit([client_ptr, cfg]() mutable {
         handle_client_connection(std::move(*client_ptr), cfg);
       });
@@ -1127,9 +1199,11 @@ void start_scheduler(int port) {
           json error = {{"message_type", "LLM_RESPONSE"},
                         {"status", "error"},
                         {"error", "scheduler_capacity_reached"}};
-          // Note: accessing *client_ptr is safe here as the lambda hasn't run yet or we own the only copy if it failed
+          // Note: accessing *client_ptr is safe here as the lambda hasn't run
+          // yet or we own the only copy if it failed
           velix::communication::send_json(*client_ptr, error.dump());
-        } catch (...) {}
+        } catch (...) {
+        }
       }
     } catch (const std::exception &e) {
       if (shutting_down.load()) {

@@ -37,7 +37,20 @@ In Velix, **one crash does not kill the system**. Each tool and agent is a separ
 ### 5. Intelligent LLM Scheduling
 Local LLMs are easily overwhelmed by concurrent requests. The **Velix Scheduler** manages the reasoning queue. It ensures fairness, handles conversation hydration (history management), and optimizes request batches, preventing the "one-at-a-time" bottleneck of simple API wrappers.
 
-### 6. Hardware Efficiency
+### 6. Infinite Context & Intelligent Compaction
+LLMs have fixed context limits. Velix solves this through a kernel-level **Compaction Engine**. When a conversation reaches its limit, the system:
+1.  **Summarizes**: Generates a high-fidelity summary of the current state.
+2.  **Snapshots**: Saves the full history as an FTS5-indexed JSON snapshot.
+3.  **Resets**: Clears the live context and re-seeds it with the summary and a "retrieval trigger."
+This allows agents to maintain "infinite" context without losing the ability to search deep history using the **session_search** skill.
+
+### 7. Persistent Multi-User Personas
+Unlike simple session-based bots, Velix distinguishes between **Personas** (Super-Users) and **Sessions**.
+*   **Persistent Memory**: Every persona (e.g., `velix`) has a dedicated `memory/agentfiles/` directory for long-term facts (`user.md`) and core instructions (`soul.md`).
+*   **Multi-Session Branching**: A single persona can maintain hundreds of independent sessions (`velix_s1`, `velix_s2`), all of which share the same underlying identity and long-term memory.
+*   **Identity Isolation**: The kernel enforces strict identity mapping, ensuring that tools and agents always access the correct user's vault.
+
+### 8. Hardware Efficiency
 While modern agent frameworks can consume gigabytes of RAM just for their orchestration layer, the Velix C++ core (Supervisor, Bus, Scheduler) has a **minimal resource footprint**. This leaves your hardware's memory where it belongs: with the LLM.
 
 ---
@@ -66,7 +79,7 @@ Velix is composed of specialized service nodes:
 ## ✨ Advanced Features
 
 *   **Non-Blocking Background Tools**: Velix supports asynchronous tool results. An agent can start a long-running "Build" or "Search" task and acknowledge it immediately, allowing the system to remain responsive while work happens in the background.
-*   **Multi-Session Isolation**: Built-in support for `user_conversation` mode, enabling gateways to manage thousands of independent user sessions with zero cross-talk.
+*   **Persona-Scoped Vaults**: Built-in support for persistent identity management. Memory is organized into `agentfiles/` for long-term facts and `sessions/` for active discourse.
 *   **Language Agnostic**: Use the best tool for the job. Write high-speed data tools in Rust, web crawlers in Node.js, and reasoning agents in Python—all living in the same Velix execution tree.
 *   **End-to-End Tracing**: Every tool call and reasoning turn is linked via a `trace_id`, allowing for deep debugging of complex multi-agent workflows.
 
@@ -85,3 +98,149 @@ Velix provides SDKs for all major languages. Each SDK implements the same core l
 ## 📜 License
 
 Velix is built for the future of agentic computing. See [LICENSE](LICENSE) for details.
+
+---
+
+## How To Build And Use
+
+### 1) Build
+
+From the project root:
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+```
+
+This produces:
+
+- `build/integration_kernel`
+- `build/chat_handler`
+
+### 2) Start the kernel and chat handler
+
+Open separate terminals from the project root.
+
+Terminal 1:
+
+```bash
+./build/integration_kernel
+```
+
+Terminal 2:
+
+```bash
+./build/chat_handler
+```
+
+### 3) Start the terminal gateway (Python client)
+
+Terminal 3:
+
+```bash
+python3 chat/terminal.py --host 127.0.0.1 --port 6060
+```
+
+### 4) Python skills require `uv`
+
+Python-runtime skills (for example `skills/web_search`) are configured to run with `uv` (`uv run ...` in the skill manifest).
+
+Install `uv` once on your machine, then run Velix normally:
+
+```bash
+uv --version
+```
+
+If `uv` is not installed, Python skills will fail to launch.
+
+### 5) LLM provider config (`config/model.json`)
+
+Velix reads the active provider from `active_adapter`.
+
+#### Environment variables (file name + format)
+
+- File name: `.env`
+- File location: project root (same level as `README.md`)
+- Format: one `KEY=VALUE` per line
+- No JSON/YAML in `.env`; plain dotenv format only
+
+Example:
+
+```dotenv
+OPENAI_API_KEY=sk-xxxxxxxx
+ANTHROPIC_API_KEY=sk-ant-xxxxxxxx
+OLLAMA_API_KEY=optional-if-your-ollama-endpoint-requires-it
+```
+
+If you set `api_key_env` for an adapter in `config/model.json`, Velix reads that env var name first. Fallback order is:
+
+1. `api_key` value inside `config/model.json`
+2. env var referenced by `api_key_env`
+3. `OPENAI_API_KEY`
+4. `OLLAMA_API_KEY`
+
+#### Option A: `llama.cpp`
+
+1. Start a llama.cpp server exposing OpenAI-compatible chat completions on port `8033`:
+
+```bash
+./llama-server -m /absolute/path/to/your-model.gguf --host 127.0.0.1 --port 8033
+```
+
+2. Keep this adapter active in `config/model.json`:
+
+```json
+{
+	"active_adapter": "llama.cpp",
+	"adapters": {
+		"llama.cpp": {
+			"base_url": "http://127.0.0.1:8033/v1",
+			"chat_completions_path": "/chat/completions",
+			"model": "your-model-name",
+			"enable_tools": true,
+			"enable_streaming": true
+		}
+	}
+}
+```
+
+#### Option B: `ollama`
+
+1. Start Ollama locally and pull a model:
+
+```bash
+ollama serve
+ollama pull llama3
+```
+
+2. Switch `active_adapter` and set the model in `config/model.json`:
+
+```json
+{
+	"active_adapter": "ollama",
+	"adapters": {
+		"ollama": {
+			"base_url": "http://127.0.0.1:11434",
+			"chat_completions_path": "/api/chat",
+			"model": "llama3",
+			"enable_tools": true,
+			"enable_streaming": true
+		}
+	}
+}
+```
+
+### 6) Other providers
+
+If you are not using `llama.cpp` or `ollama`, you can keep default values and only change:
+
+- `active_adapter`
+- adapter `base_url` / endpoint path fields
+- `model`
+- `api_key_env` (recommended) or `api_key`
+
+Recommended pattern for non-default providers:
+
+1. Put the secret in `.env` as `YOUR_PROVIDER_KEY=...`
+2. Set `api_key_env` for that adapter to `YOUR_PROVIDER_KEY`
+3. Keep `api_key` empty in `config/model.json`

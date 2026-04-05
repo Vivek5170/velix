@@ -1,0 +1,49 @@
+{
+  "name": "session_search",
+  "type": "skill",
+  "description": "Full-text search across past Velix conversation history using SQLite FTS5. Returns ranked snippets of matching turns from all persisted conversations.",
+  "runtime": "python",
+  "workdir": ".",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Natural language or keyword query to search across past conversation turns"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of results to return (default: 10, max: 50)",
+        "default": 10
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "all",
+          "user",
+          "proc"
+        ],
+        "description": "Scope of search. all=every conversation, user=user_conversation files only, proc=process conversation files only",
+        "default": "all"
+      },
+      "user_id": {
+        "type": "string",
+        "description": "If mode=user, optionally narrow to a specific user_id. Leave empty to search all users."
+      },
+      "since_hours": {
+        "type": "number",
+        "description": "Only return results from conversations active in the last N hours. 0 = no time filter.",
+        "default": 0
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  "run": {
+    "command": "python3",
+    "args": [
+      "search.py"
+    ]
+  }
+}

@@ -104,6 +104,21 @@ ConversationManager::~ConversationManager() {
 // ── Path helpers ───────────────────────────────────────────────────────────
 
 std::string ConversationManager::user_convo_path(const std::string& user_id) const {
+	// Session-based user_ids (e.g. "terminal_vivek_s1") store their live
+	// conversation inside memory/sessions/{user_id}/{user_id}.json so that
+	// SessionManager can co-locate snapshots and the live file in one folder.
+	// Check for this layout first; fall back to the legacy flat path.
+	const std::string session_path =
+	    "memory/sessions/" + user_id + "/" + user_id + ".json";
+	if (std::filesystem::exists(session_path) ||
+	    std::filesystem::exists("memory/sessions/" + user_id)) {
+		// Ensure the directory exists for new sessions.
+		try {
+			std::filesystem::create_directories("memory/sessions/" + user_id);
+		} catch (...) {}
+		return session_path;
+	}
+	// Legacy / non-session path.
 	return storage_path_ + "/users/" + sanitize_for_filename(user_id) + ".json";
 }
 
@@ -126,7 +141,7 @@ std::string ConversationManager::convo_path_from_struct(const Conversation& conv
  */
 std::string ConversationManager::infer_convo_path(const std::string& convo_id) const {
 	if (convo_id.size() > 5 && convo_id.substr(0, 5) == "user_") {
-		return storage_path_ + "/users/" + convo_id.substr(5) + ".json";
+		return user_convo_path(convo_id.substr(5));
 	}
 	if (convo_id.size() > 5 && convo_id.substr(0, 5) == "proc_") {
 		// Extract creator_pid: "proc_{pid}_{rand}" → find first '_' after "proc_"
@@ -165,6 +180,97 @@ std::string ConversationManager::load_text_file(const std::string& path) const {
 	buf << file.rdbuf();
 	return buf.str();
 }
+
+// ── Static helpers ─────────────────────────────────────────────────────────
+
+std::string ConversationManager::load_text_with_fallbacks(const std::vector<std::string>& paths) {
+	for (const auto& path : paths) {
+		std::ifstream f(path);
+		if (!f.is_open()) { continue; }
+		std::ostringstream buf;
+		buf << f.rdbuf();
+		return buf.str();
+	}
+	return "";
+}
+
+/**
+ * build_layered_system_prompt — single source of truth for system prompt assembly.
+ *
+ * Layer order (each non-empty piece is separated by "\n\n"):
+ *   1. General guidelines  (memory/general_guidelines.md)
+ *   2. Soul / personality  (memory/soul.md — only for user_conversation)
+ *   3. caller_system_msg   (appended, never replaces the base layers)
+ *
+ * The caller_system_msg parameter replaces what used to silently disappear
+ * when the SDK passed an empty string and the scheduler omitted the field.
+ * Non-empty caller messages are now always appended after the base layers.
+ */
+std::string ConversationManager::build_layered_system_prompt(
+    const std::string& mode,
+    const std::string& caller_system_msg,
+    const std::string& user_id) {
+
+	// Extract the super_user from the session_id (e.g. "terminal_vivek_s1"
+	// → "terminal_vivek") so we can load per-user soul.md and user.md.
+	// If user_id has no _s{N} suffix it is already the super_user.
+	std::string super_user = user_id;
+	if (!user_id.empty()) {
+		const auto pos = user_id.rfind("_s");
+		if (pos != std::string::npos && pos + 2 < user_id.size()) {
+			const std::string suffix = user_id.substr(pos + 2);
+			if (!suffix.empty()) super_user = user_id.substr(0, pos);
+		}
+	}
+
+	const std::string general_guidelines = load_text_with_fallbacks({
+	    "memory/general_guidelines.md",
+	    "../memory/general_guidelines.md",
+	    "build/memory/general_guidelines.md"
+	});
+
+	// Soul (persona) — per-super-user first, global fallback.
+	const std::string soul = (mode == "user_conversation" || mode == "simple")
+	    ? load_text_with_fallbacks({
+	          "memory/agentfiles/" + super_user + "/soul.md",
+	          "memory/soul.md",
+	          "../memory/soul.md",
+	          "build/memory/soul.md"
+	      })
+	    : std::string("");
+
+	// user.md — per-super-user facts, only for user_conversation.
+	const std::string user_facts = (mode == "user_conversation")
+	    ? load_text_with_fallbacks({
+	          "memory/agentfiles/" + super_user + "/user.md",
+	          "memory/user.md",
+	          "../memory/user.md",
+	          "build/memory/user.md"
+	      })
+	    : std::string("");
+
+	std::string combined;
+	if (!general_guidelines.empty()) {
+		combined += "General guidelines:\n" + general_guidelines;
+	}
+	if (!soul.empty()) {
+		if (!combined.empty()) combined += "\n\n";
+		combined += "Personality constraints:\n" + soul;
+	}
+	if (!user_facts.empty()) {
+		if (!combined.empty()) combined += "\n\n";
+		combined += "Known user facts:\n" + user_facts;
+	}
+	if (!caller_system_msg.empty()) {
+		if (!combined.empty()) combined += "\n\n";
+		combined += caller_system_msg;
+	}
+	if (combined.empty()) {
+		combined = "You are Velix Agent, an intelligent AI assistant.";
+	}
+	return combined;
+}
+
 
 json ConversationManager::load_sampling_params() const {
 	json defaults = {{"temp", 0.7}, {"top_p", 0.9}, {"max_tokens", 512}};
@@ -500,16 +606,11 @@ std::string ConversationManager::find_convo_for_user(const std::string& user_id)
 
 // ── Message builders ──────────────────────────────────────────────────────
 
-json ConversationManager::build_simple_mode_messages(const std::string& user_message) {
-	const std::string soul       = load_text_file("memory/soul.md");
-	const std::string user_facts = load_text_file("memory/user.md");
-	const std::string general_guidelines = load_text_file("memory/general_guidelines.md");
+json ConversationManager::build_simple_mode_messages(
+    const std::string& user_message,
+    const std::string& caller_system_msg) {
 
-	std::string sys;
-	if (!general_guidelines.empty()) { sys += "General guidelines:\n" + general_guidelines + "\n\n"; }
-	if (!soul.empty())       { sys += "Personality constraints:\n" + soul + "\n\n"; }
-	if (!user_facts.empty()) { sys += "Known user facts:\n" + user_facts; }
-	if (sys.empty())         { sys  = "You are velix assistant."; }
+	const std::string sys = build_layered_system_prompt("simple", caller_system_msg);
 
 	json msgs = json::array();
 	msgs.push_back({{"role", "system"}, {"content", sys}});
@@ -517,12 +618,16 @@ json ConversationManager::build_simple_mode_messages(const std::string& user_mes
 	return msgs;
 }
 
+
 json ConversationManager::build_conversation_messages_safely(const json& normalized_request) {
 	const std::string convo_id = normalized_request.value("convo_id", "");
 	if (convo_id.empty()) {
 		throw std::runtime_error("convo_id missing when building messages");
 	}
+	const std::string mode = normalized_request.value("mode", "user_conversation");
 
+	// Extract caller-supplied system message. This is APPENDED to guidelines+soul,
+	// not used to replace them. Both "system_prompt" and "system_message" are honoured.
 	const std::string explicit_system_prompt = [&]() {
 		if (normalized_request.contains("system_prompt") &&
 		    normalized_request["system_prompt"].is_string()) {
@@ -683,6 +788,12 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 	}
 
 	json msgs = json::array();
+	// ── System message ─────────────────────────────────────────────────────
+	// Build via build_layered_system_prompt so soul+guidelines are always first.
+	// The stored_system_prompt (per-conversation custom persona set at start)
+	// is treated as a caller-supplied extension appended after the base layers.
+	// If a system message is already in the persisted history we use that;
+	// otherwise we synthesise a fresh one so every API call is self-contained.
 	const std::string stored_system_prompt =
 	    (convo.metadata.is_object() && convo.metadata.contains("system_prompt") &&
 	     convo.metadata["system_prompt"].is_string())
@@ -696,8 +807,19 @@ json ConversationManager::build_conversation_messages_safely(const json& normali
 			break;
 		}
 	}
-	if (!stored_system_prompt.empty() && !history_has_system) {
-		msgs.push_back({{"role", "system"}, {"content", stored_system_prompt}});
+
+	if (!history_has_system) {
+		// No system message yet in history, synthesise the full layered one.
+		// Merge stored_system_prompt (conversation persona) + explicit_system_prompt
+		// (per-turn override). Both are appended after soul+guidelines.
+		std::string extra_for_prompt = stored_system_prompt;
+		if (!explicit_system_prompt.empty() && explicit_system_prompt != stored_system_prompt) {
+			if (!extra_for_prompt.empty()) extra_for_prompt += "\n\n";
+			extra_for_prompt += explicit_system_prompt;
+		}
+		const std::string full_sys =
+		    build_layered_system_prompt(mode, extra_for_prompt, convo.user_id);
+		msgs.push_back({{"role", "system"}, {"content", full_sys}});
 	}
 
 	for (const auto& msg : convo.messages) {

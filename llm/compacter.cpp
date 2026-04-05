@@ -205,65 +205,126 @@ void persist_compacted_history(const std::string& history_file_path, const nlohm
 	history_out << compacted.dump(2);
 }
 
+const std::string SUMMARY_PREFIX =
+    "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted "
+    "to save context space. The summary below describes work that was "
+    "already completed, and the current session state may still reflect "
+    "that work (for example, files may already be changed). Use the summary "
+    "and the current state to continue from where things left off, and "
+    "avoid repeating work:\n\n";
+
+const std::string LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:";
+
 std::string request_llm_summary(
-	const nlohmann::json& older_turns,
-	const CompacterConfig& cfg,
-	int scheduler_port
+    const nlohmann::json& older_turns,
+    const CompacterConfig& cfg,
+    int scheduler_port
 ) {
-	const std::string summary_instruction =
-		"Summarize the following conversation so that future responses still have the necessary context.\n"
-		"Focus on user intent, important facts, and decisions.\n"
-		"Do not include unnecessary dialogue.";
+    std::string previous_summary;
+    nlohmann::json turns_to_process = nlohmann::json::array();
 
-	const std::string serialized = serialize_turns_for_summary_prompt(older_turns);
+    // Detect if the first message is a previous summary to handle incremental compaction
+    if (!older_turns.empty() && older_turns[0].is_object()) {
+        const std::string first_content = older_turns[0].value("content", "");
+        if (first_content.rfind(SUMMARY_PREFIX, 0) == 0) {
+            previous_summary = first_content.substr(SUMMARY_PREFIX.size());
+        } else if (first_content.rfind(LEGACY_SUMMARY_PREFIX, 0) == 0) {
+            previous_summary = first_content.substr(LEGACY_SUMMARY_PREFIX.size());
+        }
+    }
 
-	nlohmann::json req = {
-		{"message_type", "LLM_REQUEST"},
-		{"request_id", random_id("COMPACT")},
-		{"tree_id", cfg.summary_tree_id},
-		{"source_pid", cfg.summary_source_pid},
-		{"mode", "simple"},
-		{"convo_id", ""},
-		{"user_id", ""},
-		{"priority", std::numeric_limits<int>::max()},
-		{"inherit_key", nullptr},
-		{"messages", nlohmann::json::array({
-			{{"role", "system"}, {"content", "You compress conversation context into concise summaries for memory compaction."}},
-			{{"role", "user"}, {"content", summary_instruction + "\n\nConversation:\n" + serialized}}
-		})},
-		{"sampling_params", {
-			{"temp", cfg.summary_temp},
-			{"top_p", cfg.summary_top_p},
-			{"max_tokens", cfg.summary_max_tokens}
-		}},
-		{"metadata", {
-			{"request_origin", "compacter"},
-			{"compaction_request", true},
-			{"timestamp", now_iso8601()}
-		}}
-	};
+    // Skip the previous summary in the list of "new turns" to summarize
+    for (std::size_t i = (previous_summary.empty() ? 0 : 1); i < older_turns.size(); ++i) {
+        turns_to_process.push_back(older_turns[i]);
+    }
 
-	velix::communication::SocketWrapper socket;
-	socket.create_tcp_socket();
-	socket.connect(
-		velix::communication::resolve_service_host("SCHEDULER", "127.0.0.1"),
-		static_cast<uint16_t>(scheduler_port));
-	socket.set_timeout_ms(cfg.scheduler_timeout_ms);
+    const std::string content_to_summarize = serialize_turns_for_summary_prompt(turns_to_process);
+    std::ostringstream prompt;
 
-	velix::communication::send_json(socket, req.dump());
-	const std::string response_payload = velix::communication::recv_json(socket);
+    if (!previous_summary.empty()) {
+        // Incremental update prompt
+        prompt << "Update the following technical handoff summary by incorporating the new conversation turns.\n\n"
+               << "PREVIOUS SUMMARY:\n" << previous_summary << "\n\n"
+               << "NEW TURNS TO INCORPORATE:\n" << content_to_summarize << "\n\n"
+               << "Update the summary using this exact structure. PRESERVE all existing information that is still relevant. "
+               << "ADD new progress. Move items from \"In Progress\" to \"Done\" when completed. Remove information only if it is clearly obsolete.\n\n"
+               << "## Goal\n[What the user is trying to accomplish — preserve from previous summary, update if goal evolved]\n\n"
+               << "## Constraints & Preferences\n[User preferences, coding style, constraints, important decisions — accumulate across compactions]\n\n"
+               << "## Progress\n### Done\n[Completed work — include specific file paths, commands run, results obtained]\n"
+               << "### In Progress\n[Work currently underway]\n"
+               << "### Blocked\n[Any blockers or issues encountered]\n\n"
+               << "## Key Decisions\n[Important technical decisions and why they were made]\n\n"
+               << "## Relevant Files\n[Files read, modified, or created — with brief note on each. Accumulate across compactions.]\n\n"
+               << "## Next Steps\n[What needs to happen next to continue the work]\n\n"
+               << "## Critical Context\n[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]\n\n"
+               << "Target ~" << cfg.summary_max_tokens << " tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions.\n\n"
+               << "Write only the summary body. Do not include any preamble or prefix.";
+    } else {
+        // First compaction: summarize from scratch
+        prompt << "Create a structured technical handoff summary for a later assistant that will continue this conversation after earlier turns are compacted.\n\n"
+               << "TURNS TO SUMMARIZE:\n" << content_to_summarize << "\n\n"
+               << "Use this exact structure:\n\n"
+               << "## Goal\n[What the user is trying to accomplish]\n\n"
+               << "## Constraints & Preferences\n[User preferences, coding style, constraints, important decisions]\n\n"
+               << "## Progress\n### Done\n[Completed work — include specific file paths, commands run, results obtained]\n"
+               << "### In Progress\n[Work currently underway]\n"
+               << "### Blocked\n[Any blockers or issues encountered]\n\n"
+               << "## Key Decisions\n[Important technical decisions and why they were made]\n\n"
+               << "## Relevant Files\n[Files read, modified, or created — with brief note on each]\n\n"
+               << "## Next Steps\n[What needs to happen next to continue the work]\n\n"
+               << "## Critical Context\n[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]\n\n"
+               << "Target ~" << cfg.summary_max_tokens << " tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions. "
+               << "The goal is to prevent the next assistant from repeating work or losing important details.\n\n"
+               << "Write only the summary body. Do not include any preamble or prefix.";
+    }
 
-	auto response = nlohmann::json::parse(response_payload);
-	if (response.value("status", "error") != "ok") {
-		throw std::runtime_error("Scheduler summarization failed: " + response.value("error", "unknown"));
-	}
+    nlohmann::json req = {
+        {"message_type", "LLM_REQUEST"},
+        {"request_id", random_id("COMPACT")},
+        {"tree_id", cfg.summary_tree_id},
+        {"source_pid", cfg.summary_source_pid},
+        {"mode", "simple"},
+        {"convo_id", ""},
+        {"user_id", ""},
+        {"priority", std::numeric_limits<int>::max()},
+        {"inherit_key", nullptr},
+        {"messages", nlohmann::json::array({
+            {{"role", "system"}, {"content", "You are an expert technical summarizer that preserves project state across context compactions."}},
+            {{"role", "user"}, {"content", prompt.str()}}
+        })},
+        {"sampling_params", {
+            {"temp", cfg.summary_temp},
+            {"top_p", cfg.summary_top_p},
+            {"max_tokens", cfg.summary_max_tokens}
+        }},
+        {"metadata", {
+            {"request_origin", "compacter"},
+            {"compaction_request", true},
+            {"timestamp", now_iso8601()}
+        }}
+    };
 
-	const std::string summary = response.value("response", "");
-	if (summary.empty()) {
-		throw std::runtime_error("Scheduler summarization returned empty summary");
-	}
+    velix::communication::SocketWrapper socket;
+    socket.create_tcp_socket();
+    socket.connect(
+        velix::communication::resolve_service_host("SCHEDULER", "127.0.0.1"),
+        static_cast<uint16_t>(scheduler_port));
+    socket.set_timeout_ms(cfg.scheduler_timeout_ms);
 
-	return summary;
+    velix::communication::send_json(socket, req.dump());
+    const std::string response_payload = velix::communication::recv_json(socket);
+
+    auto response = nlohmann::json::parse(response_payload);
+    if (response.value("status", "error") != "ok") {
+        throw std::runtime_error("Scheduler summarization failed: " + response.value("error", "unknown"));
+    }
+
+    const std::string summary = response.value("response", "");
+    if (summary.empty()) {
+        throw std::runtime_error("Scheduler summarization returned empty summary");
+    }
+
+    return summary;
 }
 
 void copy_metadata_from_older(const nlohmann::json& older_turns, nlohmann::json& summary_message) {
@@ -331,7 +392,7 @@ CompactResult compact_history_if_needed(const nlohmann::json& history, const std
 	nlohmann::json compacted = nlohmann::json::array();
 	nlohmann::json summary_message = {
 		{"role", "assistant"},
-		{"content", "Summary of earlier conversation: " + llm_summary}
+		{"content", SUMMARY_PREFIX + llm_summary}
 	};
 	copy_metadata_from_older(older, summary_message);
 	if (!summary_message.contains("timestamp")) {

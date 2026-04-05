@@ -126,12 +126,12 @@ bool select_runtime_adapter(const json &manifest,
       }
     }
 
-    if (runtime.run_command != "python" && runtime.run_command != "uv") {
+    if (runtime.run_command != "python" && runtime.run_command != "python3" && runtime.run_command != "uv") {
       error = "python runtime must use python or uv";
       return false;
     }
 
-    if (runtime.run_command == "python") {
+    if (runtime.run_command == "python" || runtime.run_command == "python3") {
       if (runtime.run_args.empty()) {
         error = "python runtime requires entry script arg";
         return false;

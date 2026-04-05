@@ -81,3 +81,8 @@ memory/user.md
 memory/conversations/
 memory/daily_summaries/
 chat/.terminal_user_id
+agent_playground/
+memory/agentfiles/
+memory/sessions/
+session_index.json
+memory/.session_search_index.db

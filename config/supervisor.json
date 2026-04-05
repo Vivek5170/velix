@@ -19,7 +19,7 @@
     "process_convo_ttl_sec": 86400
   },
   "handler": {
-    "binary": "/mnt/Acads and Codes/VScode_Files/Projects/velix/build/chat_handler",
+    "binary": "./build/chat_handler",
     "args": [],
     "auto_restart": true,
     "restart_delay_ms": 2000

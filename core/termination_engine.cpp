@@ -21,11 +21,17 @@ using json = nlohmann::json;
 
 namespace velix::core {
 
+#ifdef _WIN32
+constexpr int kTerminateSignal = 15;
+constexpr int kForcekillSignal = 9;
+#else
+constexpr int kTerminateSignal = SIGTERM;
+constexpr int kForcekillSignal = SIGKILL;
+#endif
+
 void TerminationEngine::kill_processes(
-    const std::vector<TerminationTarget> &targets,
-    const std::string &reason,
-    std::shared_ptr<ProcessRegistry> registry,
-    int terminate_grace_ms) {
+    const std::vector<TerminationTarget> &targets, const std::string &reason,
+    std::shared_ptr<ProcessRegistry> registry, int terminate_grace_ms) {
   for (const auto &target : targets) {
     // Step 1: Mark process as killed (lock-free atomic operation)
     registry->mark_process_killed(target.velix_pid);
@@ -33,26 +39,24 @@ void TerminationEngine::kill_processes(
     // Step 2: Notify bus that child has been terminated
     notify_bus_child_terminated(target, reason);
 
-    // Step 3: Send SIGTERM to OS process
+    // Step 3: Send terminate signal to OS process
     if (target.os_pid > 0) {
-      send_signal_to_os_process(target.os_pid, SIGTERM);
+      send_signal_to_os_process(target.os_pid, kTerminateSignal);
     }
 
     // Step 4: Wait for graceful shutdown
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(terminate_grace_ms));
+    std::this_thread::sleep_for(std::chrono::milliseconds(terminate_grace_ms));
 
-    // Step 5: Send SIGKILL if still alive
+    // Step 5: Send force-kill signal if still alive
     if (target.os_pid > 0) {
-      send_signal_to_os_process(target.os_pid, SIGKILL);
+      send_signal_to_os_process(target.os_pid, kForcekillSignal);
     }
 
     // Step 6: Remove from registry
     registry->terminate_process(target.velix_pid);
 
     LOG_WARN_CTX("Terminated velix pid " + std::to_string(target.velix_pid),
-                 "supervisor", target.tree_id, target.velix_pid,
-                 reason);
+                 "supervisor", target.tree_id, target.velix_pid, reason);
   }
 }
 
@@ -62,11 +66,11 @@ bool TerminationEngine::send_signal_to_os_process(int os_pid, int signal) {
   }
 
 #ifdef _WIN32
-  if (signal == SIGKILL || signal == SIGTERM) {
-    HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE,
-                                 static_cast<DWORD>(os_pid));
+  if (signal == kForcekillSignal || signal == kTerminateSignal) {
+    HANDLE process =
+        OpenProcess(PROCESS_TERMINATE, FALSE, static_cast<DWORD>(os_pid));
     if (process == nullptr) {
-      return false;  // Process already gone or error
+      return false; // Process already gone or error
     }
     const BOOL terminated = TerminateProcess(process, 1);
     CloseHandle(process);
@@ -86,8 +90,7 @@ bool TerminationEngine::send_signal_to_os_process(int os_pid, int signal) {
 }
 
 void TerminationEngine::notify_bus_child_terminated(
-    const TerminationTarget &target,
-    const std::string &reason) {
+    const TerminationTarget &target, const std::string &reason) {
   if (target.trace_id.empty() || target.parent_pid <= 0) {
     return;
   }
@@ -100,16 +103,15 @@ void TerminationEngine::notify_bus_child_terminated(
         velix::communication::resolve_service_host("BUS", "127.0.0.1"),
         static_cast<uint16_t>(bus_port));
 
-    json termination_msg = {
-        {"message_type", "CHILD_TERMINATED"},
-        {"source_pid", 0},  // Supervisor
-        {"target_pid", target.parent_pid},
-        {"trace_id", target.trace_id},
-        {"payload",
-         {{"status", "error"},
-          {"error", "child_terminated"},
-          {"reason", reason},
-          {"pid", target.velix_pid}}}};
+    json termination_msg = {{"message_type", "CHILD_TERMINATED"},
+                            {"source_pid", 0}, // Supervisor
+                            {"target_pid", target.parent_pid},
+                            {"trace_id", target.trace_id},
+                            {"payload",
+                             {{"status", "error"},
+                              {"error", "child_terminated"},
+                              {"reason", reason},
+                              {"pid", target.velix_pid}}}};
 
     velix::communication::send_json(bus_socket, termination_msg.dump());
   } catch (...) {
@@ -131,9 +133,9 @@ void WatchdogEngine::watchdog_loop(std::function<bool()> is_running) {
     }
 
     // Get current time once per loop
-    uint64_t now_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+    uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
 
     // Step 1: Take snapshot - this acquires and releases registry lock
     std::vector<WatchdogEntry> snapshot = registry_->snapshot_for_watchdog();
@@ -206,8 +208,8 @@ void WatchdogEngine::watchdog_loop(std::function<bool()> is_running) {
     }
 
     if (!targets.empty()) {
-      termination_engine_->kill_processes(targets, "watchdog_policy",
-                                          registry_, config_.terminate_grace_ms);
+      termination_engine_->kill_processes(targets, "watchdog_policy", registry_,
+                                          config_.terminate_grace_ms);
     }
 
     // Step 5: Mark trees as completed if all processes are done
@@ -281,4 +283,4 @@ bool WatchdogEngine::should_exempt_tree(const std::string &tree_id) const {
   return config_.exempt_system_tree_limits && tree_id == "TREE_HANDLER";
 }
 
-}  // namespace velix::core
+} // namespace velix::core

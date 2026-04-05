@@ -23,7 +23,7 @@ import struct
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 class Gateway(ABC):
@@ -37,14 +37,12 @@ class Gateway(ABC):
         handler_port: int = 6060,
         user_id: Optional[str] = None,
         connect_timeout_s: float = 5.0,
-        recv_timeout_s: float = 1.0,
+        recv_timeout_s: float = 0.05,
     ) -> None:
         self._handler_host = handler_host
         self._handler_port = handler_port
-        # user_id is the identity presented to the handler.
-        # If None the handler generates one and we adopt it.
         self._requested_user_id: Optional[str] = user_id
-        self._user_id: Optional[str] = None          # confirmed by handler
+        self._user_id: Optional[str] = None
         self._connect_timeout_s = connect_timeout_s
         self._recv_timeout_s = recv_timeout_s
 
@@ -54,11 +52,18 @@ class Gateway(ABC):
         self._running = False
         self._recv_thread: Optional[threading.Thread] = None
 
+        # ── Command registry ─────────────────────────────────────────────────────────
+        # Maps "/command" -> callable(args: str) -> None
+        # Populated by _register_builtin_commands() and subclass register_command().
+        # run() dispatches lines starting with '/' here before forwarding to handler.
+        self._command_registry: Dict[str, Callable[[str], None]] = {}
+        self._register_builtin_commands()
+
     # ------------------------------------------------------------------ #
     # Public lifecycle                                                     #
     # ------------------------------------------------------------------ #
 
-    def connect(self) -> None:
+    def connect(self, force_new: bool = False) -> None:
         """
         Connect to the Handler, perform the registration handshake,
         and start the background receive thread.
@@ -72,7 +77,7 @@ class Gateway(ABC):
         self._sock = sock
 
         # Send registration message.
-        reg: dict = {"type": "register"}
+        reg: dict = {"type": "register", "force_new": force_new}
         if self._requested_user_id:
             reg["user_id"] = self._requested_user_id
         self._send(reg)
@@ -123,22 +128,75 @@ class Gateway(ABC):
     def run(self) -> None:
         """
         Main loop: read input from the transport and forward it to the Handler.
-        Blocks until the gateway is stopped.
-        Subclasses should call this after connect().
+        Lines starting with '/' are checked against the command registry first.
+        Blocks until the gateway is stopped. Subclasses should call this after connect().
         """
         while self._running:
             try:
                 text = self.get_next_input()
                 if text is None:
                     break
-                if text.strip():
-                    self.send_user_message(text)
+                text = text.strip()
+                if not text:
+                    continue
+                # ── Command dispatch ──────────────────────────────────────────────
+                # Split on first space to support: /command optional_args
+                # Unknown slash-prefixed words are forwarded to the handler
+                # so the LLM can respond to questions like "what is /compact?".
+                if text.startswith("/"):
+                    cmd, _, args = text.partition(" ")
+                    handler_fn = self._command_registry.get(cmd)
+                    if handler_fn is not None:
+                        try:
+                            handler_fn(args)
+                        except Exception as exc:
+                            self.deliver({"type": "token", "data": f"[Command error: {exc}]\n"})
+                        continue  # Don't forward handled commands to the LLM.
+                # Forward as a normal message to the handler.
+                self.send_user_message(text)
             except (KeyboardInterrupt, EOFError):
                 break
             except Exception as exc:
                 print(f"[Gateway] Input error: {exc}")
                 break
         self.disconnect()
+
+    # ------------------------------------------------------------------ #
+    # Command registry                                                     #
+    # ------------------------------------------------------------------ #
+
+    def register_command(
+        self, name: str, handler: Callable[[str], None]
+    ) -> None:
+        """
+        Register a client-side slash command.
+
+        name    -- e.g. "/debug" (must start with '/')
+        handler -- callable(args: str) -> None
+                   args is everything after the command name, stripped.
+
+        Client-side commands run entirely in Python and are NOT forwarded
+        to the C++ handler. Use send_user_message() inside the handler if
+        you need to also send something to the LLM after local processing.
+
+        Example::
+            gw.register_command("/debug", lambda args: print(f"debug: {args}"))
+        """
+        if not name.startswith("/"):
+            raise ValueError(f"Command name must start with '/': {name!r}")
+        self._command_registry[name] = handler
+
+    def _register_builtin_commands(self) -> None:
+        """Register commands that the gateway handles locally (client-side)."""
+
+        def _help(_args: str) -> None:
+            lines = ["Available commands:"] + sorted(self._command_registry)
+            self.deliver({"type": "token", "data": "\n".join(lines) + "\n"})
+
+        self.register_command("/help", _help)
+        # Session commands are forwarded to the handler as plain messages so
+        # the C++ side can update session state. They are NOT intercepted here.
+        # (The C++ handler's own command table handles /new, /compact, etc.)
 
     # ------------------------------------------------------------------ #
     # Sending to Handler                                                   #
@@ -164,12 +222,47 @@ class Gateway(ABC):
         """Send an arbitrary payload to the Handler."""
         self._send(payload)
 
+    @classmethod
+    def list_sessions(cls, super_user: str, host: str="127.0.0.1", port: int=6060) -> list:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        try:
+            sock.connect((host, port))
+            req = {"type": "list_sessions", "super_user": super_user}
+            sock.sendall(json.dumps(req).encode() + b"\n")
+            
+            buf = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                if b"\n" in buf:
+                    break
+            
+            line = buf.split(b"\n")[0].decode()
+            resp = json.loads(line)
+            if resp.get("type") == "session_list":
+                sessions = resp.get("sessions", [])
+                if isinstance(sessions, str): # Legacy fallback
+                    try:
+                        r = json.loads(sessions)
+                        return r.get("sessions", [])
+                    except:
+                        return []
+                return sessions
+            return []
+        except Exception:
+            return []
+        finally:
+            sock.close()
+
     @staticmethod
     def list_users(
         handler_host: str = "127.0.0.1",
         handler_port: int = 6060,
         timeout_s: float = 5.0,
-    ) -> List[str]:
+    ) -> List[dict]:
         """Query handler for known persistent user identities."""
         sock = socket.create_connection((handler_host, handler_port), timeout=timeout_s)
         sock.settimeout(timeout_s)

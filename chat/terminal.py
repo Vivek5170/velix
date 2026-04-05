@@ -269,12 +269,17 @@ class TerminalGateway(Gateway):
         etype = event.get("type", "")
 
         if etype == "token":
-            self.spinner.stop()
-            with self._response_lock:
-                if not self._response_in_progress:
-                    _pt_print(f"\n{A_BOLD_CYAN}Assistant:{A_RESET}", end=" ")
-                    self._response_in_progress = True
-                    self._response_done.clear()
+            # Only call stop() on the first token — it joins the bg thread.
+            # On every subsequent token the spinner is already stopped so this
+            # was redundantly calling thread.join() in a tight streaming loop.
+            if self.spinner.running:
+                self.spinner.stop()
+            # deliver() is invoked solely from the single _recv_loop bg thread,
+            # so _response_in_progress is only ever written here — no lock needed.
+            if not self._response_in_progress:
+                _pt_print(f"\n{A_BOLD_CYAN}Assistant:{A_RESET}", end=" ")
+                self._response_in_progress = True
+                self._response_done.clear()
             _pt_print(_sanitize(event.get("data", "")), end="")
 
         elif etype == "end":
@@ -292,12 +297,13 @@ class TerminalGateway(Gateway):
             self.spinner.start(f"[{tool}] {preview}")
 
         elif etype == "tool_finish":
-            duration = time.time() - self._tool_start_time
+            duration = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
             tool     = event.get("tool", "unknown")
             self.spinner.stop(
                 self._tool_finish_line(tool, duration, event.get("result", {}))
             )
             self._current_tool = None
+            self._tool_start_time = 0.0
 
         elif etype == "notify":
             self._handle_notify(event)
@@ -429,15 +435,17 @@ def main() -> None:
             return v or None
         return None
 
-    def pick_user(host: str, port: int, store: str) -> Optional[str]:
+    def pick_persona_and_session(host: str, port: int, store: str) -> tuple[Optional[str], bool]:
         try:
             users = Gateway.list_users(host, port)
         except Exception as e:
             CONSOLE.print(f"[dim red]Note: identity listing unavailable: {e}[/]")
             users = []
         saved = load_saved(store)
+        
+        super_user = None
         if users or saved:
-            CONSOLE.print("\n[bold cyan]Handler Managed Identities:[/]")
+            CONSOLE.print("\n[bold cyan]Handler Managed Identities (Personas):[/]")
             for i, u in enumerate(users, 1):
                 uid    = u.get("id", "??")
                 status = "[bold yellow]Active[/]" if u.get("active") else "[bold green]Free[/]"
@@ -454,24 +462,63 @@ def main() -> None:
                     t = users[idx]
                     if t.get("active"):
                         CONSOLE.print(f"[bold red]Error:[/] '{t['id']}' is already in use.")
-                        return pick_user(host, port, store)
-                    return t["id"]
+                        return pick_persona_and_session(host, port, store)
+                    super_user = t["id"]
             if choice == "l" and saved:
                 if any(u.get("id") == saved and u.get("active") for u in users):
                     CONSOLE.print(f"[bold red]Error:[/] '{saved}' is active elsewhere.")
-                    return pick_user(host, port, store)
-                return saved
+                    return pick_persona_and_session(host, port, store)
+                super_user = saved
+            elif choice == "n" or not choice:
+                custom = input("Enter new persona name (leave blank for random): ").strip()
+                super_user = custom if custom else "user_" + uuid.uuid4().hex[:8]
+        else:
+            custom = input("Enter new persona name (leave blank for random): ").strip()
+            super_user = custom if custom else "user_" + uuid.uuid4().hex[:8]
+
+        # Now select session
+        try:
+            sessions = Gateway.list_sessions(super_user, host, port)
+        except Exception:
+            sessions = []
+            
+        if sessions:
+            CONSOLE.print(f"\n[bold cyan]Sessions for {super_user}:[/]")
+            for i, s_dict in enumerate(sessions, 1):
+                s_id = s_dict if isinstance(s_dict, str) else s_dict.get("id", "Unknown")
+                is_active = False if isinstance(s_dict, str) else s_dict.get("active", False)
+                status = "[bold yellow](Active)[/]" if is_active else "[bold green](Free)[/]"
+                CONSOLE.print(f"  {i}. {s_id} {status}")
+            CONSOLE.print("  [bold cyan]n[/]. Create New Session")
+            choice = input("\nSelect session (leave blank for latest, 'n' for new): ").strip().lower()
             if choice == "n":
-                return "terminal_" + uuid.uuid4().hex[:8]
-        return None
+                s_name = input("Enter new session name (leave blank for auto _sN): ").strip()
+                if s_name:
+                    if s_name.startswith("_s"):
+                        return f"{super_user}{s_name}", False
+                    return f"{super_user}_s_{s_name}", False
+                return super_user, True
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(sessions):
+                    s_dict = sessions[idx]
+                    return s_dict if isinstance(s_dict, str) else s_dict.get("id"), False
+            latest_dict = sessions[-1]
+            return latest_dict if isinstance(latest_dict, str) else latest_dict.get("id"), False # default to latest
+
+        # No sessions exist yet
+        print("\n[Welcome to Velix! Let's set up your first session]")
+        s_name = input("Enter session name (leave blank for default _s1): ").strip()
+        if s_name:
+            if s_name.startswith("_s"):
+                return f"{super_user}{s_name}", False
+            return f"{super_user}_s_{s_name}", False
+        return super_user, False
 
     user_id = args.user_id
+    force_new = False
     if not user_id:
-        user_id = pick_user(args.host, args.port, args.user_store)
-    if not user_id:
-        user_id = load_saved(args.user_store)
-    if not user_id:
-        user_id = "terminal_" + uuid.uuid4().hex[:8]
+        user_id, force_new = pick_persona_and_session(args.host, args.port, args.user_store)
 
     gw = TerminalGateway(
         handler_host=args.host,
@@ -480,14 +527,14 @@ def main() -> None:
         user_store_path=args.user_store,
     )
     try:
-        gw.connect()
+        gw.connect(force_new=force_new)
     except Exception as e:
         CONSOLE.print(f"[bold red]Connection Failed:[/] {e}")
         if "already active" in str(e).lower():
             CONSOLE.print("[yellow]Retrying with new identity...[/]")
             user_id = "terminal_" + uuid.uuid4().hex[:8]
             gw = TerminalGateway(args.host, args.port, user_id, args.user_store)
-            gw.connect()
+            gw.connect(force_new=force_new)
         else:
             sys.exit(1)
 

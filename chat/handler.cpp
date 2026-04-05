@@ -4,7 +4,6 @@
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <queue>
@@ -24,21 +23,21 @@ namespace fs = std::filesystem;
 // a unique user_id supplied (or accepted) during the registration handshake.
 // ---------------------------------------------------------------------------
 struct Session {
-  std::string user_id;
+  std::string user_id;    // the session_id (e.g. terminal_vivek_s1)
+  std::string super_user; // the original gateway user (terminal_vivek)
   SocketWrapper socket;
   std::mutex socket_mutex;
 
-  // Inbound request queue fed by the reader thread, drained by the worker.
   std::queue<std::string> request_queue;
   std::mutex queue_mutex;
   std::condition_variable queue_cv;
 
   std::atomic<bool> active{true};
 
-  // State persistence per user
-  std::string active_convo_id;
+  // active_session_id == user_id for session-based users.
+  // Always the convo_id passed to the scheduler/CM.
+  std::string active_session_id;
 
-  // Non-copyable, non-movable — always held behind a shared_ptr.
   Session() = default;
   Session(const Session &) = delete;
   Session &operator=(const Session &) = delete;
@@ -47,9 +46,22 @@ struct Session {
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
+//
+// Slash command table
+// ───────────────────────────────────────────────────────────────────────────
+// A CommandFn receives the active session and a "send to client" function.
+// It is called before the message is forwarded as an LLM request.
+// New commands: just add one entry to command_table_ in the constructor.
+//
 class Handler : public VelixProcess {
 public:
-  Handler() : VelixProcess("terminal_handler", "handler") {}
+  using SendFn = std::function<void(const json &)>;
+  using CommandFn =
+      std::function<void(std::shared_ptr<Session>, const SendFn &)>;
+
+  Handler() : VelixProcess("terminal_handler", "handler") {
+    register_commands();
+  }
 
   // ------------------------------------------------------------------
   // on_shutdown: close the gateway listener so accept() unblocks.
@@ -262,18 +274,6 @@ private:
       return false;
     }
 
-    const auto sep = user_id.find('_');
-    if (sep == std::string::npos || sep == 0 || sep == user_id.size() - 1) {
-      return false;
-    }
-
-    const std::string prefix = user_id.substr(0, sep);
-    static const std::unordered_set<std::string> allowed_prefixes = {
-        "telegram", "terminal", "web", "cron", "gw"};
-    if (allowed_prefixes.count(prefix) == 0) {
-      return false;
-    }
-
     for (const char c : user_id) {
       const bool is_alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                             (c >= '0' && c <= '9');
@@ -346,16 +346,23 @@ private:
     }
 
     try {
-      const fs::path root = known_users_root();
+      // Create agentfiles directory for the super_user to store memory profiles
+      const fs::path root = fs::path("memory") / "agentfiles" / user_id;
       fs::create_directories(root);
-      const fs::path file_path = root / (user_id + ".json");
-      if (!fs::exists(file_path)) {
-        std::ofstream out(file_path);
-        out << "{}\n";
+
+      const fs::path fallback_soul = fs::path("memory") / "soul.md";
+      const fs::path fallback_user = fs::path("memory") / "user.md";
+
+      if (fs::exists(fallback_soul) && !fs::exists(root / "soul.md")) {
+        fs::copy(fallback_soul, root / "soul.md");
       }
+      if (fs::exists(fallback_user) && !fs::exists(root / "user.md")) {
+        fs::copy(fallback_user, root / "user.md");
+      }
+
       return true;
     } catch (const std::exception &e) {
-      std::cerr << "[Handler] Failed to persist known user '" << user_id
+      std::cerr << "[Handler] Failed to initialize agentfiles for '" << user_id
                 << "': " << e.what() << std::endl;
       return false;
     }
@@ -363,7 +370,9 @@ private:
 
   void handle_new_connection(SocketWrapper client) {
     std::string user_id;
+    std::string actual_super_user;
     bool registered = false;
+    bool force_new = false;
     try {
       client.set_timeout_ms(5000);
       while (!registered) {
@@ -372,12 +381,33 @@ private:
         const std::string type = req.value("type", std::string(""));
 
         if (type == "list_users") {
-          std::vector<std::string> users = snapshot_known_users();
+          // Ask scheduler for all super users
+          const std::string raw =
+              send_session_control("", "list_super_users", "");
+          std::vector<std::string> users;
+          try {
+            const json r = json::parse(raw);
+            if (r.contains("users") && r["users"].is_array()) {
+              for (const auto &u : r["users"]) {
+                if (u.is_string())
+                  users.push_back(u.get<std::string>());
+              }
+            }
+          } catch (...) {
+          }
+
           json j_users = json::array();
           {
             std::lock_guard<std::mutex> lock(sessions_mutex);
             for (const auto &uid : users) {
-              bool active = (sessions.count(uid) > 0);
+              // Mark active if any of their sessions is actively connected
+              bool active = false;
+              for (const auto &[sid, sess] : sessions) {
+                if (sess->super_user == uid) {
+                  active = true;
+                  break;
+                }
+              }
               j_users.push_back({{"id", uid}, {"active", active}});
             }
           }
@@ -386,17 +416,45 @@ private:
           continue;
         }
 
+        if (type == "list_sessions") {
+          const std::string super_user =
+              req.value("super_user", std::string(""));
+          if (!super_user.empty()) {
+            const std::string raw =
+                send_session_control(super_user, "list", "");
+            json j_sessions = json::array();
+            try {
+              const json r = json::parse(raw);
+              if (r.contains("sessions") && r["sessions"].is_array()) {
+                std::lock_guard<std::mutex> lock(sessions_mutex);
+                for (const auto &s : r["sessions"]) {
+                  if (s.is_string()) {
+                    std::string sid = s.get<std::string>();
+                    bool active = (sessions.count(sid) > 0);
+                    j_sessions.push_back({{"id", sid}, {"active", active}});
+                  }
+                }
+              }
+            } catch (...) {
+            }
+            send_json(client,
+                      json{{"type", "session_list"}, {"sessions", j_sessions}}
+                          .dump());
+          }
+          continue;
+        }
+
         if (type != "register") {
-          send_json(
-              client,
-              json{{"type", "error"},
-                   {"message", "first message must be register or list_users"}}
-                  .dump());
+          send_json(client, json{{"type", "error"},
+                                 {"message", "first message must be register, "
+                                             "list_users, or list_sessions"}}
+                                .dump());
           client.close();
           return;
         }
 
         const std::string requested_uid = req.value("user_id", std::string(""));
+        force_new = req.value("force_new", false);
         user_id =
             requested_uid.empty()
                 ? ("terminal_" + velix::utils::generate_uuid().substr(0, 12))
@@ -411,7 +469,13 @@ private:
           return;
         }
 
-        if (!ensure_known_user(user_id)) {
+        actual_super_user = user_id;
+        const auto s_pos = actual_super_user.find("_s");
+        if (s_pos != std::string::npos && s_pos > 0) {
+          actual_super_user = actual_super_user.substr(0, s_pos);
+        }
+
+        if (!ensure_known_user(actual_super_user)) {
           send_json(client, json{{"type", "error"},
                                  {"message", "failed to persist user identity"},
                                  {"user_id", user_id}}
@@ -445,23 +509,50 @@ private:
     }
 
     auto session = std::make_shared<Session>();
-    session->user_id = user_id;
+
+    // If user_id looks like a super_user (no _s{N} suffix), resolve to an
+    // actual session_id via SESSION_CONTROL/get_or_create so the session is
+    // named {super_user}_s1 (or _sN for their latest session).
+    std::string action = force_new ? "new" : "get_or_create";
+    std::string resolved_session_id;
+
+    if (force_new) {
+      resolved_session_id = send_session_control(user_id, "new", "");
+    } else if (user_id.find("_s") != std::string::npos) {
+      // If user_id already contains an _s suffix (e.g. terminal_vivek_s1 or
+      // vivek_s_dev), use it directly. This allows resuming an older specific
+      // session or a named session.
+      resolved_session_id = user_id;
+    } else {
+      resolved_session_id = send_session_control(user_id, "get_or_create", "");
+    }
+
+    if (resolved_session_id.empty()) {
+      resolved_session_id = user_id + "_s1";
+    }
+
+    session->user_id = resolved_session_id;
+    session->super_user = actual_super_user; // the extracted gateway identity
+    session->active_session_id = resolved_session_id;
     session->socket = std::move(client);
     session->socket.set_timeout_ms(500);
 
     try {
       std::lock_guard<std::mutex> lock(session->socket_mutex);
-      send_json(session->socket,
-                json{{"type", "registered"}, {"user_id", user_id}}.dump());
+      send_json(session->socket, json{{"type", "registered"},
+                                      {"user_id", resolved_session_id},
+                                      {"super_user", user_id}}
+                                     .dump());
     } catch (...) {
       return;
     }
 
     {
       std::lock_guard<std::mutex> lock(sessions_mutex);
-      sessions[user_id] = session;
+      sessions[resolved_session_id] = session;
     }
-    std::cout << "[Handler] Session registered: " << user_id << std::endl;
+    std::cout << "[Handler] Session registered: " << resolved_session_id
+              << " (super_user=" << user_id << ")" << std::endl;
 
     std::thread worker(&Handler::session_worker, this, session);
     std::thread reader(&Handler::session_reader, this, session);
@@ -507,10 +598,13 @@ private:
 
   void session_worker(std::shared_ptr<Session> session) {
     auto send_to_client = [&](const json &event) {
+      // Serialize outside the lock so the hot streaming path doesn't hold
+      // socket_mutex longer than necessary (bus events contend on this mutex).
+      std::string frame = event.dump();
       std::lock_guard<std::mutex> lock(session->socket_mutex);
       if (session->socket.is_open()) {
         try {
-          send_json(session->socket, event.dump());
+          send_json(session->socket, frame);
         } catch (...) {
         }
       }
@@ -579,7 +673,6 @@ private:
               call_llm_resume("", tool_message, session->user_id, on_token);
           flush_non_streamed_reply(reply);
         } else if (type == "resume_turn") {
-          // Backward compatibility for pre-standardized queued notifications.
           const json p = j.value("payload", json::object());
           const json result = p.value("result", json::object());
           json tool_message = {{"role", "tool"}};
@@ -600,10 +693,24 @@ private:
         } else {
           const std::string text = j.value("message", "");
           if (!text.empty()) {
-            const std::string reply =
-                call_llm_internal("", text, "", session->user_id,
-                                  "user_conversation", true, on_token);
-            flush_non_streamed_reply(reply);
+            // ── Slash command dispatch
+            // ──────────────────────────────────────── Look up the first word
+            // (e.g. "/new" or "/sessions") in the command table. Unknown slash
+            // commands fall through to the LLM so the user can ask about
+            // commands by name.
+            const std::string cmd = text.find(' ') != std::string::npos
+                                        ? text.substr(0, text.find(' '))
+                                        : text;
+            auto it = command_table_.find(cmd);
+            if (it != command_table_.end()) {
+              it->second(session, send_to_client);
+            } else {
+              // Normal LLM turn.
+              const std::string reply =
+                  call_llm_internal("", text, "", session->user_id,
+                                    "user_conversation", true, on_token);
+              flush_non_streamed_reply(reply);
+            }
           }
         }
         clear_current_user_context();
@@ -741,6 +848,147 @@ private:
   std::mutex approval_map_mutex;
   std::unordered_map<std::thread::id, std::string> thread_user_context;
   std::mutex thread_user_context_mutex;
+
+  // ── Slash command table
+  // ───────────────────────────────────────────────────── Populated once in
+  // register_commands(). Lookup is O(1). To add a command: one line in
+  // register_commands(), nothing else changes.
+  std::unordered_map<std::string, CommandFn> command_table_;
+
+  void register_commands() {
+    // ── /new ───────────────────────────────────────────────────────────────
+    // Creates a brand-new session (next _sN). Re-keys the sessions map since
+    // the socket now represents a new session_id.
+    command_table_["/new"] = [this](auto session, const auto &send) {
+      const std::string new_sid =
+          send_session_control(session->super_user, "new", "");
+      if (!new_sid.empty()) {
+        // Re-key the sessions map: old key = current session_id, new key =
+        // new_sid.
+        std::lock_guard<std::mutex> lk(sessions_mutex);
+        sessions.erase(session->user_id);
+        session->user_id = new_sid;
+        session->active_session_id = new_sid;
+        sessions[new_sid] = session;
+      }
+      send({{"type", "token"},
+            {"data", "[New session: " + session->active_session_id + "]\n"}});
+    };
+
+    // ── /compact ───────────────────────────────────────────────────────────
+    // Compact = save snapshot + reset the SAME session with pre-seeded history.
+    // session_id does NOT change. No re-keying needed.
+    command_table_["/compact"] = [this](auto session, const auto &send) {
+      send({{"type", "token"}, {"data", "[Compacting session...]\n"}});
+      // Scheduler handles: snapshot → reset live convo with pre-seeded history.
+      // Session reply contains tokens_before / tokens_after for display.
+      const std::string raw =
+          send_session_control(session->active_session_id, "compact", "");
+      // raw may contain a JSON SESSION_RESPONSE — parse and show stats.
+      std::string status_msg =
+          "[Compacted: " + session->active_session_id + "]";
+      try {
+        const json r = json::parse(raw);
+        if (r.contains("tokens_before") && r.contains("tokens_after")) {
+          status_msg =
+              "[Compacted: " + std::to_string(r.value("tokens_before", 0)) +
+              " → " + std::to_string(r.value("tokens_after", 0)) + " tokens]";
+        }
+      } catch (...) {
+      }
+      send({{"type", "token"}, {"data", status_msg + "\n"}});
+    };
+
+    // ── /sessions ──────────────────────────────────────────────────────────
+    command_table_["/sessions"] = [this](auto session, const auto &send) {
+      const std::string listing =
+          send_session_control(session->super_user, "list", "");
+      send({{"type", "token"}, {"data", listing}});
+    };
+
+    // ── /help
+    // ─────────────────────────────────────────────────────────────────
+    command_table_["/help"] = [this](auto /*session*/, const auto &send) {
+      std::string msg = "Available commands:\n";
+      for (const auto &[name, _] : command_table_) {
+        msg += "  " + name + "\n";
+      }
+      send({{"type", "token"}, {"data", msg}});
+    };
+    // ───────────────────────────────────────────────────────────────────────────
+    // To add a new command: command_table_["/mycommand"] = [this](...) {...};
+  }
+
+  // ── Session control ────────────────────────────────────────────────────
+  //
+  // Send a SESSION_CONTROL frame to the scheduler and parse the response.
+  // action: "get_or_create" | "new" | "compact" | "list"
+  //
+  // The handler is a stateless TCP gateway. All session/conversation lifecycle
+  // is owned by the scheduler's SessionManager. The handler never imports or
+  // links against any llm/ headers.
+  //
+  std::string send_session_control(const std::string &user_id,
+                                   const std::string &action,
+                                   const std::string & /*extra*/) {
+    constexpr int kSchedulerPort = 5171;
+    constexpr int kRetries = 3;
+    constexpr int kRetryDelayMs = 300;
+    constexpr int kTimeoutMs = 8000;
+
+    try {
+      SocketWrapper sock;
+      sock.create_tcp_socket();
+      sock.set_timeout_ms(kTimeoutMs);
+
+      // Retry loop mirrors connect_with_retries in the SDK.
+      bool connected = false;
+      for (int attempt = 0; attempt < kRetries && !connected; ++attempt) {
+        try {
+          sock.connect("127.0.0.1", kSchedulerPort);
+          connected = true;
+        } catch (...) {
+          if (attempt + 1 < kRetries) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kRetryDelayMs));
+          }
+        }
+      }
+      if (!connected) {
+        std::cerr << "[Handler] Could not connect to scheduler for "
+                  << "SESSION_CONTROL/" << action << std::endl;
+        return "";
+      }
+
+      const json frame = {{"message_type", "SESSION_CONTROL"},
+                          {"action", action},
+                          {"user_id", user_id}};
+      send_json(sock, frame.dump());
+
+      const std::string raw = recv_json(sock);
+      const json response = json::parse(raw);
+
+      if (response.value("message_type", "") != "SESSION_RESPONSE") {
+        std::cerr << "[Handler] Unexpected SESSION_CONTROL response: "
+                  << response.value("message_type", "(none)") << std::endl;
+        return "";
+      }
+      if (action == "list") {
+        return response.value("listing", "(no sessions)");
+      }
+      if (action == "compact" || action == "list_super_users") {
+        // Return the full JSON so caller can read tokens_before/tokens_after or
+        // users array.
+        return raw;
+      }
+      return response.value("session_id", "");
+
+    } catch (const std::exception &e) {
+      std::cerr << "[Handler] SESSION_CONTROL failed (" << action
+                << "): " << e.what() << std::endl;
+      return "";
+    }
+  }
 
   void set_current_user_context(const std::string &user_id) {
     std::lock_guard<std::mutex> lock(thread_user_context_mutex);
