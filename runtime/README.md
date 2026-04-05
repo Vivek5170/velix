@@ -7,6 +7,12 @@ Unnecessary internal details are removed and only **SDK rules, functions, usage,
 
 This document describes how developers implement **skills, tools, agents, and handlers** using the Velix SDK.
 
+> [!NOTE]
+> This guide predominantly uses **C++** syntax for examples. If you are developing with **Python**, please refer to the [Python SDK Guide](file:///mnt/Acads%20and%20Codes/VScode_Files/Projects/velix/runtime/sdk/python/README.md) for equivalent syntax and patterns.
+>
+> Valid LLM modes are strictly: `simple`, `conversation`, and `user_conversation`.
+> The legacy alias `chat` is not part of the protocol.
+
 Velix provides a **process-based runtime** where components communicate through the Velix infrastructure.
 
 Developers interact with the runtime through the **`VelixProcess` SDK class**.
@@ -245,7 +251,8 @@ Conditions:
 
 ```
 mode = "conversation"
-convo_id must not be empty
+user_id must be empty
+source process owns this conversation
 ```
 
 Behavior:
@@ -253,17 +260,51 @@ Behavior:
 ```
 conversation history stored
 future prompts use past context
+if convo_id is empty, runtime creates one automatically
 ```
 
 Example:
 
 ```cpp
 call_llm(
-    "session_42",
+    "", // runtime may create a convo_id on first turn
     "Continue discussion",
     "You are assistant",
-    "user_123",
+    "",
     "conversation"
+);
+```
+
+---
+
+## Mode: `user_conversation`
+
+Maintains per-user conversation history for handler-driven user sessions.
+
+Conditions:
+
+```
+mode = "user_conversation"
+user_id must not be empty
+allowed for handler context
+```
+
+Behavior:
+
+```
+history is keyed by user_id
+streaming is supported for interactive handlers
+```
+
+Example:
+
+```cpp
+call_llm(
+    "",
+    "Continue for this user",
+    "",
+    "alice",
+    "user_conversation"
 );
 ```
 
@@ -372,49 +413,84 @@ json result = execute_tool(
 ### Signature
 
 ```cpp
-void report_result(const json& result);
+void report_result(
+    const json& result,
+    const std::string& trace_id = "",
+    bool append = true
+);
 ```
 
 ### Purpose
 
-Return execution result to the caller.
+Return execution result to the caller. Used by **tools/skills**.
 
-Used by **tools/skills**.
+### Parameters
 
----
-
-### Example
-
-```cpp
-json output = {
-    {"status","ok"},
-    {"data","search results"}
-};
-
-report_result(output);
-```
-
----
+*   **`result`**: The JSON payload to return.
+*   **`trace_id`**: Optional. The trace ID provided in the tool invocation.
+*   **`append`**: 
+    *   `true` (Default): **Synchronous mode**. The result is returned directly to the `execute_tool()` caller and appended to the LLM conversation history immediately.
+    *   `false`: **Asynchronous/Background mode**. Informs the system that the tool has started a background process. The result is sent to the handler as a "start acknowledgement," but the LLM is **not** immediately resumed with this data, and it is **not** appended to the main history yet.
 
 ### Required Rule
 
-Tools must call:
-
-```
-report_result()
-```
-
-exactly once before exiting.
-
-If no result is reported:
-
-```
-execute_tool() will eventually timeout
-```
+Tools must call `report_result()` exactly once before exiting.
 
 ---
 
-# 9. `send_message()`
+# 9. Asynchronous Tool Reporting
+
+When a tool starts a background process using `append=false`, it must eventually report the final result back to the Handler to resume the agent's reasoning.
+
+> [!WARNING]
+> **Supervisor Limits**: Even after calling `report_result(append=false)`, the tool process remains subject to the Supervisor's `max_runtime_sec` (Default: 300s). For tasks exceeding 5 minutes, ensure the tool either spawns a detached child and exits immediately, or that the process manifest specifies a higher runtime limit.
+
+### Workflow Example:
+
+1.  **Start**: Tool calls `report_result({ "status": "background" }, trace_id, false)`.
+2.  **Work**: Tool executes a long-running process (e.g., in a thread).
+3.  **Finish**: Tool sends a `NOTIFY_HANDLER` message via the Bus.
+
+### Final Result Message
+
+To re-activate the LLM after a background task, send a message with `notify_type: "TOOL_RESULT"`.
+
+```cpp
+send_message(
+    -1, // Route to Handler
+    "NOTIFY_HANDLER",
+    {
+        "notify_type": "TOOL_RESULT",
+        "tool": "my_tool_name",
+        "result": {
+            "status": "ok",
+            "output": "The long task finished successfully."
+        }
+    }
+);
+```
+
+The Handler will receive this, append the result to the conversation, and trigger the LLM to continue reasoning.
+
+### Other Supported `notify_type` Values
+
+Use `purpose="NOTIFY_HANDLER"` with one of the following:
+
+| notify_type   | LLM involved | Added to conversation | Delivery behavior |
+| ------------- | ------------ | --------------------- | ----------------- |
+| TOOL_RESULT   | yes          | yes                   | resume reasoning for target user |
+| INDEPENDENT   | yes (simple) | no                    | target user if `user_id` set; otherwise broadcast |
+| SYSTEM_EVENT  | no           | no                    | target user if `user_id` set; otherwise broadcast |
+
+Routing rules:
+
+- If `user_id` exists: route to that session.
+- If `user_id` is empty: broadcast.
+- For `TOOL_RESULT`, missing `user_id` should be treated as undeliverable.
+
+---
+
+# 10. `send_message()`
 
 ### Signature
 
@@ -458,7 +534,10 @@ use purpose = "NOTIFY_HANDLER" when notifying handlers
 send_message(
     handler_pid,
     "NOTIFY_HANDLER",
-    {{"summary","task completed"}}
+        {
+            {"notify_type", "SYSTEM_EVENT"},
+            {"message", "Task completed"}
+        }
 );
 ```
 
@@ -477,7 +556,7 @@ inter-agent communication
 
 ---
 
-# 10. `on_bus_event`
+# 11. `on_bus_event`
 
 ### Definition
 
@@ -493,7 +572,7 @@ Triggered when a message arrives that is **not an RPC response**.
 
 This hook is intended for SDK developers building handlers and agents that need to react to custom bus notifications.
 
-# 11. `on_tool_start` / `on_tool_finish`
+# 12. `on_tool_start` / `on_tool_finish`
 
 ### Definition
 
@@ -502,6 +581,11 @@ std::function<void(const std::string&, const json&)> on_tool_start;
 std::function<void(const std::string&, const json&)> on_tool_finish;
 ```
 
+### 2. Background Tool (Asynchronous)
+
+Use this for long-running operations like builds, web crawling, or complex simulations.
+
+**Step 1: Start work and acknowledge immediately**
 ### Purpose
 
 These hooks let your SDK process observe tool execution lifecycle events.
@@ -549,7 +633,7 @@ SDK developers can use these hooks in handlers to display tool lifecycle events 
 
 ---
 
-# 12. `on_shutdown`
+# 13. `on_shutdown`
 
 ### Definition
 
@@ -596,7 +680,9 @@ on_bus_event = [&](const json& msg){
     std::string sender_user_id = msg.value("user_id", "");
 
     if(purpose == "NOTIFY_HANDLER") {
-        std::cout << "Agent finished work" << std::endl;
+        std::string ntype = msg.value("payload", json::object())
+                              .value("notify_type", "");
+        std::cout << "Handler event: " << ntype << std::endl;
     }
 };
 ```
@@ -613,7 +699,7 @@ Instead dispatch work to worker threads.
 
 ---
 
-# 13. Example Agent
+# 14. Example Agent
 
 Agents typically:
 
@@ -644,14 +730,18 @@ void run() override {
     send_message(
         handler_pid,
         "NOTIFY_HANDLER",
-        result
+                {
+                    {"notify_type", "TOOL_RESULT"},
+                    {"tool", "web_search"},
+                    {"result", result}
+                }
     );
 }
 ```
 
 ---
 
-# 14. Best Practices
+# 15. Best Practices
 
 ### Tools
 

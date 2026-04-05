@@ -18,6 +18,7 @@ pub struct VelixProcess {
     pub tree_id: String,
     pub parent_pid: i32,
     pub entry_trace_id: String,
+    pub user_id: String,
     pub params: Value,
     status: Arc<Mutex<String>>,
     is_running: Arc<AtomicBool>,
@@ -35,6 +36,7 @@ impl VelixProcess {
             tree_id: String::new(),
             parent_pid: env::var("VELIX_PARENT_PID").ok().and_then(|v| v.parse().ok()).unwrap_or(-1),
             entry_trace_id: env::var("VELIX_TRACE_ID").unwrap_or_default(),
+            user_id: env::var("VELIX_USER_ID").unwrap_or_default(),
             params: parse_env_json("VELIX_PARAMS"),
             status: Arc::new(Mutex::new("STARTING".to_string())),
             is_running: Arc::new(AtomicBool::new(false)),
@@ -91,14 +93,33 @@ impl VelixProcess {
         self.bus_stream = None;
     }
 
-    pub fn call_llm(&self, convo_id: &str, user_message: &str, system_message: &str) -> Result<String, String> {
+    pub fn call_llm(&self, convo_id: &str, user_message: &str, system_message: &str, user_id: &str, mode: &str) -> Result<String, String> {
+        self.call_llm_internal(convo_id, user_message, system_message, user_id, mode, None)
+    }
+
+    pub fn call_llm_resume(&self, convo_id: &str, tool_result: Value, user_id: &str) -> Result<String, String> {
+        self.call_llm_internal(convo_id, "", "", user_id, "user_conversation", Some(tool_result))
+    }
+
+    fn call_llm_internal(&self, convo_id: &str, user_message: &str, system_message: &str, user_id: &str, mode: &str, tool_result_override: Option<Value>) -> Result<String, String> {
+        let m = if !mode.is_empty() {
+            mode.to_string()
+        } else if convo_id.is_empty() && user_id.is_empty() {
+            "simple".to_string()
+        } else if !user_id.is_empty() {
+            "user_conversation".to_string()
+        } else {
+            "conversation".to_string()
+        };
+
         let base_payload = json!({
             "message_type": "LLM_REQUEST",
-            "mode": "conversation",
+            "mode": m,
             "tree_id": self.tree_id,
             "source_pid": self.velix_pid,
             "priority": 1,
             "convo_id": convo_id,
+            "user_id": user_id,
             "owner_pid": self.velix_pid
         });
 
@@ -110,13 +131,20 @@ impl VelixProcess {
             next_messages.push(json!({"role": "user", "content": user_message}));
         }
 
-        const MAX_ITERATIONS: usize = 10;
-        for _ in 0..MAX_ITERATIONS {
+        const MAX_ITERATIONS: usize = 15;
+        for i in 0..MAX_ITERATIONS {
             self.set_status("WAITING_LLM");
 
             let mut payload = base_payload.clone();
             payload["request_id"] = Value::String(format!("req_{}_{}", self.velix_pid, rand_suffix()));
             payload["trace_id"] = Value::String(format!("trace_{}", now_nanos()));
+
+            if i == 0 {
+                if let Some(tr) = &tool_result_override {
+                    payload["tool_message"] = tr.clone();
+                }
+            }
+
             if !next_messages.is_empty() {
                 payload["messages"] = Value::Array(next_messages.clone());
             }
@@ -127,19 +155,19 @@ impl VelixProcess {
                 return Err(resp["error"].as_str().unwrap_or("llm request failed").to_string());
             }
 
-            if !resp["exec_required"].as_bool().unwrap_or(false) {
+            let tool_calls = resp.get("tool_calls").and_then(|v| v.as_array());
+            if tool_calls.is_none() || tool_calls.unwrap().is_empty() {
                 self.set_status("RUNNING");
                 return Ok(resp["response"].as_str().unwrap_or("").to_string());
             }
 
-            let trace_id = resp["trace_id"].as_str().unwrap_or("").to_string();
+            let tool_calls = tool_calls.unwrap();
             let mut tool_messages: Vec<Value> = Vec::new();
             let mut tool_executed = false;
 
-            for call in extract_tool_calls(&resp) {
-                let name = call
-                    .get("name")
-                    .and_then(|v| v.as_str())
+            for call in tool_calls {
+                let name = call.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str())
+                    .or_else(|| call.get("name").and_then(|v| v.as_str()))
                     .unwrap_or("")
                     .trim()
                     .to_string();
@@ -147,19 +175,23 @@ impl VelixProcess {
                     continue;
                 }
 
-                let args = call
-                    .get("arguments")
-                    .cloned()
+                let args = call.get("function").and_then(|f| f.get("arguments")).cloned()
+                    .or_else(|| call.get("arguments").cloned())
                     .filter(|v| v.is_object())
                     .unwrap_or_else(|| Value::Object(Map::new()));
 
                 self.set_status("RUNNING");
                 let result = self.execute_tool(&name, args)?;
                 tool_executed = true;
+
+                let call_id = call.get("id").and_then(|v| v.as_str())
+                    .or_else(|| call.get("trace_id").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+
                 tool_messages.push(json!({
                     "role": "tool",
                     "content": result.to_string(),
-                    "tool_call_id": trace_id
+                    "tool_call_id": call_id
                 }));
             }
 
@@ -168,7 +200,6 @@ impl VelixProcess {
                 return Ok(resp["response"].as_str().unwrap_or("").to_string());
             }
 
-            // Scheduler reconstructs full conversation from convo_id.
             next_messages = tool_messages;
         }
 
@@ -186,6 +217,10 @@ impl VelixProcess {
             "name": name,
             "params": params
         });
+        let mut req = req;
+        if !self.user_id.is_empty() {
+            req["user_id"] = Value::String(self.user_id.clone());
+        }
         let ack = self.request("EXECUTIONER", &req, Duration::from_secs(5))?;
         if ack["status"] != "ok" {
             return Err(format!("executioner rejected: {}", ack));
@@ -209,15 +244,25 @@ impl VelixProcess {
         }
     }
 
-    pub fn report_result(&mut self, target_pid: i32, data: Value, trace_id: &str) -> Result<(), String> {
+    pub fn report_result(&mut self, target_pid: i32, data: Value, trace_id: &str, append: bool) -> Result<(), String> {
         if let Some(stream) = self.bus_stream.as_mut() {
+            let tid = if trace_id.is_empty() { &self.entry_trace_id } else { trace_id };
+
             let msg = json!({
                 "message_type": "IPM_RELAY",
                 "target_pid": target_pid,
-                "trace_id": trace_id,
+                "trace_id": tid,
                 "payload": data
             });
             send_framed(stream, &msg).map_err(|e| e.to_string())?;
+
+            if !append && !tid.is_empty() {
+                let (lock, cvar) = &*self.responses;
+                if let Ok(mut map) = lock.lock() {
+                    map.remove(tid);
+                    cvar.notify_all();
+                }
+            }
         }
         Ok(())
     }

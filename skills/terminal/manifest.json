@@ -54,7 +54,7 @@
       "background": {
         "type": "boolean",
         "default": false,
-        "description": "Run detached. Returns immediately with status=background. Handler receives NOTIFY_HANDLER when the process exits."
+        "description": "Run detached. Returns immediately with status=background. Handler receives NOTIFY_HANDLER with notify_type=TOOL_RESULT when the process exits."
       },
       "pty": {
         "type": "boolean",

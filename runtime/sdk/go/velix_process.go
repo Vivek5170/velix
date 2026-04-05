@@ -21,6 +21,7 @@ type VelixProcess struct {
 	TreeID       string
 	ParentPid    int
 	EntryTraceID string
+	UserID       string
 	Params       map[string]any
 	Status       string
 
@@ -40,6 +41,7 @@ func NewVelixProcess(name, role string) *VelixProcess {
 		VelixPid:    -1,
 		ParentPid:   readEnvInt("VELIX_PARENT_PID", -1),
 		EntryTraceID: os.Getenv("VELIX_TRACE_ID"),
+		UserID:      os.Getenv("VELIX_USER_ID"),
 		Params:      readEnvJSON("VELIX_PARAMS"),
 		Status:      "STARTING",
 		responses:   map[string]map[string]any{},
@@ -101,14 +103,33 @@ func (p *VelixProcess) Shutdown() {
 	}
 }
 
-func (p *VelixProcess) CallLLM(convoID, userMessage, systemMessage string) (string, error) {
+func (p *VelixProcess) CallLLM(convoID, userMessage, systemMessage, userID, mode string) (string, error) {
+	return p.callLLMInternal(convoID, userMessage, systemMessage, userID, mode, nil)
+}
+
+func (p *VelixProcess) CallLLMResume(convoID string, toolResult map[string]any, userID string) (string, error) {
+	return p.callLLMInternal(convoID, "", "", userID, "user_conversation", toolResult)
+}
+
+func (p *VelixProcess) callLLMInternal(convoID, userMessage, systemMessage, userID, mode string, toolResultOverride map[string]any) (string, error) {
+	if mode == "" {
+		if convoID == "" && userID == "" {
+			mode = "simple"
+		} else if userID != "" {
+			mode = "user_conversation"
+		} else {
+			mode = "conversation"
+		}
+	}
+
 	basePayload := map[string]any{
 		"message_type": "LLM_REQUEST",
-		"mode":         "conversation",
+		"mode":         mode,
 		"tree_id":      p.TreeID,
 		"source_pid":   p.VelixPid,
 		"priority":     1,
 		"convo_id":     convoID,
+		"user_id":      userID,
 		"owner_pid":    p.VelixPid,
 	}
 
@@ -120,7 +141,7 @@ func (p *VelixProcess) CallLLM(convoID, userMessage, systemMessage string) (stri
 		nextMessages = append(nextMessages, map[string]any{"role": "user", "content": userMessage})
 	}
 
-	const maxIterations = 10
+	const maxIterations = 15
 	for i := 0; i < maxIterations; i++ {
 		p.Status = "WAITING_LLM"
 
@@ -130,6 +151,11 @@ func (p *VelixProcess) CallLLM(convoID, userMessage, systemMessage string) (stri
 		}
 		payload["request_id"] = fmt.Sprintf("req_%d_%d", p.VelixPid, time.Now().UnixNano()%100000000)
 		payload["trace_id"] = fmt.Sprintf("trace_%d", time.Now().UnixNano())
+
+		if i == 0 && toolResultOverride != nil {
+			payload["tool_message"] = toolResultOverride
+		}
+
 		if len(nextMessages) > 0 {
 			payload["messages"] = nextMessages
 		}
@@ -144,8 +170,8 @@ func (p *VelixProcess) CallLLM(convoID, userMessage, systemMessage string) (stri
 			return "", fmt.Errorf("scheduler rejected: %v", resp["error"])
 		}
 
-		execRequired, _ := resp["exec_required"].(bool)
-		if !execRequired {
+		toolCallsRaw, _ := resp["tool_calls"].([]any)
+		if len(toolCallsRaw) == 0 {
 			p.Status = "RUNNING"
 			if s, ok := resp["response"].(string); ok {
 				return s, nil
@@ -153,17 +179,28 @@ func (p *VelixProcess) CallLLM(convoID, userMessage, systemMessage string) (stri
 			return "", nil
 		}
 
-		traceID, _ := resp["trace_id"].(string)
-		toolCalls := extractToolCalls(resp)
 		toolMessages := make([]map[string]any, 0)
 		toolExecuted := false
 
-		for _, call := range toolCalls {
-			name, _ := call["name"].(string)
+		for _, item := range toolCallsRaw {
+			call, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			fn, _ := call["function"].(map[string]any)
+			name, _ := fn["name"].(string)
+			if name == "" {
+				name, _ = call["name"].(string)
+			}
 			if name == "" {
 				continue
 			}
-			args, _ := call["arguments"].(map[string]any)
+
+			args, _ := fn["arguments"].(map[string]any)
+			if args == nil {
+				args, _ = call["arguments"].(map[string]any)
+			}
 			if args == nil {
 				args = map[string]any{}
 			}
@@ -176,11 +213,16 @@ func (p *VelixProcess) CallLLM(convoID, userMessage, systemMessage string) (stri
 			}
 			toolExecuted = true
 
+			callID, _ := call["id"].(string)
+			if callID == "" {
+				callID, _ = call["trace_id"].(string)
+			}
+
 			resJSON, _ := json.Marshal(res)
 			toolMessages = append(toolMessages, map[string]any{
 				"role":         "tool",
 				"content":      string(resJSON),
-				"tool_call_id": traceID,
+				"tool_call_id": callID,
 			})
 		}
 
@@ -192,7 +234,6 @@ func (p *VelixProcess) CallLLM(convoID, userMessage, systemMessage string) (stri
 			return "", nil
 		}
 
-		// Send only newly produced tool messages on next iteration.
 		nextMessages = toolMessages
 	}
 
@@ -272,6 +313,9 @@ func (p *VelixProcess) ExecuteTool(name string, params map[string]any) (map[stri
 		"name":         name,
 		"params":       params,
 	}
+	if p.UserID != "" {
+		req["user_id"] = p.UserID
+	}
 	ack, err := p.request("EXECUTIONER", req, 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -298,17 +342,33 @@ func (p *VelixProcess) ExecuteTool(name string, params map[string]any) (map[stri
 	}
 }
 
-func (p *VelixProcess) ReportResult(targetPID int, data map[string]any, traceID string) error {
+func (p *VelixProcess) ReportResult(targetPID int, data map[string]any, traceID string, appendToConvo bool) error {
 	if p.busConn == nil {
 		return nil
 	}
+	if traceID == "" {
+		traceID = p.EntryTraceID
+	}
+
 	msg := map[string]any{
 		"message_type": "IPM_RELAY",
 		"target_pid":   targetPID,
 		"trace_id":     traceID,
 		"payload":      data,
 	}
-	return sendFramed(p.busConn, msg)
+	err := sendFramed(p.busConn, msg)
+	if err != nil {
+		return err
+	}
+
+	if !appendToConvo && traceID != "" {
+		p.mu.Lock()
+		delete(p.responses, traceID)
+		p.mu.Unlock()
+		p.respCond.Broadcast()
+	}
+
+	return nil
 }
 
 func (p *VelixProcess) connectBus() error {

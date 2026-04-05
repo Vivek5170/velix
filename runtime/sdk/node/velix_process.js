@@ -12,6 +12,7 @@ class VelixProcess {
     this.treeId = '';
     this.parentPid = Number(process.env.VELIX_PARENT_PID || -1);
     this.entryTraceId = process.env.VELIX_TRACE_ID || '';
+    this.userId = process.env.VELIX_USER_ID || '';
     this.params = this.#parseJson(process.env.VELIX_PARAMS || '{}');
     this.isRunning = false;
     this.busSocket = null;
@@ -68,14 +69,29 @@ class VelixProcess {
     }
   }
 
-  async callLlm(convoId, userMessage = '', systemMessage = '') {
+  async callLlm(convoId, userMessage = '', systemMessage = '', userId = '', mode = 'user_conversation') {
+    return this._callLlmInternal(convoId, userMessage, systemMessage, userId, mode);
+  }
+
+  /**
+   * Resumes a conversation with an out-of-band tool result.
+   */
+  async callLlmResume(convoId, toolResult, userId = '') {
+    return this._callLlmInternal(convoId || '', '', '', userId || '', 'user_conversation', toolResult);
+  }
+
+  async _callLlmInternal(convoId, userMessage, systemMessage, userId, mode, toolResultOverride = null) {
+    const effectiveUserId = userId || '';
+    const m = mode || (!convoId && !effectiveUserId ? 'simple' : (effectiveUserId ? 'user_conversation' : 'conversation'));
+
     const basePayload = {
       message_type: 'LLM_REQUEST',
-      mode: 'conversation',
-      tree_id: this.treeId,
+      mode: m,
+      tree_id: this.tree_id,
       source_pid: this.velixPid,
       priority: 1,
-      convo_id: convoId,
+      convo_id: convoId || '',
+      user_id: effectiveUserId,
       owner_pid: this.velixPid,
     };
 
@@ -83,7 +99,7 @@ class VelixProcess {
     if (systemMessage) nextMessages.push({ role: 'system', content: systemMessage });
     if (userMessage) nextMessages.push({ role: 'user', content: userMessage });
 
-    const maxIterations = 10;
+    const maxIterations = 15;
     for (let i = 0; i < maxIterations; i++) {
       this.status = 'WAITING_LLM';
 
@@ -92,6 +108,11 @@ class VelixProcess {
         request_id: `req_${this.velixPid}_${crypto.randomUUID().slice(0, 8)}`,
         trace_id: crypto.randomUUID().replace(/-/g, ''),
       };
+
+      if (i === 0 && toolResultOverride) {
+        payload.tool_message = toolResultOverride;
+      }
+
       if (nextMessages.length) {
         payload.messages = [...nextMessages];
       }
@@ -102,22 +123,19 @@ class VelixProcess {
         throw new Error(resp.error || 'llm request failed');
       }
 
-      if (!resp.exec_required) {
+      if (!resp.tool_calls || !Array.isArray(resp.tool_calls) || resp.tool_calls.length === 0) {
         this.status = 'RUNNING';
         return String(resp.response || '');
       }
 
-      const traceId = String(resp.trace_id || '');
-      const toolCalls = this.#extractToolCalls(resp);
+      const toolCalls = resp.tool_calls;
       const toolMessages = [];
       let toolExecuted = false;
 
       for (const toolCall of toolCalls) {
-        const name = String(toolCall?.name || '').trim();
+        const name = String(toolCall?.function?.name || toolCall?.name || '').trim();
         if (!name) continue;
-        const args = toolCall?.arguments && typeof toolCall.arguments === 'object'
-          ? toolCall.arguments
-          : {};
+        const args = toolCall?.function?.arguments || toolCall?.arguments || {};
 
         this.status = 'RUNNING';
         const result = await this.executeTool(name, args);
@@ -125,7 +143,7 @@ class VelixProcess {
         toolMessages.push({
           role: 'tool',
           content: JSON.stringify(result),
-          tool_call_id: traceId,
+          tool_call_id: toolCall.id || toolCall.trace_id || '',
         });
       }
 
@@ -134,8 +152,6 @@ class VelixProcess {
         return String(resp.response || '');
       }
 
-      // Scheduler rebuilds conversation state; only send newly produced tool
-      // messages in the next iteration.
       nextMessages = toolMessages;
     }
 
@@ -206,6 +222,9 @@ class VelixProcess {
       name,
       params,
     };
+    if (this.userId) {
+      req.user_id = this.userId;
+    }
     const ack = await this.#request('EXECUTIONER', req, 5000);
     if (ack.status !== 'ok') {
       throw new Error(ack.error || 'executioner rejected');
@@ -247,14 +266,26 @@ class VelixProcess {
     });
   }
 
-  reportResult(targetPid, data, traceId = '') {
+  reportResult(targetPid, data, traceId = '', append = true) {
     if (!this.busSocket) return;
+    const tid = traceId || this.entryTraceId;
     this.#sendFramed(this.busSocket, {
       message_type: 'IPM_RELAY',
       target_pid: targetPid,
-      trace_id: traceId,
+      trace_id: tid,
       payload: data,
     });
+
+    if (append) {
+      // Logic for internal tool-calling wait-state
+      // (Wait, Node.js uses responses/waiters map directly in executeTool)
+    } else {
+      // Async: remove trace from waiters so executeTool stops waiting.
+      if (tid) {
+        this.pendingToolWaiters.delete(tid);
+        this.responses.delete(tid);
+      }
+    }
   }
 
   async #connectBus() {

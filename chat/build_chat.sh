@@ -1,23 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Find the project root
 ROOT=$(cd "$(dirname "$0")" && pwd)
 BUILD_DIR="$ROOT/../build"
 
-echo "[*] Building chat handler and terminal clients..."
+echo "[*] Building Velix Gateway Handler (C++)..."
 
 mkdir -p "$BUILD_DIR"
 
-# build terminal client (requires communication helpers)
-g++ -std=c++17 -pthread -O2 \
-    -I"$ROOT/.." \
-    -I"$ROOT/../vendor" \
-    "$ROOT/terminal.cpp" \
-        "$ROOT/../communication/send.cpp" \
-        "$ROOT/../communication/recv.cpp" \
-        -o "$BUILD_DIR/chat_terminal"
-
-# build handler (SDK + communication layer)
+# -----------------------------------------------------------------------------
+# build handler
+# -----------------------------------------------------------------------------
+# Requires the Velix SDK, the framing layer, and the core communication utils.
 if g++ -std=c++17 -pthread -O2 \
     -I"$ROOT/.." \
     -I"$ROOT/../vendor" \
@@ -27,11 +22,12 @@ if g++ -std=c++17 -pthread -O2 \
         "$ROOT/../communication/recv.cpp" \
         -o "$BUILD_DIR/chat_handler"; then
     chmod +x "$BUILD_DIR/chat_handler"
-    echo "[OK] chat handler built: build/chat_handler"
+    echo "[OK] chat_handler built: build/chat_handler"
+    echo "[INFO] Running it will listen on port 6060 for Gateway connections."
 else
-    echo "[WARN] chat handler build failed; terminal client is still available."
+    echo "[FAIL] chat_handler build failed!"
+    exit 1
 fi
 
-chmod +x "$BUILD_DIR/chat_terminal"
-
-echo "[DONE] chat terminal built: build/chat_terminal"
+echo "[INFO] Python gateways (terminal.py) do not require compilation."
+echo "[DONE]"

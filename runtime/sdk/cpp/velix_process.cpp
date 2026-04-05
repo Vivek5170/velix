@@ -302,6 +302,7 @@ uint64_t VelixProcess::get_current_memory_usage_mb() const {
 #endif
 }
 
+// static
 int VelixProcess::resolve_port(const std::string &service_name, int fallback) {
   if (service_name == "SCHEDULER") {
     return velix::utils::get_port(
@@ -430,8 +431,6 @@ void VelixProcess::start(int override_pid,
       this->run();
     } catch (const std::exception &e) {
       LOG_ERROR("VelixProcess Sandbox Crashed: " + std::string(e.what()));
-      // The guard will still fire with "completed" or we could refine its
-      // reason here
     }
   }
 
@@ -457,12 +456,11 @@ void VelixProcess::run_kernel_io_loop() {
       const int sup_port = resolve_port("SUPERVISOR", 5173);
       velix::communication::SocketWrapper hb_socket;
       hb_socket.create_tcp_socket();
-        hb_socket.connect(
+      hb_socket.connect(
           velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
           static_cast<uint16_t>(sup_port));
       velix::communication::send_json(hb_socket, heartbeat.dump());
-      velix::communication::recv_json(
-          hb_socket); // read the {"status": "ok"} acknowledgment
+      velix::communication::recv_json(hb_socket); // read the {"status": "ok"} acknowledgment
     } catch (...) {
       if (is_running) {
         LOG_WARN("Lost supervisor connection natively during heartbeat. Engine "
@@ -488,11 +486,11 @@ void VelixProcess::run_kernel_io_loop() {
           {"pid", velix_pid},
           {"payload",
            {{"memory_mb", static_cast<double>(get_current_memory_usage_mb())},
-          {"status", forced_by_signal.load() ? "KILLED" : "FINISHED"}}}};
+            {"status", forced_by_signal.load() ? "KILLED" : "FINISHED"}}}};
       const int sup_port = resolve_port("SUPERVISOR", 5173);
       velix::communication::SocketWrapper hb_socket;
       hb_socket.create_tcp_socket();
-        hb_socket.connect(
+      hb_socket.connect(
           velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
           static_cast<uint16_t>(sup_port));
       velix::communication::send_json(hb_socket, final_heartbeat.dump());
@@ -542,7 +540,6 @@ void VelixProcess::bus_listener_loop() {
         continue;
       } catch (const std::exception &e) {
         const std::string err = e.what();
-        // Socket timeout: keep looping so shutdown can flip is_running.
         if (is_transient_socket_error(err)) {
           std::this_thread::sleep_for(std::chrono::milliseconds(10));
           continue;
@@ -552,7 +549,6 @@ void VelixProcess::bus_listener_loop() {
     }
   } catch (const std::exception &e) {
     LOG_WARN("Velix Bus connection lost: " + std::string(e.what()));
-
     {
       std::lock_guard<std::mutex> lock(queue_mutex);
       is_running = false;
@@ -577,18 +573,34 @@ json VelixProcess::execute_tool_internal(
     const std::string &instruction, const json &args,
     const std::optional<std::string> &user_id_override,
     const std::optional<std::string> &intent_override) {
-  auto call_on_tool_finish = [&](const json &tool_result = json::object()) {
-    if (!on_tool_finish) {
-      return;
-    }
-    try {
-      on_tool_finish(instruction, tool_result);
-    } catch (const std::exception &e) {
-      LOG_WARN("on_tool_finish hook failed: " + std::string(e.what()));
-    } catch (...) {
-      LOG_WARN("on_tool_finish hook failed with unknown exception");
-    }
-  };
+  std::string effective_user_id = user_id;
+  if (is_handler && user_id_override.has_value() &&
+      !user_id_override.value().empty()) {
+    // Handler-only per-call override to avoid shared mutable state races.
+    effective_user_id = user_id_override.value();
+  }
+
+  std::function<void(const json &)> call_on_tool_finish =
+      [&](const json &tool_result) {
+        if (!on_tool_finish) {
+          return;
+        }
+        try {
+          json hook_result = tool_result;
+          if (!effective_user_id.empty() &&
+              (!hook_result.is_object() || !hook_result.contains("user_id"))) {
+            if (!hook_result.is_object()) {
+              hook_result = json::object();
+            }
+            hook_result["user_id"] = effective_user_id;
+          }
+          on_tool_finish(instruction, hook_result);
+        } catch (const std::exception &e) {
+          LOG_WARN("on_tool_finish hook failed: " + std::string(e.what()));
+        } catch (...) {
+          LOG_WARN("on_tool_finish hook failed with unknown exception");
+        }
+      };
 
   std::string actual_trace;
   bool pending_trace_registered = false;
@@ -606,7 +618,15 @@ json VelixProcess::execute_tool_internal(
 
     if (on_tool_start) {
       try {
-        on_tool_start(instruction, args);
+        json hook_args = args;
+        if (!effective_user_id.empty() &&
+            (!hook_args.is_object() || !hook_args.contains("user_id"))) {
+          if (!hook_args.is_object()) {
+            hook_args = json::object();
+          }
+          hook_args["user_id"] = effective_user_id;
+        }
+        on_tool_start(instruction, hook_args);
       } catch (const std::exception &e) {
         LOG_WARN("on_tool_start hook failed: " + std::string(e.what()));
       } catch (...) {
@@ -625,13 +645,6 @@ json VelixProcess::execute_tool_internal(
     if (is_handler && intent_override.has_value() &&
       is_supported_intent_value(intent_override.value())) {
       effective_intent = intent_override.value();
-    }
-
-    std::string effective_user_id = user_id;
-    if (is_handler && user_id_override.has_value() &&
-        !user_id_override.value().empty()) {
-      // Handler-only per-call override to avoid shared mutable state races.
-      effective_user_id = user_id_override.value();
     }
 
     json launch_req = {{"message_type", "EXEC_VELIX_PROCESS"},
@@ -758,7 +771,8 @@ json VelixProcess::execute_tool_internal(
 }
 
 void VelixProcess::report_result(int target_pid, const json &data,
-                                 const std::string &trace_id) {
+                                 const std::string &trace_id,
+                                 bool append) {
   if (!bus_socket.is_open())
     return;
 
@@ -767,11 +781,24 @@ void VelixProcess::report_result(int target_pid, const json &data,
                 {"trace_id", trace_id},
                 {"payload", data}};
 
-  std::lock_guard<std::mutex> lock(bus_mutex);
-  velix::communication::send_json(bus_socket, relay.dump());
+  {
+    std::lock_guard<std::mutex> lock(bus_mutex);
+    velix::communication::send_json(bus_socket, relay.dump());
+  }
 
-  // Mark as reported to prevent the RAII guard from double-reporting on exit
-  result_reported = true;
+  if (append) {
+    // Normal path: wake the waiting execute_tool_internal() so the LLM loop
+    // can continue with this result appended to the conversation.
+    result_reported = true;
+  } else {
+    // Async path: the tool is reporting out-of-band. Remove the trace from the
+    // pending set so execute_tool_internal() does NOT resume waiting for it.
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    if (!trace_id.empty()) {
+      pending_response_traces.erase(trace_id);
+      response_map.erase(trace_id);
+    }
+  }
 }
 
 void VelixProcess::send_message(int target_pid, const std::string &purpose,
@@ -795,8 +822,7 @@ std::string VelixProcess::call_llm(const std::string &convo_id,
                                    const std::string &user_id,
                                    const std::string &mode) {
   return call_llm_internal(convo_id, user_message, system_message, user_id,
-                           mode,
-                           false, nullptr, std::nullopt);
+                           mode, false, nullptr, std::nullopt);
 }
 
 std::string VelixProcess::call_llm_stream(
@@ -805,8 +831,15 @@ std::string VelixProcess::call_llm_stream(
   const std::string &system_message, const std::string &user_id,
   const std::string &mode) {
   return call_llm_internal(convo_id, user_message, system_message, user_id,
-                           mode,
-                           true, on_token, std::nullopt);
+                           mode, true, on_token, std::nullopt);
+}
+
+std::string VelixProcess::call_llm_resume(
+    const std::string &convo_id, const json &tool_result,
+    const std::string &user_id,
+    const std::function<void(const std::string &)> &on_token) {
+  return call_llm_internal(convo_id, "", "", user_id, "", true, on_token,
+                           std::nullopt, tool_result);
 }
 
 std::string VelixProcess::call_llm_internal(
@@ -815,7 +848,8 @@ std::string VelixProcess::call_llm_internal(
   const std::string &mode,
   bool stream_requested,
   const std::function<void(const std::string &)> &on_token,
-  const std::optional<std::string> &intent_override) {
+  const std::optional<std::string> &intent_override,
+  const std::optional<json> &tool_result_override) {
   status.store(ProcessStatus::WAITING_LLM);
 
   // Resolve per-call user context without mutating shared process state.
@@ -830,17 +864,25 @@ std::string VelixProcess::call_llm_internal(
   const std::string effective_mode =
       resolve_effective_mode(mode, convo_id, effective_user_id, is_handler);
 
-  const std::string normalized_convo_id = convo_id;
+  std::string active_convo_id = convo_id;
   json base_payload = {{"mode", effective_mode},
-                       {"convo_id", normalized_convo_id},
                        {"owner_pid", velix_pid},
-             {"stream", stream_requested}};
+                       {"stream", stream_requested}};
 
-  base_payload["user_id"] = effective_user_id;
+  if (effective_mode != "simple") {
+    base_payload["user_id"] = effective_user_id;
+  }
 
   std::string pending_user_message = user_message;
   std::string pending_system_message = system_message;
   json pending_tool_messages = json::array();
+  if (tool_result_override.has_value()) {
+    if (tool_result_override.value().is_array()) {
+      pending_tool_messages = tool_result_override.value();
+    } else {
+      pending_tool_messages.push_back(tool_result_override.value());
+    }
+  }
 
   auto dispatch_llm_request = [&](const json &request_payload,
                                   bool request_streaming) -> std::string {
@@ -877,6 +919,7 @@ std::string VelixProcess::call_llm_internal(
   int loop_count = 0;
   while (is_running && loop_count < 10) {
     json payload = base_payload;
+    payload["convo_id"] = active_convo_id;
 
     if (!pending_system_message.empty()) {
       payload["system_message"] = pending_system_message;
@@ -910,6 +953,13 @@ std::string VelixProcess::call_llm_internal(
                                reply.value("error", ""));
     }
 
+    if (reply.contains("convo_id") && reply["convo_id"].is_string()) {
+      const std::string returned_convo_id = reply["convo_id"].get<std::string>();
+      if (!returned_convo_id.empty()) {
+        active_convo_id = returned_convo_id;
+      }
+    }
+
     const std::string response_text = reply.value("response", "");
 
     const json normalized_tool_calls =
@@ -934,46 +984,44 @@ std::string VelixProcess::call_llm_internal(
     tool_futures.reserve(normalized_tool_calls.size());
 
     for (const auto &tool_call : normalized_tool_calls) {
-        tool_futures.push_back(std::async(
+      tool_futures.push_back(std::async(
           std::launch::async,
           [this, tool_call, effective_user_id, effective_intent_override]() {
-        if (!tool_call.is_object()) {
-          throw std::runtime_error("Malformed tool_call: expected object");
-        }
+            if (!tool_call.is_object()) {
+              throw std::runtime_error("Malformed tool_call: expected object");
+            }
 
-        const json fn = tool_call.value("function", json::object());
-        const std::string tool_name =
-            fn.value("name", std::string(""));
-        if (tool_name.empty()) {
-          throw std::runtime_error("Malformed tool_call: missing function.name");
-        }
+            const json fn = tool_call.value("function", json::object());
+            const std::string tool_name = fn.value("name", std::string(""));
+            if (tool_name.empty()) {
+              throw std::runtime_error("Malformed tool_call: missing function.name");
+            }
 
-        const json tool_args =
-            fn.value("arguments", json::object());
-        const std::string tool_call_id = tool_call.value("id", std::string(""));
-        if (tool_call_id.empty()) {
-          throw std::runtime_error("Malformed tool_call: missing id");
-        }
+            const json tool_args = fn.value("arguments", json::object());
+            const std::string tool_call_id = tool_call.value("id", std::string(""));
+            if (tool_call_id.empty()) {
+              throw std::runtime_error("Malformed tool_call: missing id");
+            }
 
-        json tool_res;
-        try {
-          tool_res = execute_tool_internal(
-              tool_name, tool_args,
-              effective_user_id.empty()
-                  ? std::optional<std::string>{}
-                  : std::optional<std::string>{effective_user_id},
-              effective_intent_override);
-        } catch (const std::exception &e) {
-          tool_res = json{{"status", "error"},
-                          {"error", "tool_execution_failed"},
-                          {"message", e.what()},
-                          {"tool", tool_name}};
-        }
+            json tool_res;
+            try {
+              tool_res = execute_tool_internal(
+                  tool_name, tool_args,
+                  effective_user_id.empty()
+                      ? std::optional<std::string>{}
+                      : std::optional<std::string>{effective_user_id},
+                  effective_intent_override);
+            } catch (const std::exception &e) {
+              tool_res = json{{"status", "error"},
+                              {"error", "tool_execution_failed"},
+                              {"message", e.what()},
+                              {"tool", tool_name}};
+            }
 
-        return json{{"role", "tool"},
-                    {"tool_call_id", tool_call_id},
-                    {"content", tool_res.dump()}};
-      }));
+            return json{{"role", "tool"},
+                        {"tool_call_id", tool_call_id},
+                        {"content", tool_res.dump()}};
+          }));
     }
 
     json tool_messages = json::array();

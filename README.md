@@ -1,116 +1,87 @@
-# Velix
+# Velix: The Agentic Operating System
 
-Velix is a local-first, multi-process AI runtime that behaves like a small agent operating system.
-It separates lifecycle control, LLM scheduling, tool execution, and IPC into dedicated services.
+Velix is a high-performance, local-first agentic runtime designed to solve the structural failures of modern LLM frameworks. It treats agents and tools as **independent processes**, orchestrated by a robust C++ kernel.
 
-This README is the current operational reference for this repository.
+## Why Velix?
 
-## What Velix Runs
+Traditional agentic systems (often Python-heavy) fail when moved from cloud playgrounds to production local hardware. Velix was built to solve the **"Unmanaged Reasoning Loop"**:
 
-Core runtime services:
-- Supervisor: lifecycle authority, process registration, heartbeats, limits, and authorization checks.
-- Scheduler: LLM request queue, conversation hydration, fairness, and tool-call routing.
-- Executioner: validated process launcher for skills and agents.
-- Bus: PID-addressed IPC relay for results and lifecycle signals.
-- Conversation Manager: user and process conversation storage.
+*   **Concurrency Crisis**: Local LLMs have finite resources. Without a **Scheduler**, multiple agent turns crash the memory or cause massive latency spikes. Velix enforces queuing, fairness, and history compaction at the kernel level.
+*   **Orchestration Latency**: Every millisecond spent in Python orchestration is a millisecond lost in user experience. Velix uses an **asynchronous C++ backbone** to reach near-zero orchestration overhead.
+*   **Fragility**: A single tool crash in a single-threaded framework kills the entire agent. Velix uses **Process-Level Isolation**; if a tool fails, the OS cleans it up and the Supervisor reports it—preserving the system's state.
+*   **Privacy Sovereignty**: Built for **air-gapped and data-sensitive environments**, Velix ensures that all reasoning, history, and tool traces stay on your local infrastructure.
 
-SDKs:
-- C++
-- Python
-- Node
-- Go
-- Rust
+---
 
-All SDKs use the same framed TCP JSON protocol:
-- 4-byte big-endian length prefix
-- UTF-8 JSON payload
+## 🚀 Key Features
 
-## Repository Layout
+### 1. Developer-First SDK (Not "Prompt-First")
+Most frameworks rely on loose prompts to guide agent behavior. Velix provides the `VelixProcess` SDK (C++, Python, Node, Go, Rust) that enforces **predictable behavior contracts**. Developers write code to handle logic, while the LLM handles reasoning—creating a clear separation of concerns.
 
-- core/: supervisor and bus services.
-- llm/: scheduler, conversation manager, and compacter.
-- execution/: executioner and launch adapters.
-- communication/: socket transport and framing helpers.
-- runtime/sdk/: language SDK implementations.
-- schema/: runtime message contracts.
-- config/: ports and runtime tuning.
-- skills/ and agents/: executable tools and orchestrators.
-- tests/integration/: integration kernel and flow tests.
+### 2. High-Performance C++ Core
+While other systems spend significant fractions of a second just orchestrating Python objects, Velix uses an **asynchronous C++ kernel**. This reduces orchestration latency by orders of magnitude, allowing for real-time, fluid agent interactions and token streaming across multiple concurrent users.
 
-## Current Runtime Status
+### 3. Distributed by Design
+Every component in Velix communicates via a **standardized TCP/JSON protocol**. 
+*   Your **Scheduler** can run on a machine with a powerful GPU.
+*   Your **Agents** can run on a cluster of lightweight workers.
+*   Your **Gateway** can run on a public-facing edge server.
+Everything is connected via a simple, PID-addressed Bus.
 
-Implemented and actively used:
-- Refactored Supervisor integrated as the canonical implementation in core/supervisor.cpp.
-- ProcessRegistry and TerminationEngine wired into integration builds.
-- Scheduler queue hardening and OpenAI-compatible base URL parsing.
-- Cross-language SDK call_llm orchestration with iterative tool loop behavior.
+### 4. Multi-Process Stability & Isolation
+In Velix, **one crash does not kill the system**. Each tool and agent is a separate OS process. 
+*   **Isolation**: Python dependency conflicts between two different tools are impossible.
+*   **Security**: Tools run in their own process space, managed by the **Supervisor**.
+*   **Lifecycle**: The Supervisor monitors heartbeats, memory usage, and execution limits, automatically cleaning up "zombie" reasoning loops.
 
-Still intentionally minimal:
-- core/handler.cpp is a placeholder in this repo.
-- Integration flows use temporary handlers in tests/integration/ for runtime validation.
+### 5. Intelligent LLM Scheduling
+Local LLMs are easily overwhelmed by concurrent requests. The **Velix Scheduler** manages the reasoning queue. It ensures fairness, handles conversation hydration (history management), and optimizes request batches, preventing the "one-at-a-time" bottleneck of simple API wrappers.
 
-## Build and Integration
+### 6. Hardware Efficiency
+While modern agent frameworks can consume gigabytes of RAM just for their orchestration layer, the Velix C++ core (Supervisor, Bus, Scheduler) has a **minimal resource footprint**. This leaves your hardware's memory where it belongs: with the LLM.
 
-Integration build script:
-- tests/integration/build_integration.sh
+---
 
-The script currently builds:
-- build/tests/custom_verify_handler
-- build/tests/integration_kernel
+## 🧩 Broad Model Support
 
-Integration kernel links Supervisor plus modular components:
-- core/supervisor.cpp
-- core/process_registry.cpp
-- core/termination_engine.cpp
-- core/bus.cpp
-- execution/*
-- llm/*
+Velix is built to be model-agnostic. Use high-performance local providers or enterprise cloud APIs:
 
-## Runtime Contract
+*   **Local Performance**: Native support for `llama.cpp` and `Ollama`.
+*   **OpenAI-Compatible**: Seamless integration with `vLLM`, `LM Studio`, and `TGI`.
+*   **Enterprise Grade**: Built-in adapters for Anthropic and OpenAI.
 
-Message types commonly exchanged:
-- REGISTER_PID
-- HEARTBEAT
-- LLM_REQUEST
-- EXEC_VELIX_PROCESS
-- IPM_RELAY
-- IPM_PUSH
-- CHILD_TERMINATED
+---
 
-Execution context from environment:
-- VELIX_PARENT_PID
-- VELIX_TRACE_ID
-- VELIX_PARAMS
-- VELIX_PROCESS_NAME
-- VELIX_TREE_ID
+## 🏗️ Architecture
 
-Default service ports (from config/ports.json unless overridden):
-- SUPERVISOR: 5173
-- LLM_SCHEDULER: 5171
-- EXECUTIONER: 5172
-- BUS: 5174
+Velix is composed of specialized service nodes:
 
-## SDK Behavior Parity
+*   **Supervisor**: The lifecycle authority. Monitors process health, enforces timeouts, and manages the execution tree.
+*   **Scheduler**: The reasoning engine. Manages LLM queues and maintains conversation state across multi-turn reasoning loops.
+*   **Executioner**: The deployment engine. Safely launches and configures skill/agent processes.
+*   **Bus**: The neural network. A high-speed IPC relay for PID-targeted messages and system events.
 
-The SDK templates in runtime/sdk/ implement the same core lifecycle pattern:
-- Register with Supervisor.
-- Register on Bus and listen for PID-targeted replies.
-- Send LLM requests through Scheduler.
-- Execute tool calls through Executioner.
-- Reinject tool outputs and continue the loop until final assistant response.
+---
 
-Current parity focus that has been implemented:
-- Iterative call_llm loop with max-iteration guard.
-- Support for both structured tool_calls and embedded EXEC ... END_EXEC blocks.
-- Tool result reinjection as role tool messages with tool_call_id correlation.
-- Consistent WAITING_LLM, RUNNING, and ERROR status transitions.
+## ✨ Advanced Features
 
-## Configuration Notes
+*   **Non-Blocking Background Tools**: Velix supports asynchronous tool results. An agent can start a long-running "Build" or "Search" task and acknowledge it immediately, allowing the system to remain responsive while work happens in the background.
+*   **Multi-Session Isolation**: Built-in support for `user_conversation` mode, enabling gateways to manage thousands of independent user sessions with zero cross-talk.
+*   **Language Agnostic**: Use the best tool for the job. Write high-speed data tools in Rust, web crawlers in Node.js, and reasoning agents in Python—all living in the same Velix execution tree.
+*   **End-to-End Tracing**: Every tool call and reasoning turn is linked via a `trace_id`, allowing for deep debugging of complex multi-agent workflows.
 
-Primary runtime configuration files:
-- config/ports.json
-- config/config.json
-- config/model.json
-- config/supervisor.json
+---
 
-Runtime components support fallback lookup paths used by test and build layouts.
+## 🛠️ Getting Started
+
+Velix provides SDKs for all major languages. Each SDK implements the same core lifecycle and reasoning patterns.
+
+*   **[C++ SDK Documentation](runtime/README.md)**
+*   **[Python SDK Documentation](runtime/sdk/python/README.md)**
+*   **[Node.js / Go / Rust SDKs](runtime/sdk/)**
+
+---
+
+## 📜 License
+
+Velix is built for the future of agentic computing. See [LICENSE](LICENSE) for details.

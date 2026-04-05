@@ -1,0 +1,55 @@
+{
+  "notify_handler": {
+    "IPM_RELAY_example": {
+      "message_type": "IPM_RELAY",
+      "target_pid": -1,
+      "purpose": "NOTIFY_HANDLER",
+      "payload": {
+        "notify_type": "TOOL_RESULT",
+        "tool": "web_search",
+        "result": {
+          "status": "ok",
+          "results": [
+            { "title": "Velix Architecture", "url": "..." }
+          ]
+        },
+        "user_id": "alice"
+      }
+    },
+    "types": {
+      "TOOL_RESULT": {
+        "description": "Used to inject an out-of-band result into an LLM session.",
+        "behavior": "Handler appends to conversation and calls call_llm_resume().",
+        "required_fields": ["tool", "result", "user_id"]
+      },
+      "INDEPENDENT": {
+        "description": "Used for one-shot notifications to the user interface.",
+        "behavior": "Handler sends directly to user session; may trigger LLM via 'simple' mode.",
+        "required_fields": ["content"]
+      },
+      "SYSTEM_EVENT": {
+        "description": "Low-latency passthrough for status updates, logging, or UI markers.",
+        "behavior": "Handler sends directly to user session; no LLM involvement.",
+        "required_fields": ["message"]
+      }
+    }
+  },
+  "lifecycle_notifications": {
+    "TOOL_START": {
+      "purpose": "TOOL_START",
+      "payload": {
+        "tool": "terminal",
+        "args": { "cmd": "ls -la" },
+        "user_id": "alice"
+      }
+    },
+    "TOOL_FINISH": {
+      "purpose": "TOOL_FINISH",
+      "payload": {
+        "tool": "terminal",
+        "result": { "exit_code": 0, "output": "..." },
+        "user_id": "alice"
+      }
+    }
+  }
+}

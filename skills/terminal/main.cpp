@@ -36,9 +36,12 @@
  *
  * ─── Background completion notification ──────────────────────────────────────
  *  Skill → Handler  purpose="NOTIFY_HANDLER"
- *    { "status":"ok"|"error"|"timeout", "exit_code":0,
- *      "output":"...", "stderr":"...", "cwd":"...", "timed_out":false,
- *      "cmd":"...", "background":true }
+ *    { "notify_type":"TOOL_RESULT", "tool":"terminal",
+ *      "result":{
+ *        "status":"ok"|"error"|"timeout", "exit_code":0,
+ *        "output":"...", "stderr":"...", "cwd":"...", "timed_out":false,
+ *        "cmd":"...", "background":true
+ *      }}
  *
  * ─── report_result payload ───────────────────────────────────────────────────
  *  foreground:
@@ -897,7 +900,7 @@ public:
                                  "You will be notified when it completes."},
                      {"cmd", full_cmd},
                      {"cwd", cwd.string()}},
-                    entry_trace_id);
+                    entry_trace_id, false);
 
       // Run on worker — we hold a reference to *this via lambda capture,
       // which is safe because run() (and therefore the process) doesn't
@@ -910,25 +913,31 @@ public:
         } catch (const std::exception &ex) {
           send_message(
               -1, "NOTIFY_HANDLER",
-              {{"status", "error"},
-               {"error", std::string("Execution failed: ") + ex.what()},
-               {"cmd", full_cmd},
-               {"background", true}});
+              {{"notify_type", "TOOL_RESULT"},
+               {"tool", "terminal"},
+               {"result",
+                {{"status", "error"},
+                 {"error", std::string("Execution failed: ") + ex.what()},
+                 {"cmd", full_cmd},
+                 {"background", true}}}});
           return;
         }
 
-        json note = {{"status", exec.timed_out        ? "timeout"
-                                : exec.exit_code == 0 ? "ok"
-                                                      : "error"},
-                     {"exit_code", exec.exit_code},
-                     {"output", trunc(exec.out)},
-                     {"stderr", trunc(exec.err)},
-                     {"cwd", cwd.string()},
-                     {"timed_out", exec.timed_out},
-                     {"cmd", full_cmd},
-                     {"background", true}};
+        json note = {{"notify_type", "TOOL_RESULT"},
+                     {"tool", "terminal"},
+                     {"result",
+                      {{"status", exec.timed_out        ? "timeout"
+                                              : exec.exit_code == 0 ? "ok"
+                                                                    : "error"},
+                       {"exit_code", exec.exit_code},
+                       {"output", trunc(exec.out)},
+                       {"stderr", trunc(exec.err)},
+                       {"cwd", cwd.string()},
+                       {"timed_out", exec.timed_out},
+                       {"cmd", full_cmd},
+                       {"background", true}}}};
         if (!approval.message.empty())
-          note["approval_note"] = approval.message;
+          note["result"]["approval_note"] = approval.message;
 
         send_message(-1, "NOTIFY_HANDLER", note);
       });

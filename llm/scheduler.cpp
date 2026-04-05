@@ -31,7 +31,6 @@
 #include <csignal>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -65,6 +64,10 @@ struct PendingRequest {
   std::shared_ptr<std::promise<json>> completion;
 };
 
+struct ActiveRequest {
+  std::string request_id; // unique per attempt for a trace
+};
+
 struct TreeQueue {
   std::deque<PendingRequest> requests;
   bool has_active_key{false};
@@ -93,11 +96,57 @@ std::atomic<bool> shutting_down{false};
 ConversationManager conversation_manager;
 tools::ToolRegistry tool_registry;
 
-// Active Trace Set: Records trace_ids currently held by client lobby threads.
-// If a client disconnects, the lobby thread removes the trace_id.
-// The GPU worker checks this set before calling LLM.
+// Active request tracking keyed by trace_id.
+// A trace_id can be retried, so workers must match both trace_id and request_id.
 std::mutex trace_mutex;
-std::unordered_set<std::string> active_traces;
+std::unordered_map<std::string, ActiveRequest> active_requests;
+
+void mark_request_active(const std::string &trace_id,
+                         const std::string &request_id) {
+  if (trace_id.empty() || request_id.empty()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(trace_mutex);
+  active_requests[trace_id] = ActiveRequest{request_id};
+}
+
+bool is_request_current(const std::string &trace_id,
+                        const std::string &request_id) {
+  if (trace_id.empty() || request_id.empty()) {
+    return true;
+  }
+
+  std::lock_guard<std::mutex> lock(trace_mutex);
+  auto it = active_requests.find(trace_id);
+  return it != active_requests.end() && it->second.request_id == request_id;
+}
+
+void clear_request_if_current(const std::string &trace_id,
+                              const std::string &request_id) {
+  if (trace_id.empty() || request_id.empty()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(trace_mutex);
+  auto it = active_requests.find(trace_id);
+  if (it != active_requests.end() && it->second.request_id == request_id) {
+    active_requests.erase(it);
+  }
+}
+
+void safe_set_promise_value(const PendingRequest &req, const json &value) {
+  if (!req.completion) {
+    return;
+  }
+
+  try {
+    req.completion->set_value(value);
+  } catch (const std::future_error &e) {
+    LOG_DEBUG("Skipping completion for request_id=" + req.request_id +
+              ": future not waiting (" + std::string(e.what()) + ")");
+  }
+}
 
 using SignalHandler = void (*)(int);
 SignalHandler previous_sigint_handler = SIG_DFL;
@@ -607,8 +656,9 @@ json notify_supervisor_llm_request(const PendingRequest& req,
   return supervisor_response;
 }
 
-json process_llm_request_stateless(PendingRequest &req,
-                                     const SchedulerConfig &cfg) {
+json process_llm_request_stateless(
+  PendingRequest &req, const SchedulerConfig &cfg,
+  const std::function<bool()> &is_attempt_current) {
   if (!req.payload.contains("messages") ||
       !req.payload["messages"].is_array()) {
     throw std::runtime_error("LLM_REQUEST missing messages[]");
@@ -626,6 +676,12 @@ json process_llm_request_stateless(PendingRequest &req,
       build_chat_request(req, cfg, layered_messages);
   const adapters::ChatResponse final_response =
       run_chat_once(*adapter, cfg, chat_request, req.stream_token_callback);
+
+  // A retry may have superseded this attempt while inference was running.
+  // Discard the stale result and prevent any conversation writes.
+  if (is_attempt_current && !is_attempt_current()) {
+    return json{};
+  }
 
   json normalized_tool_calls = json::array();
   if (final_response.tool_calls.is_array()) {
@@ -774,11 +830,7 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
     json response;
     try {
       // Worker Check: Is the client still alive in the lobby?
-      bool client_alive = false;
-      {
-        std::lock_guard<std::mutex> lock(trace_mutex);
-        client_alive = (active_traces.find(req.trace_id) != active_traces.end());
-      }
+      const bool client_alive = is_request_current(req.trace_id, req.request_id);
 
       if (!client_alive) {
         LOG_INFO("Skipping LLM inference for cancelled trace_id: " + req.trace_id);
@@ -797,7 +849,9 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
                 conversation_manager.build_conversation_messages_safely(req.payload);
           }
         }
-        response = process_llm_request_stateless(req, cfg);
+        response = process_llm_request_stateless(
+            req, cfg,
+            [&req]() { return is_request_current(req.trace_id, req.request_id); });
       }
     } catch (const std::exception &e) {
       response = {{"status", "error"},
@@ -810,12 +864,13 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
     }
 
     if (!response.empty()) {
-      req.completion->set_value(response);
+      safe_set_promise_value(req, response);
     } else {
       // Client gone. Just unblock with a cancelled stub.
-      req.completion->set_value({{"message_type", "LLM_RESPONSE"},
-                                 {"status", "cancelled"},
-                                 {"trace_id", req.trace_id}});
+      safe_set_promise_value(req, {{"message_type", "LLM_RESPONSE"},
+                                   {"status", "cancelled"},
+                                   {"request_id", req.request_id},
+                                   {"trace_id", req.trace_id}});
     }
 
     {
@@ -955,11 +1010,13 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
   auto client_send_mutex = std::make_shared<std::mutex>();
 
   std::string current_trace;
+  std::string current_request_id;
   try {
     const std::string raw_payload =
         velix::communication::recv_json(*client_socket_ptr);
     PendingRequest req = parse_request_payload(raw_payload);
     current_trace = req.trace_id;
+    current_request_id = req.request_id;
 
     req.stream_token_callback =
         [client_socket_ptr, client_send_mutex,
@@ -978,14 +1035,12 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
           }
         };
 
-    // Register active trace for cancellation tracking
-    {
-      std::lock_guard<std::mutex> lock(trace_mutex);
-      active_traces.insert(current_trace);
-    }
+    mark_request_active(req.trace_id, req.request_id);
 
     std::future<json> future = req.completion->get_future();
     const std::string queue_key = req.queue_key;
+    const std::string trace_id = req.trace_id;
+    const std::string request_id = req.request_id;
 
     {
       std::lock_guard<std::mutex> lock(queue_mutex);
@@ -1007,19 +1062,12 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
       std::lock_guard<std::mutex> lock(*client_send_mutex);
       velix::communication::send_json(*client_socket_ptr, response.dump());
     }
-    
-    // Cleanup trace
-    {
-      std::lock_guard<std::mutex> lock(trace_mutex);
-      active_traces.erase(current_trace);
-    }
+
+    clear_request_if_current(trace_id, request_id);
 
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("Scheduler client handling error: ") + e.what());
-    if (!current_trace.empty()) {
-      std::lock_guard<std::mutex> lock(trace_mutex);
-      active_traces.erase(current_trace);
-    }
+    clear_request_if_current(current_trace, current_request_id);
     try {
       const json error = {{"message_type", "LLM_RESPONSE"},
                           {"status", "error"},
