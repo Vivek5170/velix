@@ -4,7 +4,7 @@ This document describes how to build Velix **skills, tools, and agents** using t
 
 > [!IMPORTANT]
 > Valid LLM modes are strictly: `simple`, `conversation`, and `user_conversation`. 
-> The legacy `chat` alias is no longer supported.
+> The `chat` alias is no longer supported.
 
 ---
 

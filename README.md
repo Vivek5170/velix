@@ -127,17 +127,46 @@ Terminal 1:
 ./build/integration_kernel
 ```
 
-```
-
-### 3) Start the terminal gateway (Python client)
-
-Terminal 3:
+Terminal 2:
 
 ```bash
-python3 chat/terminal.py
+./build/chat_handler
 ```
 
-### 4) Python skills require `uv`
+### 3) Python requirements for terminal client
+
+The interactive terminal client requires Python 3.10+ and these packages:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install prompt_toolkit rich
+```
+
+If you use Conda/Miniforge, install into the same environment where you run
+`python -m terminal`.
+
+### 4) Start the terminal gateway (Python client)
+
+Use the terminal client from the `chat` directory (recommended):
+
+```bash
+cd chat
+python -m terminal
+```
+
+Common options:
+
+```bash
+python -m terminal --user-id user1
+python -m terminal --user-id user1_s2
+python -m terminal --new
+python -m terminal --tool-mode summary
+python -m terminal --tool-mode silent
+python -m terminal --no-stream
+python -m terminal --help
+```
+
+### 5) Python skills require `uv`
 
 Python-runtime skills (for example `skills/web_search`) are configured to run with `uv` (`uv run ...` in the skill manifest).
 
@@ -149,7 +178,7 @@ uv --version
 
 If `uv` is not installed, Python skills will fail to launch.
 
-### 5) LLM provider config (`config/model.json`)
+### 6) LLM provider config (`config/model.json`)
 
 Velix reads the active provider from `active_adapter`.
 

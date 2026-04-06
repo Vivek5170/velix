@@ -1,4 +1,5 @@
 #include "session_manager.hpp"
+#include "session_io.hpp"
 #include "../utils/logger.hpp"
 #include "compacter.hpp"
 
@@ -17,8 +18,6 @@ namespace velix::llm {
 
 SessionManager::SessionManager(const std::string &storage_root)
     : storage_root_(storage_root) {
-  // Session directories are created lazily per session.
-  // Only taxonomy roots are pre-created.
   try {
     fs::create_directories(storage_root_ + "/sessions/users");
     fs::create_directories(storage_root_ + "/sessions/procs");
@@ -26,6 +25,21 @@ SessionManager::SessionManager(const std::string &storage_root)
   } catch (const std::exception &e) {
     LOG_ERROR_CTX(std::string("SessionManager init failed: ") + e.what(),
                   "session_mgr", "", -1, "init_error");
+  }
+}
+
+void SessionManager::validate_super_user_name(const std::string &super_user) {
+  if (super_user.empty()) {
+    throw std::runtime_error("super_user name must not be empty");
+  }
+  for (char c : super_user) {
+    if (c == '_') {
+      throw std::runtime_error("super_user name must not contain '_'");
+    }
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-') {
+      throw std::runtime_error(
+          "super_user name must be alphanumeric (hyphens allowed)");
+    }
   }
 }
 
@@ -53,6 +67,16 @@ bool SessionManager::is_session_id(const std::string &s) {
   return extract_super_user(s) != s;
 }
 
+SessionManager::SessionTarget
+SessionManager::resolve_target(const std::string &user_id) {
+  SessionTarget target;
+  target.is_session_id = is_session_id(user_id);
+  target.super_user =
+      target.is_session_id ? extract_super_user(user_id) : user_id;
+  target.session_id = target.is_session_id ? user_id : std::string("");
+  return target;
+}
+
 // ── Path helpers ──────────────────────────────────────────────────────────
 
 std::string SessionManager::session_dir(const std::string &session_id) const {
@@ -71,29 +95,7 @@ std::string SessionManager::session_dir(const std::string &session_id) const {
 
 std::string
 SessionManager::live_convo_path(const std::string &session_id) const {
-  const std::string dir = session_dir(session_id);
-  const std::string preferred = dir + "/" + session_id + ".json";
-
-  if (fs::exists(preferred)) {
-    return preferred;
-  }
-
-  if (fs::exists(dir)) {
-    for (const auto &entry : fs::directory_iterator(dir)) {
-      if (!entry.is_regular_file()) {
-        continue;
-      }
-      if (entry.path().extension() != ".json") {
-        continue;
-      }
-      const std::string stem = entry.path().stem().string();
-      if (stem.find("_h") == std::string::npos) {
-        return entry.path().string();
-      }
-    }
-  }
-
-  return preferred;
+  return session_dir(session_id) + "/active.json";
 }
 
 std::string SessionManager::history_snapshot_path(const std::string &session_id,
@@ -128,13 +130,15 @@ json SessionManager::load_index() const {
 }
 
 void SessionManager::save_index(const json &idx) {
+  fs::create_directories(fs::path(index_path()).parent_path());
   std::ofstream f(index_path());
   if (f.is_open())
     f << idx.dump(2);
 }
 
-void SessionManager::index_add_session(const std::string &super_user,
-                                       const std::string &session_id) {
+void SessionManager::index_upsert_session(const std::string &super_user,
+                                          const std::string &session_id,
+                                          const std::string &title) {
   std::lock_guard<std::mutex> lk(index_mutex_);
   json idx = [&]() {
     if (!fs::exists(index_path()))
@@ -155,14 +159,23 @@ void SessionManager::index_add_session(const std::string &super_user,
       !idx["users"][super_user].is_array())
     idx["users"][super_user] = json::array();
 
-  // De-duplicate.
-  for (const auto &s : idx["users"][super_user]) {
-    if (s.is_string() && s.get<std::string>() == session_id) {
+  for (auto &entry : idx["users"][super_user]) {
+    if (entry.is_object() && entry.value("session_id", "") == session_id) {
+      if (!title.empty()) {
+        entry["title"] = title;
+      }
+      save_index(idx);
+      return;
+    }
+    if (entry.is_string() && entry.get<std::string>() == session_id) {
+      entry = json{{"session_id", session_id}, {"title", title}};
       save_index(idx);
       return;
     }
   }
-  idx["users"][super_user].push_back(session_id);
+
+  idx["users"][super_user].push_back(
+      json{{"session_id", session_id}, {"title", title}});
   save_index(idx);
 }
 
@@ -198,7 +211,7 @@ SessionManager::get_or_create_active_session(const std::string &super_user) {
   // No sessions yet — create _s1.
   const std::string sid = super_user + "_s1";
   fs::create_directories(session_dir(sid));
-  index_add_session(super_user, sid);
+  index_upsert_session(super_user, sid, "");
   LOG_INFO_CTX("Created first session " + sid, "session_mgr", "", -1,
                "session_create");
   return sid;
@@ -206,12 +219,126 @@ SessionManager::get_or_create_active_session(const std::string &super_user) {
 
 // ── new_session ───────────────────────────────────────────────────────────
 
-std::string SessionManager::new_session(const std::string &super_user) {
+std::string SessionManager::new_session(const std::string &super_user,
+                                        const std::string &title) {
+  validate_super_user_name(super_user);
   const std::string sid = next_session_id(super_user);
   fs::create_directories(session_dir(sid));
-  index_add_session(super_user, sid);
+  index_upsert_session(super_user, sid, title);
   LOG_INFO_CTX("New session " + sid, "session_mgr", "", -1, "session_new");
   return sid;
+}
+
+std::string SessionManager::create_super_user(const std::string &super_user) {
+  validate_super_user_name(super_user);
+  fs::create_directories(storage_root_ + "/sessions/users/" + super_user);
+  fs::create_directories(storage_root_ + "/agentfiles/" + super_user);
+
+  {
+    std::lock_guard<std::mutex> lk(index_mutex_);
+    json idx = json{{"users", json::object()}};
+    if (fs::exists(index_path())) {
+      try {
+        std::ifstream f(index_path());
+        f >> idx;
+      } catch (...) {
+        idx = json{{"users", json::object()}};
+      }
+    }
+    if (!idx.contains("users") || !idx["users"].is_object()) {
+      idx["users"] = json::object();
+    }
+    if (!idx["users"].contains(super_user)) {
+      idx["users"][super_user] = json::array();
+    }
+    save_index(idx);
+  }
+
+  return super_user;
+}
+
+void SessionManager::set_session_title(const std::string &session_id,
+                                       const std::string &new_title) {
+  if (!is_session_id(session_id)) {
+    throw std::runtime_error("set_session_title requires session_id");
+  }
+  index_upsert_session(extract_super_user(session_id), session_id, new_title);
+}
+
+SessionManager::SessionInfo
+SessionManager::get_session_info(const std::string &session_id) const {
+  SessionInfo info;
+  info.session_id = session_id;
+
+  const std::string super_user = extract_super_user(session_id);
+  const json idx = load_index();
+  if (idx.contains("users") && idx["users"].is_object() &&
+      idx["users"].contains(super_user) &&
+      idx["users"][super_user].is_array()) {
+    for (const auto &entry : idx["users"][super_user]) {
+      if (entry.is_object() && entry.value("session_id", "") == session_id) {
+        info.title = entry.value("title", "");
+        break;
+      }
+    }
+  }
+
+  const std::string live = live_convo_path(session_id);
+  if (fs::exists(live)) {
+    try {
+      std::ifstream f(live);
+      json convo;
+      f >> convo;
+      info.live_stats.current_context_tokens =
+          convo.value("current_context_tokens", static_cast<uint64_t>(0));
+      info.live_stats.total_tokens_used =
+          convo.value("total_tokens_used", static_cast<uint64_t>(0));
+      info.live_stats.turn_count = convo.value("turn_count", 0);
+      info.live_stats.compacted = convo.value("compacted", false);
+    } catch (...) {
+    }
+  }
+
+  info.snapshot_count = snapshot_count(session_id);
+  return info;
+}
+
+SessionManager::SuperUserInfo
+SessionManager::get_super_user_info(const std::string &super_user) const {
+  SuperUserInfo out;
+  out.super_user = super_user;
+  for (const auto &sid : list_sessions(super_user)) {
+    out.sessions.push_back(get_session_info(sid));
+  }
+  return out;
+}
+
+json SessionManager::build_session_object(const SessionInfo &info,
+                                          std::size_t max_ctx) {
+  json session;
+  session["session_id"] = info.session_id;
+  session["title"] = info.title;
+  session["current_context_tokens"] = info.live_stats.current_context_tokens;
+  session["total_tokens_used"] = info.live_stats.total_tokens_used;
+  session["turn_count"] = info.live_stats.turn_count;
+  session["snapshot_count"] = info.snapshot_count;
+  session["compacted"] = info.live_stats.compacted;
+
+  if (max_ctx > 0) {
+    session["max_context_tokens"] = max_ctx;
+    const double fill =
+        static_cast<double>(info.live_stats.current_context_tokens) /
+        static_cast<double>(max_ctx) * 100.0;
+    session["context_fill_pct"] =
+        static_cast<double>(static_cast<int>(fill * 10.0)) / 10.0;
+  }
+
+  return session;
+}
+
+json SessionManager::get_session_object(const std::string &session_id,
+                                        std::size_t max_ctx) const {
+  return build_session_object(get_session_info(session_id), max_ctx);
 }
 
 // ── list_sessions & list_super_users ──────────────────────────────────────
@@ -252,9 +379,15 @@ SessionManager::list_sessions(const std::string &super_user) const {
   if (idx.contains("users") && idx["users"].is_object()) {
     const json &users = idx["users"];
     if (users.contains(super_user) && users[super_user].is_array()) {
-      for (const auto &s : users[super_user]) {
-        if (s.is_string()) {
-          sessions_set.insert(s.get<std::string>());
+      for (const auto &entry : users[super_user]) {
+        if (entry.is_string()) {
+          sessions_set.insert(entry.get<std::string>());
+        }
+        if (entry.is_object()) {
+          const std::string sid = entry.value("session_id", "");
+          if (!sid.empty()) {
+            sessions_set.insert(sid);
+          }
         }
       }
     }
@@ -302,6 +435,13 @@ SessionManager::list_sessions(const std::string &super_user) const {
 int SessionManager::next_snapshot_index(const std::string &session_id) const {
   int n = 1;
   while (fs::exists(history_snapshot_path(session_id, n)))
+    ++n;
+  return n;
+}
+
+int SessionManager::snapshot_count(const std::string &session_id) const {
+  int n = 0;
+  while (fs::exists(history_snapshot_path(session_id, n + 1)))
     ++n;
   return n;
 }
@@ -430,11 +570,8 @@ SessionManager::compact(const std::string &session_id, const json &history,
   std::string summary;
   json retained_recent = json::array();
   if (!history.empty()) {
-    // compact_history_if_needed comes from compacter.hpp / compacter.cpp.
-    // It takes a mutable history array and a path hint.
-    json mutable_history = history;
     const ::velix::llm::CompactResult cr =
-        compact_history_if_needed(mutable_history, live_convo_path(session_id));
+      compact_history_if_needed(history);
 
     if (!cr.compacted) {
       result.compacted = false;
@@ -458,8 +595,7 @@ SessionManager::compact(const std::string &session_id, const json &history,
           continue;
         }
         const std::string content = m.value("content", "");
-        if (content.find("[CONTEXT COMPACTION]") != std::string::npos ||
-            content.find("[CONTEXT SUMMARY]") != std::string::npos) {
+        if (content.find("[CONTEXT COMPACTION]") != std::string::npos) {
           continue;
         }
         retained_recent.push_back(m);
@@ -475,8 +611,7 @@ SessionManager::compact(const std::string &session_id, const json &history,
         if (!m.is_object())
           continue;
         const std::string content = m.value("content", "");
-        if (content.find("[CONTEXT COMPACTION]") != std::string::npos ||
-            content.find("[CONTEXT SUMMARY]") != std::string::npos) {
+        if (content.find("[CONTEXT COMPACTION]") != std::string::npos) {
           const auto nl = content.find('\n');
           summary =
               (nl != std::string::npos) ? content.substr(nl + 1) : content;
@@ -529,6 +664,56 @@ SessionManager::compact(const std::string &session_id, const json &history,
                    std::to_string(result.tokens_before) + " → " +
                    std::to_string(result.tokens_after),
                "session_mgr", "", -1, "session_compact");
+
+  return result;
+}
+
+SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
+    const std::string &convo_id, std::size_t estimated_request_tokens,
+    std::size_t max_context_tokens, double auto_compact_threshold,
+    SessionIO &session_io) {
+  AutoCompactGuardResult result;
+
+  if (convo_id.empty()) {
+    result.skip_reason = "missing_convo_id";
+    return result;
+  }
+  if (max_context_tokens == 0) {
+    result.skip_reason = "unknown_context_limit";
+    return result;
+  }
+  if (auto_compact_threshold <= 0.0) {
+    auto_compact_threshold = 0.70;
+  }
+
+  const double fill_ratio =
+      static_cast<double>(estimated_request_tokens) /
+      static_cast<double>(max_context_tokens);
+  if (fill_ratio < auto_compact_threshold) {
+    result.skip_reason = "below_compaction_limit";
+    return result;
+  }
+
+  result.threshold_exceeded = true;
+  result.compact_attempted = true;
+
+  const Conversation convo = session_io.get_conversation(convo_id);
+  json history = json::array();
+  for (const auto &message : convo.messages) {
+    if (message.is_object()) {
+      history.push_back(message);
+    }
+  }
+
+  const auto compact_result = compact(convo_id, history, true);
+  result.compacted = compact_result.compacted;
+  result.skip_reason = compact_result.compact_reason;
+  result.tokens_before = compact_result.tokens_before;
+  result.tokens_after = compact_result.tokens_after;
+
+  if (!result.compacted && result.skip_reason.empty()) {
+    result.skip_reason = "below_compaction_limit";
+  }
 
   return result;
 }

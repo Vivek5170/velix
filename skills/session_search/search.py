@@ -105,24 +105,26 @@ class SessionSearchSkill(VelixProcess):
         conn.commit()
         return conn
 
-    def _scan_convo_files(self, user_id: str) -> list[Path]:
-        """Return session JSON files scoped to the provided user/session identifier."""
+    def _scan_convo_files(self, user_id: str, mode: str) -> list[Path]:
+        """Return session JSON files scoped to mode and optional user/session identifier."""
         files: list[Path] = []
         if not self.sessions_root.exists():
             return files
 
         users_root = self.sessions_root / "users"
         procs_root = self.sessions_root / "procs"
+        include_users = mode in ("all", "user")
+        include_procs = mode in ("all", "proc")
 
         if not user_id:
-            if users_root.exists():
+            if include_users and users_root.exists():
                 for super_dir in users_root.iterdir():
                     if not super_dir.is_dir():
                         continue
                     for session_dir in super_dir.iterdir():
                         if session_dir.is_dir():
                             files.extend(session_dir.glob("*.json"))
-            if procs_root.exists():
+            if include_procs and procs_root.exists():
                 for pid_dir in procs_root.iterdir():
                     if not pid_dir.is_dir():
                         continue
@@ -133,6 +135,8 @@ class SessionSearchSkill(VelixProcess):
 
         proc_parts = self._parse_proc_session(user_id)
         if proc_parts is not None:
+            if not include_procs:
+                return files
             pid, sid = proc_parts
             session_dir = procs_root / pid / sid
             if session_dir.exists() and session_dir.is_dir():
@@ -140,6 +144,8 @@ class SessionSearchSkill(VelixProcess):
             return files
 
         if self._is_session_id(user_id):
+            if not include_users:
+                return files
             super_user = self._extract_super_user(user_id)
             session_dir = users_root / super_user / user_id
             if session_dir.exists() and session_dir.is_dir():
@@ -147,11 +153,12 @@ class SessionSearchSkill(VelixProcess):
             return files
 
         # Fallback: treat user_id as super_user and scan all their sessions.
-        super_dir = users_root / user_id
-        if super_dir.exists() and super_dir.is_dir():
-            for session_dir in super_dir.iterdir():
-                if session_dir.is_dir():
-                    files.extend(session_dir.glob("*.json"))
+        if include_users:
+            super_dir = users_root / user_id
+            if super_dir.exists() and super_dir.is_dir():
+                for session_dir in super_dir.iterdir():
+                    if session_dir.is_dir():
+                        files.extend(session_dir.glob("*.json"))
         return files
 
     def _index_file(self, conn: sqlite3.Connection, path: Path) -> int:
@@ -190,8 +197,8 @@ class SessionSearchSkill(VelixProcess):
         )
         return count
 
-    def _update_index(self, conn: sqlite3.Connection, user_id: str) -> None:
-        files = self._scan_convo_files(user_id)
+    def _update_index(self, conn: sqlite3.Connection, user_id: str, mode: str) -> None:
+        files = self._scan_convo_files(user_id, mode)
         stale = []
         for f in files:
             try:
@@ -224,7 +231,7 @@ class SessionSearchSkill(VelixProcess):
 
         try:
             conn = self._open_db()
-            self._update_index(conn, user_id)
+            self._update_index(conn, user_id, mode)
             
             since_ms = 0
             if since_hours > 0:

@@ -1,0 +1,6 @@
+{
+  "port": 6060,
+  "tool_output_mode": "summary",
+  "stream_enabled": true,
+  "max_tool_output_len": 512
+}

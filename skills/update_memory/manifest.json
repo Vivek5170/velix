@@ -9,7 +9,7 @@
     "properties": {
       "user_id": {
         "type": "string",
-        "description": "The target user id representing the active session (e.g. terminal_vivek_s1)"
+        "description": "The target user id representing the active session (e.g. user1_s1)"
       },
       "target_file": {
         "type": "string",
