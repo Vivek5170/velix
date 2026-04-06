@@ -260,20 +260,8 @@ SchedulerConfig load_scheduler_config() {
     cfg.adapter_cfg.timeout_ms = model_json.value("request_timeout_ms", 60000);
     cfg.scheduler_wait_timeout_ms =
         model_json.value("request_timeout_ms", 60000) + 5000;
-    const int configured_max_llm_keys = model_json.value("max_llm_keys", 5);
-    const int configured_max_simultaneous = model_json.value(
-        "max_simultaneous_llm_requests", configured_max_llm_keys);
-    cfg.max_llm_keys = configured_max_simultaneous;
+    cfg.max_llm_keys = model_json.value("max_simultaneous_llm_requests", 5);
     cfg.max_client_threads = model_json.value("max_client_threads", 64);
-
-    if (model_json.contains("max_llm_keys") &&
-        model_json.contains("max_simultaneous_llm_requests") &&
-        configured_max_llm_keys != configured_max_simultaneous) {
-      LOG_WARN("Both max_llm_keys and max_simultaneous_llm_requests are set "
-               "with different values; "
-               "using max_simultaneous_llm_requests=" +
-               std::to_string(configured_max_simultaneous));
-    }
   }
 
   cfg.executioner_port = velix::utils::get_port("EXECUTIONER", 5172);
@@ -284,6 +272,386 @@ SchedulerConfig load_scheduler_config() {
   }
 
   return cfg;
+}
+
+struct ModelConfig {
+  std::string model_name{"unknown"};
+  std::string model_type{"unknown"};
+  std::size_t context_length{0};
+  bool enabled{true};
+};
+
+ModelConfig load_model_config() {
+  ModelConfig model_config;
+
+  for (const char *path : {"config/model.json", "../config/model.json",
+                           "build/config/model.json"}) {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+      continue;
+    }
+
+    try {
+      json cfg;
+      in >> cfg;
+
+      model_config.model_name =
+          cfg.value("model_name", std::string("unknown"));
+      model_config.model_type =
+          cfg.value("model_type", std::string("unknown"));
+      model_config.enabled = cfg.value("enabled", true);
+
+      model_config.context_length =
+          cfg.value("max_context_tokens", std::size_t{0});
+    } catch (...) {
+    }
+
+    break;
+  }
+
+  return model_config;
+}
+
+double load_auto_compact_threshold() {
+  for (const char *path : {"config/compacter.json", "../config/compacter.json",
+                           "build/config/compacter.json"}) {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+      continue;
+    }
+
+    try {
+      json cfg;
+      in >> cfg;
+
+      if (cfg.contains("auto_compact_threshold") &&
+          cfg["auto_compact_threshold"].is_number()) {
+        return cfg["auto_compact_threshold"].get<double>();
+      }
+    } catch (...) {
+    }
+  }
+
+  return 0.70;
+}
+
+std::size_t estimate_request_tokens(const json &messages) {
+  if (!messages.is_array()) {
+    return 0;
+  }
+
+  std::size_t total_chars = 0;
+  for (const auto &message : messages) {
+    if (!message.is_object()) {
+      continue;
+    }
+    if (message.contains("content") && message["content"].is_string()) {
+      total_chars += message["content"].get<std::string>().size();
+    }
+  }
+
+  return total_chars / 4;
+}
+
+void attach_session_alias_fields(json &reply) {
+  if (!reply.contains("session") || !reply["session"].is_object()) {
+    return;
+  }
+
+  const json &session = reply["session"];
+  reply["session_id"] = session.value("session_id", std::string(""));
+  reply["title"] = session.value("title", std::string(""));
+}
+
+void handle_session_control(const json &envelope,
+                            velix::communication::SocketWrapper &socket,
+                            SessionManager &sm, SessionIO &session_io_ref) {
+  const std::string action = envelope.value("action", std::string(""));
+  const std::string user_id = envelope.value("user_id", std::string(""));
+  const std::string title = envelope.value("title", std::string(""));
+
+  json reply = {{"message_type", "SESSION_RESPONSE"}, {"action", action}};
+
+  try {
+    const ModelConfig mc = load_model_config();
+
+    const auto target = SessionManager::resolve_target(user_id);
+    const std::string super_user = target.super_user;
+    const std::string session_id = target.session_id;
+
+    if (action == "get_or_create") {
+      if (super_user.empty()) {
+        throw std::runtime_error("'get_or_create' requires user_id");
+      }
+
+      const std::string sid = sm.get_or_create_active_session(super_user);
+      reply["session"] = sm.get_session_object(sid, mc.context_length);
+      attach_session_alias_fields(reply);
+    } else if (action == "new") {
+      if (super_user.empty()) {
+        throw std::runtime_error("'new' requires user_id");
+      }
+
+      const std::string sid = sm.new_session(super_user, title);
+      reply["session"] = sm.get_session_object(sid, mc.context_length);
+      attach_session_alias_fields(reply);
+    } else if (action == "create_super_user") {
+      const std::string name =
+          (envelope.contains("super_user") && envelope["super_user"].is_string() &&
+           !envelope["super_user"].get<std::string>().empty())
+              ? envelope["super_user"].get<std::string>()
+              : user_id;
+
+      sm.create_super_user(name);
+      reply["super_user"] = name;
+    } else if (action == "set_title") {
+      if (session_id.empty()) {
+        throw std::runtime_error(
+            "'set_title' requires a full session_id (e.g. vivek_s2)");
+      }
+
+      sm.set_session_title(session_id, title);
+      reply["session"] = sm.get_session_object(session_id, mc.context_length);
+      attach_session_alias_fields(reply);
+    } else if (action == "compact") {
+      const std::string target =
+          !session_id.empty() ? session_id
+                              : sm.get_or_create_active_session(super_user);
+
+      const Conversation convo = session_io_ref.get_conversation(target);
+      json history = json::array();
+      for (const auto &message : convo.messages) {
+        if (message.is_object()) {
+          history.push_back(message);
+        }
+      }
+
+      const auto compact_result = sm.compact(target, history, false);
+
+      reply["session"] = sm.get_session_object(target, mc.context_length);
+      reply["summary"] = compact_result.summary;
+      reply["tokens_before"] = compact_result.tokens_before;
+      reply["tokens_after"] = compact_result.tokens_after;
+      reply["session_compacted"] = compact_result.compacted;
+      reply["compact_reason"] = compact_result.compact_reason;
+      attach_session_alias_fields(reply);
+    } else if (action == "undo") {
+      const std::string target =
+          !session_id.empty() ? session_id
+                              : sm.get_or_create_active_session(super_user);
+
+      Conversation convo = session_io_ref.get_conversation(target);
+      auto &messages = convo.messages;
+
+      int last_assistant = -1;
+      for (int i = static_cast<int>(messages.size()) - 1; i >= 0; --i) {
+        if (messages[i].is_object() &&
+            messages[i].value("role", std::string("")) == "assistant") {
+          last_assistant = i;
+          break;
+        }
+      }
+
+      int cut_from = -1;
+      if (last_assistant >= 0) {
+        for (int i = last_assistant - 1; i >= 0; --i) {
+          if (!messages[i].is_object()) {
+            continue;
+          }
+          if (messages[i].value("role", std::string("")) == "user") {
+            cut_from = i;
+            break;
+          }
+        }
+      }
+
+      int removed = 0;
+      if (cut_from >= 0) {
+        removed = static_cast<int>(messages.size()) - cut_from;
+        messages.erase(messages.begin() + cut_from, messages.end());
+        convo.turn_count -= removed;
+        if (convo.turn_count < 0) {
+          convo.turn_count = 0;
+        }
+        session_io_ref.persist_conversation(convo);
+      }
+
+      reply["session"] = sm.get_session_object(target, mc.context_length);
+      reply["turns_removed"] = removed;
+      reply["turns_remaining"] = static_cast<int>(messages.size());
+      attach_session_alias_fields(reply);
+    } else if (action == "list") {
+      if (super_user.empty()) {
+        throw std::runtime_error("'list' requires user_id");
+      }
+
+      const auto info = sm.get_super_user_info(super_user);
+      json sessions = json::array();
+      for (const auto &si : info.sessions) {
+        sessions.push_back(
+            SessionManager::build_session_object(si, mc.context_length));
+      }
+
+      reply["super_user"] = super_user;
+      reply["sessions"] = sessions;
+    } else if (action == "list_super_users") {
+      const auto all_users = sm.list_super_users();
+      json users = json::array();
+      for (const auto &super_user_name : all_users) {
+        const auto su_info = sm.get_super_user_info(super_user_name);
+        json sessions = json::array();
+        for (const auto &si : su_info.sessions) {
+          sessions.push_back({{"session_id", si.session_id},
+                              {"title", si.title},
+                              {"turn_count", si.live_stats.turn_count}});
+        }
+        users.push_back({{"super_user", super_user_name},
+                         {"session_count",
+                          static_cast<int>(su_info.sessions.size())},
+                         {"sessions", sessions}});
+      }
+
+      reply["super_users"] = users;
+    } else {
+      throw std::runtime_error("Unknown SESSION_CONTROL action: '" + action +
+                               "'");
+    }
+  } catch (const std::exception &e) {
+    reply["error"] = e.what();
+    LOG_WARN(std::string("SESSION_CONTROL [") + action + "]: " + e.what());
+  }
+
+  velix::communication::send_json(socket, reply.dump());
+}
+
+void handle_session_query(const json &envelope,
+                          velix::communication::SocketWrapper &socket,
+                          SessionManager &sm,
+                          const tools::ToolRegistry &registry,
+                          const std::unordered_map<std::string, TreeQueue>
+                              &tree_queues_ref,
+                          std::mutex &queue_mutex_ref) {
+  const std::string query_type =
+      envelope.value("query_type", std::string(""));
+  const std::string user_id = envelope.value("user_id", std::string(""));
+
+  json reply = {{"message_type", "SESSION_QUERY_RESPONSE"},
+                {"query_type", query_type}};
+
+  try {
+    const ModelConfig mc = load_model_config();
+    const double threshold = load_auto_compact_threshold();
+
+    const auto target = SessionManager::resolve_target(user_id);
+    const std::string super_user = target.super_user;
+    const std::string session_id = target.session_id;
+
+    if (query_type == "info") {
+      if (super_user.empty()) {
+        throw std::runtime_error("'info' query requires user_id");
+      }
+
+      const std::string target =
+          !session_id.empty() ? session_id
+                              : sm.get_or_create_active_session(super_user);
+
+      const auto info = sm.get_session_info(target);
+        reply["session"] =
+          SessionManager::build_session_object(info, mc.context_length);
+      reply["auto_compact_threshold_pct"] =
+          static_cast<int>(threshold * 100);
+
+      if (mc.context_length > 0) {
+        const double fill =
+            static_cast<double>(info.live_stats.current_context_tokens) /
+            static_cast<double>(mc.context_length);
+        reply["context_warning"] = (fill >= threshold);
+      }
+    } else if (query_type == "queue_depth") {
+      const std::string queue_key =
+          envelope.value("queue_key", std::string(""));
+      int depth = 0;
+      int total = 0;
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_ref);
+        for (const auto &[key, queue] : tree_queues_ref) {
+          const int size = static_cast<int>(queue.requests.size());
+          total += size;
+          if (!queue_key.empty() && key == queue_key) {
+            depth = size;
+          }
+        }
+        if (queue_key.empty()) {
+          depth = total;
+        }
+      }
+
+      reply["queue_key"] = queue_key.empty() ? "(all)" : queue_key;
+      reply["queue_depth"] = depth;
+      reply["total_pending"] = total;
+    } else if (query_type == "model_info") {
+      reply["model_name"] = mc.model_name;
+      reply["model_type"] = mc.model_type;
+      reply["context_length"] = mc.context_length;
+      reply["enabled"] = mc.enabled;
+      reply["auto_compact_threshold_pct"] =
+          static_cast<int>(threshold * 100);
+    } else if (query_type == "tool_info") {
+      const json schemas = registry.get_tool_schemas();
+      const int tool_count = static_cast<int>(schemas.size());
+      const int tool_context_tokens = static_cast<int>(schemas.dump().size() / 4);
+
+      json tools = json::array();
+      for (const auto &schema : schemas) {
+        if (!schema.is_object()) {
+          continue;
+        }
+        const json function = schema.value("function", json::object());
+        tools.push_back({{"name", function.value("name", std::string(""))},
+                         {"description",
+                          function.value("description", std::string(""))}});
+      }
+
+      reply["tool_count"] = tool_count;
+      reply["tools"] = tools;
+      reply["tool_context_tokens"] = tool_context_tokens;
+
+      if (mc.context_length > 0) {
+        reply["tool_context_pct"] =
+            static_cast<double>(
+                static_cast<int>(static_cast<double>(tool_context_tokens) /
+                                 static_cast<double>(mc.context_length) *
+                                 1000.0)) /
+            10.0;
+      }
+    } else if (query_type == "all_sessions") {
+      const auto all_users = sm.list_super_users();
+      json users = json::array();
+      for (const auto &super_user_name : all_users) {
+        const auto su_info = sm.get_super_user_info(super_user_name);
+        json sessions = json::array();
+        for (const auto &si : su_info.sessions) {
+          sessions.push_back(
+              SessionManager::build_session_object(si, mc.context_length));
+        }
+
+        users.push_back({{"super_user", super_user_name},
+                         {"session_count",
+                          static_cast<int>(su_info.sessions.size())},
+                         {"sessions", sessions}});
+      }
+
+      reply["super_users"] = users;
+    } else {
+      throw std::runtime_error("Unknown SESSION_QUERY query_type: '" +
+                               query_type + "'");
+    }
+  } catch (const std::exception &e) {
+    reply["error"] = e.what();
+    LOG_WARN(std::string("SESSION_QUERY [") + query_type + "]: " + e.what());
+  }
+
+  velix::communication::send_json(socket, reply.dump());
 }
 
 adapters::ChatRequest build_chat_request(const PendingRequest &req,
@@ -665,6 +1033,9 @@ json process_llm_request_stateless(
 
   if (mode == "conversation" || mode == "user_conversation") {
     response["convo_id"] = req.payload.value("convo_id", "");
+    response["auto_compacted"] = req.payload.value("auto_compacted", false);
+    response["compact_skip_reason"] =
+        req.payload.value("compact_skip_reason", std::string(""));
     if (req.payload.value("session_compacted", false)) {
       response["session_compacted"] = true;
       response["tokens_before"] = req.payload.value("tokens_before", 0);
@@ -805,47 +1176,27 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
             req.payload["messages"] =
                 session_io.build_conversation_messages_safely(
                     req.payload);
+          }
 
-            const std::string session_id = req.payload.value("convo_id", "");
-            if (!session_id.empty() && SessionManager::is_session_id(session_id)) {
-              int total_chars = 0;
-              for (const auto &m : req.payload["messages"]) {
-                if (m.is_object()) {
-                  total_chars += m.value("content", std::string("")).size();
-                }
-              }
-              int estimated_tokens = total_chars / 4;
+          const ModelConfig model_cfg = load_model_config();
+          const double auto_compact_threshold = load_auto_compact_threshold();
+          const std::string convo_id =
+              req.payload.value("convo_id", std::string(""));
+          const std::size_t request_tokens =
+              estimate_request_tokens(req.payload["messages"]);
 
-              float context_threshold = 0.70f;
-              int max_tokens = 8192;
-              try {
-                std::ifstream f("config/compacter.json");
-                if (f.is_open()) {
-                  json comp; f >> comp;
-                  if (comp.contains("context_pressure_threshold"))
-                    context_threshold = comp["context_pressure_threshold"].get<float>();
-                  if (comp.contains("max_context_tokens"))
-                    max_tokens = comp["max_context_tokens"].get<int>();
-                }
-              } catch (...) {}
+          const auto guard_result = session_manager.run_auto_compact_guard(
+              convo_id, request_tokens, model_cfg.context_length,
+              auto_compact_threshold, session_io);
 
-              if (estimated_tokens > context_threshold * max_tokens) {
-                const Conversation convo = session_io.get_conversation(session_id);
-                json history = json::array();
-                for (const auto& m : convo.messages) {
-                  if (m.is_object()) history.push_back(m);
-                }
-                const auto cr = session_manager.compact(session_id, history, true /*is_auto*/);
-
-                if (cr.compacted) {
-                  req.payload["messages"] =
-                      session_io.build_conversation_messages_safely(req.payload);
-                  req.payload["session_compacted"] = true;
-                  req.payload["tokens_before"] = cr.tokens_before;
-                  req.payload["tokens_after"] = cr.tokens_after;
-                }
-              }
-            }
+          req.payload["auto_compacted"] = guard_result.compacted;
+          req.payload["compact_skip_reason"] = guard_result.skip_reason;
+          if (guard_result.compacted) {
+            req.payload["session_compacted"] = true;
+            req.payload["tokens_before"] = guard_result.tokens_before;
+            req.payload["tokens_after"] = guard_result.tokens_after;
+            req.payload["messages"] =
+                session_io.build_conversation_messages_safely(req.payload);
           }
 
         }
@@ -1026,67 +1377,20 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
     const std::string raw_payload =
         velix::communication::recv_json(*client_socket_ptr);
 
-    // ── SESSION_CONTROL ────────────────────────────────────────────────────────
-    // Lightweight session lifecycle commands from the handler (or any other
-    // client). Handled synchronously — no LLM worker queue needed.
-    // ───────────────────────────────────────────────────────────────────
+    // SESSION_CONTROL / SESSION_QUERY: synchronous control-plane endpoints.
     {
       const json envelope = json::parse(raw_payload);
-      if (envelope.value("message_type", "") == "SESSION_CONTROL") {
-        const std::string action  = envelope.value("action",  "");
-        const std::string user_id = envelope.value("user_id", "");
-        json reply = {{"message_type", "SESSION_RESPONSE"}, {"action", action}};
+      const std::string message_type = envelope.value("message_type", "");
 
-        try {
-          const std::string super_user =
-              SessionManager::is_session_id(user_id)
-                  ? SessionManager::extract_super_user(user_id)
-                  : user_id;
-
-          if (action == "get_or_create") {
-            const std::string sid =
-                session_manager.get_or_create_active_session(super_user);
-            reply["session_id"] = sid;
-          } else if (action == "new") {
-            const std::string sid = session_manager.new_session(super_user);
-            reply["session_id"] = sid;
-          } else if (action == "compact") {
-            // Fetch current history from SessionIO, run compact (saves snapshot +
-            // resets live convo with pre-seeded tool-call history).
-            const std::string session_id = SessionManager::is_session_id(user_id)
-                                               ? user_id
-                                               : session_manager.get_or_create_active_session(super_user);
-            const Conversation convo =
-                session_io.get_conversation(session_id);
-            json history = json::array();
-            for (const auto& m : convo.messages) {
-              if (m.is_object()) history.push_back(m);
-            }
-            const auto cr =
-                session_manager.compact(session_id, history, /*is_auto=*/false);
-            reply["session_id"]      = cr.session_id;
-            reply["summary"]         = cr.summary;
-            reply["tokens_before"]   = cr.tokens_before;
-            reply["tokens_after"]    = cr.tokens_after;
-            reply["session_compacted"] = cr.compacted;
-            reply["compact_reason"] = cr.compact_reason;
-          } else if (action == "list") {
-            const auto ids = session_manager.list_sessions(super_user);
-            std::string listing = "Sessions for " + super_user + ":\n";
-            for (const auto& id : ids) {
-              listing += "  " + id + "\n";
-            }
-            reply["listing"] = listing;
-            reply["sessions"] = ids;
-          } else {
-            reply["error"] = "unknown SESSION_CONTROL action: " + action;
-          }
-        } catch (const std::exception& e) {
-          reply["error"] = e.what();
-        }
-
-        velix::communication::send_json(*client_socket_ptr, reply.dump());
-        return;  // Done — no LLM work needed.
+      if (message_type == "SESSION_CONTROL") {
+        handle_session_control(envelope, *client_socket_ptr, session_manager,
+                               session_io);
+        return;
+      }
+      if (message_type == "SESSION_QUERY") {
+        handle_session_query(envelope, *client_socket_ptr, session_manager,
+                             tool_registry, tree_queues, queue_mutex);
+        return;
       }
     }
     // ── LLM_REQUEST (normal path) ─────────────────────────────────────────────────
@@ -1132,7 +1436,7 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
       throw std::runtime_error("scheduler_request_deadline_exceeded");
     }
 
-    const json response = future.get();
+    json response = future.get();
     {
       std::lock_guard<std::mutex> lock(*client_send_mutex);
       velix::communication::send_json(*client_socket_ptr, response.dump());

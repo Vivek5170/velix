@@ -1,50 +1,126 @@
 """
-gateway.py — Base Gateway
+gateway.py — Velix Base Gateway
+================================
 
-Every gateway (terminal, Telegram, HTTP, etc.) inherits from Gateway.
-The base class handles:
+Every transport gateway (terminal, Telegram, HTTP, …) inherits from
+``Gateway``.  The base class owns:
 
-  - framed TCP communication with the Handler
-  - session registration handshake (user_id negotiation)
-  - sending messages/events to the Handler
-  - receiving and dispatching notifications from the Handler
-  - clean connection lifecycle
+  - framed 4-byte-length-prefixed TCP communication with the Handler
+  - session registration handshake (user_id / session resolution)
+  - sending messages and approval replies to the Handler
+  - background receive thread that dispatches events to deliver()
+  - clean connection lifecycle (connect / disconnect / run)
+  - an extensible client-side slash-command registry
+  - static helpers for listing users and sessions before connecting
 
 Subclasses must implement:
-  - get_next_input() -> str | None   (blocking read from their transport)
-  - deliver(event: dict)             (push an event to the user)
-  - on_connected()                   (optional — called after registration ack)
-  - on_disconnected()                (optional — called on teardown)
+  - ``get_next_input() -> str | None``   (blocking read from their transport)
+  - ``deliver(event: dict) -> None``     (push an event to the user)
+
+Optional hooks (override as needed):
+  - ``on_connected()``        called once the registration ack is received
+  - ``on_disconnected()``     called when the gateway tears down
+  - ``on_token(text: str)``   called for each streaming token  (default: deliver)
+  - ``on_end()``              called after each full turn
+  - ``on_tool_start(tool, args)``
+  - ``on_tool_finish(tool, result)``
+  - ``on_context_usage(current, maximum, pct)``
+  - ``on_approval_request(approval_trace, payload)``
+  - ``on_notify(event)``      generic / unhandled bus events
+  - ``on_error(message)``     error frames from the handler
+
+Protocol (wire format)
+-----------------------
+Every frame:  [ 4-byte big-endian uint32 length ][ UTF-8 JSON body ]
+
+Events emitted by the Handler:
+  type == "token"         → streaming text delta
+  type == "end"           → end of one full turn
+  type == "tool_start"    → tool execution starting
+  type == "tool_finish"   → tool execution finished
+  type == "context_usage" → token budget status
+  type == "approval_request" → human-in-the-loop gate
+  type == "approval_ack"  → acknowledgement of our approval_reply
+  type == "session_switched" → session_id changed in-band
+  type == "notify"        → generic bus notification
+  type == "error"         → handler-side error
+
+Commands sent by the client:
+  type == "register"         → initial handshake
+  type == "message"          → user text → LLM
+  type == "tool_message"     → resume after external tool result
+  type == "resume_turn"      → resume after approval result
+  type == "approval_reply"   → answer an approval request
+  type == "switch_session"   → swap to a different session_id
+  type == "list_users"       → pre-auth: enumerate super-users
+  type == "list_sessions"    → pre-auth: enumerate sessions for a super-user
 """
+
+from __future__ import annotations
 
 import json
 import socket
 import struct
 import threading
-import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional
 
 
+# ---------------------------------------------------------------------------
+# Wire helpers (module-level so they can be reused by static methods)
+# ---------------------------------------------------------------------------
+
+def _encode_frame(payload: dict) -> bytes:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return struct.pack(">I", len(body)) + body
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise RuntimeError("Handler socket closed unexpectedly")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _recv_one(sock: socket.socket) -> dict:
+    header = _recv_exact(sock, 4)
+    size   = struct.unpack(">I", header)[0]
+    body   = _recv_exact(sock, size)
+    return json.loads(body.decode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Gateway base class
+# ---------------------------------------------------------------------------
+
 class Gateway(ABC):
+    """
+    Abstract base gateway.  Subclass it, implement get_next_input() and
+    deliver(), then call connect() followed by run().
+    """
+
     # ------------------------------------------------------------------ #
     # Construction                                                         #
     # ------------------------------------------------------------------ #
 
     def __init__(
         self,
-        handler_host: str = "127.0.0.1",
-        handler_port: int = 6060,
-        user_id: Optional[str] = None,
-        connect_timeout_s: float = 5.0,
-        recv_timeout_s: float = 0.05,
+        handler_host: str          = "127.0.0.1",
+        handler_port: int          = 6060,
+        user_id: Optional[str]     = None,
+        connect_timeout_s: float   = 5.0,
+        recv_timeout_s: float      = 0.05,
     ) -> None:
-        self._handler_host = handler_host
-        self._handler_port = handler_port
-        self._requested_user_id: Optional[str] = user_id
+        self._handler_host       = handler_host
+        self._handler_port       = handler_port
+        self._requested_user_id  = user_id
         self._user_id: Optional[str] = None
-        self._connect_timeout_s = connect_timeout_s
-        self._recv_timeout_s = recv_timeout_s
+        self._super_user: Optional[str] = None
+        self._connect_timeout_s  = connect_timeout_s
+        self._recv_timeout_s     = recv_timeout_s
 
         self._sock: Optional[socket.socket] = None
         self._sock_lock = threading.Lock()
@@ -52,11 +128,8 @@ class Gateway(ABC):
         self._running = False
         self._recv_thread: Optional[threading.Thread] = None
 
-        # ── Command registry ─────────────────────────────────────────────────────────
-        # Maps "/command" -> callable(args: str) -> None
-        # Populated by _register_builtin_commands() and subclass register_command().
-        # run() dispatches lines starting with '/' here before forwarding to handler.
-        self._command_registry: Dict[str, Callable[[str], None]] = {}
+        # Slash-command registry: "/cmd" → callable(args: str) -> None
+        self._commands: Dict[str, Callable[[str], None]] = {}
         self._register_builtin_commands()
 
     # ------------------------------------------------------------------ #
@@ -65,9 +138,9 @@ class Gateway(ABC):
 
     def connect(self, force_new: bool = False) -> None:
         """
-        Connect to the Handler, perform the registration handshake,
-        and start the background receive thread.
-        Raises RuntimeError if the handler rejects the connection.
+        Connect to the Handler and complete the registration handshake.
+        Starts the background receive thread.
+        Raises RuntimeError on rejection.
         """
         sock = socket.create_connection(
             (self._handler_host, self._handler_port),
@@ -76,15 +149,15 @@ class Gateway(ABC):
         sock.settimeout(self._recv_timeout_s)
         self._sock = sock
 
-        # Send registration message.
+        # Registration frame.
         reg: dict = {"type": "register", "force_new": force_new}
         if self._requested_user_id:
             reg["user_id"] = self._requested_user_id
-        self._send(reg)
+        self._send_raw(reg)
 
-        # Wait for the handler's ack (blocking, uses connect_timeout).
+        # Wait for ack (use connect_timeout here; recv_timeout is too short).
         self._sock.settimeout(self._connect_timeout_s)
-        ack = self._recv_one()
+        ack = _recv_one(self._sock)
         self._sock.settimeout(self._recv_timeout_s)
 
         if ack.get("type") == "error":
@@ -93,19 +166,19 @@ class Gateway(ABC):
             raise RuntimeError(
                 f"Handler rejected registration: {ack.get('message', 'unknown')}"
             )
-
         if ack.get("type") != "registered":
             self._sock.close()
             self._sock = None
             raise RuntimeError(f"Unexpected registration response: {ack}")
 
-        self._user_id = ack["user_id"]
-        self._running = True
+        self._user_id   = ack["user_id"]
+        self._super_user = ack.get("super_user", self._user_id)
+        self._running   = True
 
-        # Start background thread that reads events from the Handler and
-        # dispatches them to deliver() / subclass handlers.
         self._recv_thread = threading.Thread(
-            target=self._recv_loop, daemon=True, name=f"gw-recv-{self._user_id}"
+            target=self._recv_loop,
+            daemon=True,
+            name=f"gw-recv-{self._user_id}",
         )
         self._recv_thread.start()
 
@@ -127,9 +200,9 @@ class Gateway(ABC):
 
     def run(self) -> None:
         """
-        Main loop: read input from the transport and forward it to the Handler.
-        Lines starting with '/' are checked against the command registry first.
-        Blocks until the gateway is stopped. Subclasses should call this after connect().
+        Main input loop.  Reads from get_next_input(), dispatches client-side
+        slash commands, then forwards everything else to the Handler.
+        Blocks until disconnected.  Call after connect().
         """
         while self._running:
             try:
@@ -139,126 +212,88 @@ class Gateway(ABC):
                 text = text.strip()
                 if not text:
                     continue
-                # ── Command dispatch ──────────────────────────────────────────────
-                # Split on first space to support: /command optional_args
-                # Unknown slash-prefixed words are forwarded to the handler
-                # so the LLM can respond to questions like "what is /compact?".
+
+                # Slash-command dispatch (client-side).
                 if text.startswith("/"):
                     cmd, _, args = text.partition(" ")
-                    handler_fn = self._command_registry.get(cmd)
+                    handler_fn = self._commands.get(cmd)
                     if handler_fn is not None:
                         try:
-                            handler_fn(args)
+                            handler_fn(args.strip())
                         except Exception as exc:
-                            self.deliver({"type": "token", "data": f"[Command error: {exc}]\n"})
-                        continue  # Don't forward handled commands to the LLM.
-                # Forward as a normal message to the handler.
-                self.send_user_message(text)
+                            self.deliver({"type": "token",
+                                          "data": f"[Command error: {exc}]\n"})
+                        continue
+                    # Unknown /command → forward to LLM so the user can ask
+                    # about it by name (e.g. "what does /compact do?").
+
+                self.send_message(text)
+
             except (KeyboardInterrupt, EOFError):
                 break
             except Exception as exc:
-                print(f"[Gateway] Input error: {exc}")
+                print(f"[Gateway] Input loop error: {exc}")
                 break
+
         self.disconnect()
-
-    # ------------------------------------------------------------------ #
-    # Command registry                                                     #
-    # ------------------------------------------------------------------ #
-
-    def register_command(
-        self, name: str, handler: Callable[[str], None]
-    ) -> None:
-        """
-        Register a client-side slash command.
-
-        name    -- e.g. "/debug" (must start with '/')
-        handler -- callable(args: str) -> None
-                   args is everything after the command name, stripped.
-
-        Client-side commands run entirely in Python and are NOT forwarded
-        to the C++ handler. Use send_user_message() inside the handler if
-        you need to also send something to the LLM after local processing.
-
-        Example::
-            gw.register_command("/debug", lambda args: print(f"debug: {args}"))
-        """
-        if not name.startswith("/"):
-            raise ValueError(f"Command name must start with '/': {name!r}")
-        self._command_registry[name] = handler
-
-    def _register_builtin_commands(self) -> None:
-        """Register commands that the gateway handles locally (client-side)."""
-
-        def _help(_args: str) -> None:
-            lines = ["Available commands:"] + sorted(self._command_registry)
-            self.deliver({"type": "token", "data": "\n".join(lines) + "\n"})
-
-        self.register_command("/help", _help)
-        # Session commands are forwarded to the handler as plain messages so
-        # the C++ side can update session state. They are NOT intercepted here.
-        # (The C++ handler's own command table handles /new, /compact, etc.)
 
     # ------------------------------------------------------------------ #
     # Sending to Handler                                                   #
     # ------------------------------------------------------------------ #
 
-    def send_user_message(self, message: str, user_id: Optional[str] = None) -> None:
-        """Forward a user text message to the Handler for LLM processing."""
-        self._send({
-            "type": "message",
-            "message": message,
-            "user_id": user_id or self._user_id or "",
+    def send_message(self, text: str) -> None:
+        """Send a user text message to the Handler for LLM processing."""
+        self._send_raw({
+            "type":    "message",
+            "message": text,
+            "user_id": self._user_id or "",
         })
+
+    def send_tool_message(self, tool_message: dict) -> None:
+        """Resume an LLM turn with an external tool result."""
+        self._send_raw({"type": "tool_message", "tool_message": tool_message})
+
+    def send_resume_turn(self, result: dict) -> None:
+        """Resume a turn with a structured result payload."""
+        self._send_raw({"type": "resume_turn", "payload": {"result": result}})
 
     def send_approval_reply(self, approval_trace: str, scope: str) -> None:
-        """Forward a user approval decision to the Handler."""
-        self._send({
-            "type": "approval_reply",
+        """Answer an approval request from the Handler."""
+        self._send_raw({
+            "type":           "approval_reply",
             "approval_trace": approval_trace,
-            "scope": scope,
+            "scope":          scope,
         })
 
+    def switch_session(self, session_id: str) -> None:
+        """Request the Handler to switch this connection to a different session."""
+        self._send_raw({"type": "switch_session", "session_id": session_id})
+
     def send_raw(self, payload: dict) -> None:
-        """Send an arbitrary payload to the Handler."""
-        self._send(payload)
+        """Send an arbitrary frame to the Handler."""
+        self._send_raw(payload)
 
-    @classmethod
-    def list_sessions(cls, super_user: str, host: str="127.0.0.1", port: int=6060) -> list:
-        sock = socket.create_connection((host, port), timeout=5.0)
-        sock.settimeout(5.0)
-        try:
-            Gateway._send_framed(sock, {"type": "list_sessions", "super_user": super_user})
-            resp = Gateway._recv_one_from(sock)
-            if resp.get("type") == "session_list":
-                sessions = resp.get("sessions", [])
-                if not isinstance(sessions, list):
-                    return []
-
-                normalized = []
-                for s in sessions:
-                    if isinstance(s, dict):
-                        sid = s.get("id")
-                        if isinstance(sid, str) and sid:
-                            normalized.append({"id": sid, "active": bool(s.get("active", False))})
-                return normalized
-            return []
-        except Exception:
-            return []
-        finally:
-            sock.close()
+    # ------------------------------------------------------------------ #
+    # Static pre-auth queries (no live session required)                   #
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def list_users(
         handler_host: str = "127.0.0.1",
         handler_port: int = 6060,
-        timeout_s: float = 5.0,
+        timeout_s: float  = 5.0,
     ) -> List[dict]:
-        """Query handler for known persistent user identities."""
-        sock = socket.create_connection((handler_host, handler_port), timeout=timeout_s)
+        """
+        Return all known super-users.
+        Each entry: {"id": str, "active": bool}
+        """
+        sock = socket.create_connection(
+            (handler_host, handler_port), timeout=timeout_s
+        )
         sock.settimeout(timeout_s)
         try:
-            Gateway._send_framed(sock, {"type": "list_users"})
-            reply = Gateway._recv_one_from(sock)
+            sock.sendall(_encode_frame({"type": "list_users"}))
+            reply = _recv_one(sock)
         finally:
             try:
                 sock.close()
@@ -268,47 +303,190 @@ class Gateway(ABC):
         if reply.get("type") != "user_list":
             raise RuntimeError(f"Unexpected list_users response: {reply}")
 
-        users = reply.get("users", [])
-        if not isinstance(users, list):
-            return []
-        
-        # New format: list of dicts {id, active}
-        processed = []
-        for u in users:
+        out: List[dict] = []
+        for u in reply.get("users", []):
             if isinstance(u, dict):
-                processed.append(u)
+                out.append({"id": u.get("id", ""), "active": bool(u.get("active"))})
             elif isinstance(u, str):
-                # Backwards compat: assume not active if it's just a string
-                processed.append({"id": u, "active": False})
-        return processed
+                out.append({"id": u, "active": False})
+        return out
+
+    @staticmethod
+    def list_sessions(
+        super_user: str,
+        handler_host: str = "127.0.0.1",
+        handler_port: int = 6060,
+        timeout_s: float  = 5.0,
+    ) -> List[dict]:
+        """
+        Return all sessions for a super-user.
+        Each entry: {"id": str, "title": str, "turns": int, "active": bool}
+        """
+        sock = socket.create_connection(
+            (handler_host, handler_port), timeout=timeout_s
+        )
+        sock.settimeout(timeout_s)
+        try:
+            sock.sendall(_encode_frame({
+                "type":       "list_sessions",
+                "super_user": super_user,
+            }))
+            reply = _recv_one(sock)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        if reply.get("type") != "session_list":
+            raise RuntimeError(f"Unexpected list_sessions response: {reply}")
+
+        out: List[dict] = []
+        for s in reply.get("sessions", []):
+            if isinstance(s, dict):
+                out.append({
+                    "id":     s.get("id", ""),
+                    "title":  s.get("title", ""),
+                    "turns":  s.get("turns", 0),
+                    "active": bool(s.get("active")),
+                })
+            elif isinstance(s, str):
+                out.append({"id": s, "title": "", "turns": 0, "active": False})
+        return out
 
     # ------------------------------------------------------------------ #
-    # Abstract interface — subclasses must implement                       #
+    # Command registry                                                     #
+    # ------------------------------------------------------------------ #
+
+    def register_command(self, name: str, fn: Callable[[str], None]) -> None:
+        """
+        Register a *client-side* slash command.
+
+        name  — must start with '/', e.g. "/debug"
+        fn    — callable(args: str) -> None
+                args is everything after the command name, stripped.
+
+        Client-side commands are NOT forwarded to the Handler.
+        Call send_message() inside fn if you also need an LLM response.
+        """
+        if not name.startswith("/"):
+            raise ValueError(f"Command name must start with '/': {name!r}")
+        self._commands[name] = fn
+
+    def _register_builtin_commands(self) -> None:
+        """
+        Built-in client-side commands.
+
+        Note: /new, /compact, /undo, /sessions, /title, /session_info,
+        /model_info, /scheduler_info, /context are implemented on the C++
+        handler side — we forward them as plain messages so the handler can
+        update session state and reply.  Only /help is intercepted here to
+        avoid a network round-trip.
+        """
+        def _help(_args: str) -> None:
+            lines = [
+                "Client-side commands (handled locally):",
+                "  /help            — this message",
+                "",
+                "Handler-side commands (forwarded to server):",
+                "  /new             — start a new session",
+                "  /compact         — compact current session",
+                "  /undo            — undo last turn",
+                "  /sessions        — list your sessions",
+                "  /title <text>    — set session title",
+                "  /session_info    — current session stats",
+                "  /model_info      — model & adapter config",
+                "  /scheduler_info  — scheduler queue depth",
+                "  /context         — context window usage",
+                "",
+                "Extra client commands registered by this gateway:",
+            ]
+            for cmd in sorted(self._commands):
+                if cmd != "/help":
+                    lines.append(f"  {cmd}")
+            self.deliver({"type": "token", "data": "\n".join(lines) + "\n"})
+
+        self.register_command("/help", _help)
+
+    # ------------------------------------------------------------------ #
+    # Abstract interface                                                   #
     # ------------------------------------------------------------------ #
 
     @abstractmethod
     def get_next_input(self) -> Optional[str]:
         """
-        Block until the next piece of input arrives from the user transport.
-        Return the input string, or None to signal clean shutdown.
+        Block until the next user input arrives.
+        Return the raw string, or None to signal clean shutdown.
         """
 
     @abstractmethod
     def deliver(self, event: dict) -> None:
         """
-        Deliver an event that arrived from the Handler to the user.
-        event["type"] is one of: "token", "end", "notify", "approval_ack", "error"
+        Deliver a Handler event to the user.
+        event["type"] is one of:
+          "token", "end", "tool_start", "tool_finish", "context_usage",
+          "approval_request", "approval_ack", "session_switched",
+          "notify", "error"
         """
 
     # ------------------------------------------------------------------ #
-    # Optional hooks                                                       #
+    # Optional hooks — override any or all                                #
     # ------------------------------------------------------------------ #
 
     def on_connected(self) -> None:
-        """Called once registration is confirmed. Override to customise."""
+        """Called once the registration handshake succeeds."""
 
     def on_disconnected(self) -> None:
-        """Called when the gateway tears down. Override to clean up."""
+        """Called when the gateway tears down."""
+
+    def on_token(self, text: str) -> None:
+        """Called for every streaming token delta. Default: calls deliver()."""
+        self.deliver({"type": "token", "data": text})
+
+    def on_end(self) -> None:
+        """Called at the end of each complete LLM turn."""
+        self.deliver({"type": "end"})
+
+    def on_tool_start(self, tool: str, args: dict) -> None:
+        """Called when a tool execution begins."""
+        self.deliver({"type": "tool_start", "tool": tool, "args": args})
+
+    def on_tool_finish(self, tool: str, result: dict) -> None:
+        """Called when a tool execution completes."""
+        self.deliver({"type": "tool_finish", "tool": tool, "result": result})
+
+    def on_context_usage(self, current: int, maximum: int, pct: float) -> None:
+        """Called whenever the handler reports context window usage."""
+        self.deliver({
+            "type":           "context_usage",
+            "current_tokens": current,
+            "max_tokens":     maximum,
+            "pct":            pct,
+        })
+
+    def on_approval_request(self, approval_trace: str, payload: dict) -> None:
+        """
+        Called when an agent needs human approval.
+        Default: delivers the event.  Override to show interactive UI.
+        """
+        self.deliver({
+            "type":           "approval_request",
+            "approval_trace": approval_trace,
+            "payload":        payload,
+        })
+
+    def on_session_switched(self, session_id: str) -> None:
+        """Called when the handler confirms a session switch."""
+        self._user_id = session_id
+        self.deliver({"type": "session_switched", "session_id": session_id})
+
+    def on_notify(self, event: dict) -> None:
+        """Called for generic bus notifications not handled by another hook."""
+        self.deliver(event)
+
+    def on_error(self, message: str) -> None:
+        """Called for error frames from the handler."""
+        self.deliver({"type": "error", "message": message})
 
     # ------------------------------------------------------------------ #
     # Properties                                                           #
@@ -316,8 +494,13 @@ class Gateway(ABC):
 
     @property
     def user_id(self) -> Optional[str]:
-        """The user_id confirmed by the Handler after registration."""
+        """The resolved session_id confirmed by the Handler."""
         return self._user_id
+
+    @property
+    def super_user(self) -> Optional[str]:
+        """The super-user identity (without _sN suffix)."""
+        return self._super_user
 
     @property
     def is_connected(self) -> bool:
@@ -328,13 +511,10 @@ class Gateway(ABC):
     # ------------------------------------------------------------------ #
 
     def _recv_loop(self) -> None:
-        """
-        Background thread: reads events from the Handler and dispatches them.
-        Exits when the socket closes or _running is False.
-        """
+        """Background thread: reads events and dispatches them via hooks."""
         while self._running:
             try:
-                event = self._recv_one()
+                event = _recv_one(self._sock)  # type: ignore[arg-type]
                 self._dispatch(event)
             except (TimeoutError, OSError):
                 # Transient timeout — keep looping.
@@ -346,65 +526,64 @@ class Gateway(ABC):
         self._running = False
 
     def _dispatch(self, event: dict) -> None:
-        """Route an incoming Handler event to the appropriate handler."""
-        event_type = event.get("type", "")
+        """Route an incoming event to the correct hook or deliver()."""
+        t = event.get("type", "")
 
-        # Delegate everything to deliver() — the subclass decides presentation.
-        try:
+        if t == "token":
+            self.on_token(event.get("data", ""))
+
+        elif t == "end":
+            self.on_end()
+
+        elif t == "tool_start":
+            self.on_tool_start(
+                event.get("tool", ""),
+                event.get("args", event.get("summary", {})),
+            )
+
+        elif t == "tool_finish":
+            self.on_tool_finish(
+                event.get("tool", ""),
+                event.get("result", event.get("summary", {})),
+            )
+
+        elif t == "context_usage":
+            self.on_context_usage(
+                event.get("current_tokens", 0),
+                event.get("max_tokens", 0),
+                event.get("pct", 0.0),
+            )
+
+        elif t == "approval_request":
+            self.on_approval_request(
+                event.get("approval_trace", ""),
+                event.get("payload", {}),
+            )
+
+        elif t == "approval_ack":
+            # Deliver raw for subclasses that want to react.
             self.deliver(event)
-        except Exception as exc:
-            print(f"[Gateway:{self._user_id}] deliver() error: {exc}")
+
+        elif t == "session_switched":
+            self.on_session_switched(event.get("session_id", ""))
+
+        elif t == "error":
+            self.on_error(event.get("message", "unknown error"))
+
+        elif t in ("notify", "tool_message", "independent_msg"):
+            self.on_notify(event)
+
+        else:
+            # Unknown event type — hand it to deliver() unchanged.
+            self.deliver(event)
 
     # ------------------------------------------------------------------ #
-    # Internal: framed socket IO                                           #
+    # Internal: framed send                                                #
     # ------------------------------------------------------------------ #
 
-    def _send(self, payload: dict) -> None:
-        frame = self._encode_frame(payload)
+    def _send_raw(self, payload: dict) -> None:
+        frame = _encode_frame(payload)
         with self._sock_lock:
             if self._sock is None:
                 raise RuntimeError("Gateway is not connected")
             self._sock.sendall(frame)
-
-    def _recv_one(self) -> dict:
-        """Read one framed message from the socket. May raise on timeout."""
-        header = self._recv_exact(4)
-        size = struct.unpack(">I", header)[0]
-        body = self._recv_exact(size)
-        return json.loads(body.decode("utf-8"))
-
-    @staticmethod
-    def _encode_frame(payload: dict) -> bytes:
-        body = json.dumps(payload).encode("utf-8")
-        return struct.pack(">I", len(body)) + body
-
-    @staticmethod
-    def _send_framed(sock: socket.socket, payload: dict) -> None:
-        sock.sendall(Gateway._encode_frame(payload))
-
-    @staticmethod
-    def _recv_exact_from(sock: socket.socket, n: int) -> bytes:
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
-            if not chunk:
-                raise RuntimeError("Handler socket closed")
-            buf.extend(chunk)
-        return bytes(buf)
-
-    @staticmethod
-    def _recv_one_from(sock: socket.socket) -> dict:
-        header = Gateway._recv_exact_from(sock, 4)
-        size = struct.unpack(">I", header)[0]
-        body = Gateway._recv_exact_from(sock, size)
-        return json.loads(body.decode("utf-8"))
-
-    def _recv_exact(self, n: int) -> bytes:
-        buf = bytearray()
-        while len(buf) < n:
-            # Access sock directly (called from recv thread or connect, no lock needed).
-            chunk = self._sock.recv(n - len(buf))
-            if not chunk:
-                raise RuntimeError("Handler socket closed")
-            buf.extend(chunk)
-        return bytes(buf)

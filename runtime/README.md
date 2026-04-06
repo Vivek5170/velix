@@ -8,10 +8,10 @@ Unnecessary internal details are removed and only **SDK rules, functions, usage,
 This document describes how developers implement **skills, tools, agents, and handlers** using the Velix SDK.
 
 > [!NOTE]
-> This guide predominantly uses **C++** syntax for examples. If you are developing with **Python**, please refer to the [Python SDK Guide](file:///mnt/Acads%20and%20Codes/VScode_Files/Projects/velix/runtime/sdk/python/README.md) for equivalent syntax and patterns.
+> This guide predominantly uses **C++** syntax for examples. If you are developing with **Python**, please refer to the [Python SDK Guide](runtime/sdk/python/README.md) for equivalent syntax and patterns.
 >
 > Valid LLM modes are strictly: `simple`, `conversation`, and `user_conversation`.
-> The legacy alias `chat` is not part of the protocol.
+> The `chat` alias is not part of the protocol.
 
 Velix provides a **process-based runtime** where components communicate through the Velix infrastructure.
 
