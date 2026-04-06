@@ -224,33 +224,23 @@ class Gateway(ABC):
 
     @classmethod
     def list_sessions(cls, super_user: str, host: str="127.0.0.1", port: int=6060) -> list:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock = socket.create_connection((host, port), timeout=5.0)
         sock.settimeout(5.0)
         try:
-            sock.connect((host, port))
-            req = {"type": "list_sessions", "super_user": super_user}
-            sock.sendall(json.dumps(req).encode() + b"\n")
-            
-            buf = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                if b"\n" in buf:
-                    break
-            
-            line = buf.split(b"\n")[0].decode()
-            resp = json.loads(line)
+            Gateway._send_framed(sock, {"type": "list_sessions", "super_user": super_user})
+            resp = Gateway._recv_one_from(sock)
             if resp.get("type") == "session_list":
                 sessions = resp.get("sessions", [])
-                if isinstance(sessions, str): # Legacy fallback
-                    try:
-                        r = json.loads(sessions)
-                        return r.get("sessions", [])
-                    except:
-                        return []
-                return sessions
+                if not isinstance(sessions, list):
+                    return []
+
+                normalized = []
+                for s in sessions:
+                    if isinstance(s, dict):
+                        sid = s.get("id")
+                        if isinstance(sid, str) and sid:
+                            normalized.append({"id": sid, "active": bool(s.get("active", False))})
+                return normalized
             return []
         except Exception:
             return []

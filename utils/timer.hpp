@@ -9,10 +9,10 @@ class Timer {
 private:
     std::chrono::high_resolution_clock::time_point start_time;
     std::chrono::high_resolution_clock::time_point end_time;
-    bool running;
+    bool running{false};
 
 public:
-    Timer() : running(false) {
+    Timer() {
         reset();
     }
 
@@ -73,6 +73,11 @@ public:
     explicit ScopedTimer(const std::string& timer_name) : name(timer_name) {
         timer.start();
     }
+
+    ScopedTimer(const ScopedTimer&) = delete;
+    ScopedTimer& operator=(const ScopedTimer&) = delete;
+    ScopedTimer(ScopedTimer&&) = delete;
+    ScopedTimer& operator=(ScopedTimer&&) = delete;
 
     ~ScopedTimer() {
         timer.stop();

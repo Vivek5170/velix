@@ -3,14 +3,51 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <cstdlib>
+#include <cctype>
 #include "../vendor/nlohmann/json.hpp"
 
 namespace velix::utils {
 
+struct TransparentStringHash {
+    using is_transparent = void;
+
+    std::size_t operator()(std::string_view value) const noexcept {
+        return std::hash<std::string_view>{}(value);
+    }
+
+    std::size_t operator()(const std::string& value) const noexcept {
+        return operator()(std::string_view(value));
+    }
+
+    std::size_t operator()(const char* value) const noexcept {
+        return operator()(std::string_view(value));
+    }
+};
+
+struct TransparentStringEqual {
+    using is_transparent = void;
+
+    bool operator()(std::string_view lhs, std::string_view rhs) const noexcept {
+        return lhs == rhs;
+    }
+
+    bool operator()(const std::string& lhs, const std::string& rhs) const noexcept {
+        return lhs == rhs;
+    }
+
+    bool operator()(const char* lhs, const char* rhs) const noexcept {
+        return std::string_view(lhs) == std::string_view(rhs);
+    }
+};
+
+using DotEnvMap = std::unordered_map<std::string, std::string, TransparentStringHash, TransparentStringEqual>;
+
 namespace detail {
-inline std::unordered_map<std::string, int> &get_ports_cache() {
-    static std::unordered_map<std::string, int> cache;
+inline std::unordered_map<std::string, int, TransparentStringHash, TransparentStringEqual> &get_ports_cache() {
+    static std::unordered_map<std::string, int, TransparentStringHash, TransparentStringEqual> cache;
     return cache;
 }
 
@@ -50,7 +87,9 @@ inline void load_ports_impl() {
             for (auto it = j.begin(); it != j.end(); ++it) {
                 if (it.value().is_number_integer()) ports[it.key()] = it.value().get<int>();
             }
-        } catch (...) {}
+        } catch (const nlohmann::json::exception&) {
+            // Keep empty cache on malformed ports file.
+        }
     }
     ports_loaded() = true;
 }
@@ -67,7 +106,7 @@ inline void load_configs_impl() {
     if (cfile.is_open()) {
         try {
             cfile >> config;
-        } catch (...) {
+        } catch (const nlohmann::json::exception&) {
             config = nlohmann::json::object();
         }
     }
@@ -79,7 +118,7 @@ inline void load_configs_impl() {
  * @brief Thread-safe port resolution with internal caching.
  */
 inline int get_port(const std::string &name, int fallback) {
-    std::lock_guard<std::mutex> lock(detail::get_config_mutex());
+    std::scoped_lock lock(detail::get_config_mutex());
     if (!detail::ports_loaded()) {
         detail::load_ports_impl();
     }
@@ -93,7 +132,7 @@ inline int get_port(const std::string &name, int fallback) {
  * Falls back to provided value when not configured.
  */
 inline std::string get_service_host(const std::string &name, const std::string &fallback) {
-    std::lock_guard<std::mutex> lock(detail::get_config_mutex());
+    std::scoped_lock lock(detail::get_config_mutex());
     if (!detail::config_loaded()) {
         detail::load_configs_impl();
     }
@@ -108,7 +147,9 @@ inline std::string get_service_host(const std::string &name, const std::string &
                 }
             }
         }
-    } catch (...) {}
+    } catch (const nlohmann::json::exception&) {
+        // Fall back on malformed config structure.
+    }
     return fallback;
 }
 
@@ -116,8 +157,8 @@ inline std::string get_service_host(const std::string &name, const std::string &
  * @brief Resolve service bind host from config/config.json key BIND_HOSTS.<name>.
  * Falls back to provided value when not configured.
  */
-inline std::unordered_map<std::string, std::string> load_dotenv(const std::string &path) {
-    std::unordered_map<std::string, std::string> map;
+inline DotEnvMap load_dotenv(const std::string &path) {
+    DotEnvMap map;
     std::ifstream in(path);
     if (!in.is_open()) {
         return map;
@@ -144,16 +185,30 @@ inline std::unordered_map<std::string, std::string> load_dotenv(const std::strin
     return map;
 }
 
-inline std::string get_env_value(const std::string &name, const std::unordered_map<std::string, std::string> &dot_env) {
+inline std::string get_env_value(const std::string &name, const DotEnvMap &dot_env) {
     if (auto it = dot_env.find(name); it != dot_env.end() && !it->second.empty()) {
         return it->second;
     }
-    const char *v = std::getenv(name.c_str());
-    return v ? std::string(v) : std::string("");
+#ifdef _WIN32
+    char *value = nullptr;
+    std::size_t len = 0;
+    const errno_t err = _dupenv_s(&value, &len, name.c_str());
+    if (err != 0 || value == nullptr) {
+        return "";
+    }
+    std::string out(value);
+    std::free(value);
+    return out;
+#else
+    if (const char *v = std::getenv(name.c_str()); v != nullptr) {
+        return std::string(v);
+    }
+    return "";
+#endif
 }
 
 inline std::string get_bind_host(const std::string &name, const std::string &fallback) {
-    std::lock_guard<std::mutex> lock(detail::get_config_mutex());
+    std::scoped_lock lock(detail::get_config_mutex());
     if (!detail::config_loaded()) {
         detail::load_configs_impl();
     }
@@ -168,7 +223,9 @@ inline std::string get_bind_host(const std::string &name, const std::string &fal
                 }
             }
         }
-    } catch (...) {}
+    } catch (const nlohmann::json::exception&) {
+        // Fall back on malformed config structure.
+    }
     return fallback;
 }
 
@@ -177,7 +234,7 @@ inline std::string get_bind_host(const std::string &name, const std::string &fal
  */
 template <typename T>
 inline T get_config(const std::string &key, T fallback) {
-    std::lock_guard<std::mutex> lock(detail::get_config_mutex());
+    std::scoped_lock lock(detail::get_config_mutex());
     if (!detail::config_loaded()) {
         detail::load_configs_impl();
     }
@@ -186,7 +243,7 @@ inline T get_config(const std::string &key, T fallback) {
     if (config.contains(key)) {
         try {
             return config.at(key).get<T>();
-        } catch (...) {
+        } catch (const nlohmann::json::exception&) {
             return fallback;
         }
     }
@@ -197,7 +254,7 @@ inline T get_config(const std::string &key, T fallback) {
  * @brief Forces a re-read of configuration files from disk.
  */
 inline void reload_configs() {
-    std::lock_guard<std::mutex> lock(detail::get_config_mutex());
+    std::scoped_lock lock(detail::get_config_mutex());
     detail::get_ports_cache().clear();
     detail::get_config_cache().clear();
     detail::ports_loaded() = false;

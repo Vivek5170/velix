@@ -7,14 +7,14 @@
 namespace velix::core {
 
 ProcessRegistry::ProcessRegistry()
-    : process_counter_(1000), tree_counter_(1) {}
+  = default;
 
 ProcessRegistry::RegisterResult ProcessRegistry::register_process(
     int os_pid,
-    const std::string &tree_id,
+  std::string_view tree_id,
     int parent_pid,
-    const std::string &role,
-    const std::string &trace_id,
+  std::string_view role,
+  std::string_view trace_id,
     ProcessStatus initial_status,
     double initial_memory_mb,
     bool is_system_handler) {
@@ -38,7 +38,7 @@ ProcessRegistry::RegisterResult ProcessRegistry::register_process(
   }
 
   // Determine tree_id
-  std::string final_tree_id = tree_id;
+  std::string final_tree_id(tree_id);
   bool is_tree_root = false;
 
   if (is_system_handler) {
@@ -50,13 +50,10 @@ ProcessRegistry::RegisterResult ProcessRegistry::register_process(
     is_tree_root = true;
   } else {
     // Verify tree exists
-    auto tree_it = tree_table_.find(final_tree_id);
-    if (tree_it == tree_table_.end()) {
+    if (auto tree_it = tree_table_.find(final_tree_id);
+        tree_it == tree_table_.end()) {
       return {false, "tree not found", nullptr, final_tree_id};
-    }
-
-    // Check tree is active
-    if (tree_it->second.status.load() != TreeStatus::ACTIVE) {
+    } else if (tree_it->second.status.load() != TreeStatus::ACTIVE) {
       return {false, "tree is not active", nullptr, final_tree_id};
     }
   }
@@ -67,8 +64,8 @@ ProcessRegistry::RegisterResult ProcessRegistry::register_process(
   process_info->os_pid = os_pid;
   process_info->parent_pid = parent_pid;
   process_info->tree_id = final_tree_id;
-  process_info->role = role;
-  process_info->trace_id = trace_id;
+  process_info->role = std::string(role);
+  process_info->trace_id = std::string(trace_id);
   process_info->status.store(initial_status);
   process_info->memory_mb.store(initial_memory_mb);
   process_info->last_heartbeat_ms.store(
@@ -83,8 +80,8 @@ ProcessRegistry::RegisterResult ProcessRegistry::register_process(
   on_process_registered_unlocked_(*process_info);
 
   // Update tree root_pid if this is tree root registration
-  auto tree_it = tree_table_.find(final_tree_id);
-  if (tree_it != tree_table_.end() && is_tree_root) {
+  if (auto tree_it = tree_table_.find(final_tree_id);
+      tree_it != tree_table_.end() && is_tree_root) {
     tree_it->second.root_pid = pid;
   }
 
@@ -121,10 +118,11 @@ void ProcessRegistry::update_heartbeat(int pid,
 }
 
 ProcessRegistry::TreeStatusResult ProcessRegistry::get_tree_status(
-    const std::string &tree_id) {
+  std::string_view tree_id) {
   std::shared_lock<std::shared_mutex> lock(registry_mutex_);
 
-  auto it = tree_table_.find(tree_id);
+  const std::string tree_key(tree_id);
+  auto it = tree_table_.find(tree_key);
   if (it == tree_table_.end()) {
     return {false, TreeStatus::FAILED, -1};
   }
@@ -133,11 +131,12 @@ ProcessRegistry::TreeStatusResult ProcessRegistry::get_tree_status(
 }
 
 std::vector<int> ProcessRegistry::get_tree_processes(
-    const std::string &tree_id) {
+  std::string_view tree_id) {
   std::shared_lock<std::shared_mutex> lock(registry_mutex_);
 
   std::vector<int> pids;
-  auto index_it = tree_process_index_.find(tree_id);
+  const std::string tree_key(tree_id);
+  auto index_it = tree_process_index_.find(tree_key);
   if (index_it != tree_process_index_.end()) {
     pids.reserve(index_it->second.size());
     for (int pid : index_it->second) {
@@ -147,11 +146,12 @@ std::vector<int> ProcessRegistry::get_tree_processes(
   return pids;
 }
 
-double ProcessRegistry::compute_tree_memory_mb(const std::string &tree_id) {
+double ProcessRegistry::compute_tree_memory_mb(std::string_view tree_id) {
   std::shared_lock<std::shared_mutex> lock(registry_mutex_);
 
   double total = 0.0;
-  auto index_it = tree_process_index_.find(tree_id);
+  const std::string tree_key(tree_id);
+  auto index_it = tree_process_index_.find(tree_key);
   if (index_it == tree_process_index_.end()) {
     return total;
   }
@@ -203,17 +203,18 @@ std::vector<WatchdogEntry> ProcessRegistry::snapshot_for_watchdog() {
   return snapshot;
 }
 
-std::vector<int> ProcessRegistry::kill_tree(const std::string &tree_id) {
+std::vector<int> ProcessRegistry::kill_tree(std::string_view tree_id) {
   std::unique_lock<std::shared_mutex> lock(registry_mutex_);
 
   std::vector<int> pids;
+  const std::string tree_key(tree_id);
 
-  auto tree_it = tree_table_.find(tree_id);
+  auto tree_it = tree_table_.find(tree_key);
   if (tree_it != tree_table_.end()) {
     tree_it->second.status.store(TreeStatus::KILLED);
   }
 
-  auto index_it = tree_process_index_.find(tree_id);
+  auto index_it = tree_process_index_.find(tree_key);
   if (index_it != tree_process_index_.end()) {
     for (int pid : index_it->second) {
       auto process_it = process_table_.find(pid);
@@ -288,10 +289,11 @@ void ProcessRegistry::terminate_process(int pid) {
 }
 
 bool ProcessRegistry::mark_tree_completed_if_done(
-    const std::string &tree_id) {
+  std::string_view tree_id) {
   std::unique_lock<std::shared_mutex> lock(registry_mutex_);
+  const std::string tree_key(tree_id);
 
-  auto tree_it = tree_table_.find(tree_id);
+  auto tree_it = tree_table_.find(tree_key);
   if (tree_it == tree_table_.end()) {
     return false;
   }
@@ -309,14 +311,14 @@ bool ProcessRegistry::mark_tree_completed_if_done(
   }
 
   // Check if any processes remain
-  auto index_it = tree_process_index_.find(tree_id);
+  auto index_it = tree_process_index_.find(tree_key);
   if (index_it != tree_process_index_.end() && !index_it->second.empty()) {
     return false;
   }
 
   // Check if all processes in tree are terminal
   for (const auto &[pid, process] : process_table_) {
-    if (process->tree_id == tree_id) {
+    if (process->tree_id == tree_key) {
       ProcessStatus proc_status = process->status.load();
       if (proc_status != ProcessStatus::FINISHED &&
           proc_status != ProcessStatus::KILLED &&
@@ -331,10 +333,11 @@ bool ProcessRegistry::mark_tree_completed_if_done(
   return true;
 }
 
-void ProcessRegistry::mark_tree_failed(const std::string &tree_id) {
+void ProcessRegistry::mark_tree_failed(std::string_view tree_id) {
   std::unique_lock<std::shared_mutex> lock(registry_mutex_);
+  const std::string tree_key(tree_id);
 
-  auto tree_it = tree_table_.find(tree_id);
+  auto tree_it = tree_table_.find(tree_key);
   if (tree_it != tree_table_.end()) {
     TreeStatus current = tree_it->second.status.load();
     if (current != TreeStatus::KILLED && current != TreeStatus::COMPLETED &&
@@ -344,19 +347,18 @@ void ProcessRegistry::mark_tree_failed(const std::string &tree_id) {
   }
 }
 
-std::string ProcessRegistry::create_tree(const std::string &explicit_id) {
+std::string ProcessRegistry::create_tree(std::string_view explicit_id) {
   // FIX #7: Use explicit tree ID if provided, otherwise auto-generate
   std::string tree_id;
   if (!explicit_id.empty()) {
-    tree_id = explicit_id;
+    tree_id = std::string(explicit_id);
   } else {
     std::ostringstream oss;
     oss << "TREE_" << tree_counter_++;
     tree_id = oss.str();
   }
 
-  auto tree_it = tree_table_.find(tree_id);
-  if (tree_it == tree_table_.end()) {
+  if (auto tree_it = tree_table_.find(tree_id); tree_it == tree_table_.end()) {
     TreeInfo tree_info;
     tree_info.tree_id = tree_id;
     tree_info.root_pid = -1;
@@ -365,7 +367,7 @@ std::string ProcessRegistry::create_tree(const std::string &explicit_id) {
             std::chrono::system_clock::now().time_since_epoch()).count();
     tree_info.status.store(TreeStatus::ACTIVE);
     tree_info.llm_request_count.store(0);
-    tree_it = tree_table_.emplace(tree_id, tree_info).first;
+    tree_table_.try_emplace(tree_id, tree_info);
   } else {
     tree_it->second.tree_id = tree_id;
     tree_it->second.root_pid = -1;
@@ -407,7 +409,7 @@ ProcessRegistry::get_all_tree_ids_with_created_at() {
   std::vector<std::pair<std::string, uint64_t>> pairs;
   pairs.reserve(tree_table_.size());
   for (const auto &[id, tree] : tree_table_) {
-    pairs.push_back({id, tree.created_at_ms});
+    pairs.emplace_back(id, tree.created_at_ms);
   }
   return pairs;
 }

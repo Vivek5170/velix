@@ -67,7 +67,7 @@ private:
    *
    * Platform-specific: Uses kill() on Unix, TerminateProcess() on Windows.
    */
-  bool send_signal_to_os_process(int os_pid, int signal);
+  bool send_signal_to_os_process(int os_pid, int signal) const;
 
   /**
    * Notify the BUS that a child process has terminated.
@@ -75,7 +75,7 @@ private:
    * This is best-effort - failures are logged but not fatal.
    */
   void notify_bus_child_terminated(const TerminationTarget &target,
-                                    const std::string &reason);
+                                   const std::string &reason) const;
 };
 
 /**
@@ -138,8 +138,8 @@ public:
    *
    * Never holds locks for extended periods.
    */
-  void watchdog_loop(
-      std::function<bool()> is_running);  // Called with running flag
+    void watchdog_loop(
+      const std::function<bool()> &is_running);  // Called with running flag
 
 private:
   std::shared_ptr<ProcessRegistry> registry_;

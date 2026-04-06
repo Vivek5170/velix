@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "keep_recent_turns": 16,
+  "keep_recent_turns": 8,
   "max_history_tokens_before_compact": 3000,
   "context_pressure_threshold": 0.70,
   "max_context_tokens": 32768,
@@ -9,6 +9,5 @@
   "summary_top_p": 0.9,
   "scheduler_timeout_ms": 30000,
   "summary_tree_id": "TREE_HANDLER",
-  "summary_source_pid": 1000,
-  "history_file": "memory/history.json"
+  "summary_source_pid": 1000
 }

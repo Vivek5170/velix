@@ -5,22 +5,21 @@
 
 #if __has_include(<nlohmann/json.hpp>)
     #include <nlohmann/json.hpp>
-    #define VELIX_HAS_NLOHMANN_JSON 1
+    inline constexpr bool kHasNlohmannJson = true;
 #elif __has_include("../vendor/nlohmann/json.hpp")
     #include "../vendor/nlohmann/json.hpp"
-    #define VELIX_HAS_NLOHMANN_JSON 1
+    inline constexpr bool kHasNlohmannJson = true;
 #else
-    #define VELIX_HAS_NLOHMANN_JSON 0
+    inline constexpr bool kHasNlohmannJson = false;
 #endif
 
 namespace velix::communication {
 
-static void send_all(SocketWrapper& socket, const void* data, std::size_t len) {
+static void send_all(SocketWrapper& socket, const char* data, std::size_t len) {
     std::size_t total = 0;
-    const char* ptr = static_cast<const char*>(data);
 
     while (total < len) {
-        int sent = socket.send(ptr + total, static_cast<int>(len - total));
+        auto sent = socket.send(data + total, static_cast<int>(len - total));
         if (sent <= 0) {
             throw SocketException("send failed");
         }
@@ -29,7 +28,7 @@ static void send_all(SocketWrapper& socket, const void* data, std::size_t len) {
 }
 
 static void validate_json_if_available(const std::string& msg) {
-#if VELIX_HAS_NLOHMANN_JSON
+#if __has_include(<nlohmann/json.hpp>) || __has_include("../vendor/nlohmann/json.hpp")
     try {
         [[maybe_unused]] auto parsed = nlohmann::json::parse(msg);
     } catch (const std::exception& e) {
@@ -50,7 +49,7 @@ void send_json(SocketWrapper& socket, const std::string& json) {
     std::uint32_t len = static_cast<std::uint32_t>(json.size());
     std::uint32_t net_len = htonl(len);
 
-    send_all(socket, &net_len, sizeof(net_len));
+    send_all(socket, reinterpret_cast<const char*>(&net_len), sizeof(net_len));
     if (!json.empty()) {
         send_all(socket, json.data(), json.size());
     }

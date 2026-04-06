@@ -17,6 +17,11 @@ struct SseEvent {
   std::string data;
 };
 
+class AdapterException : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 inline std::string ensure_leading_slash(const std::string &path) {
   if (path.empty()) {
     return "";
@@ -64,27 +69,25 @@ inline void resolve_endpoint(const AdapterConfig &cfg, std::string &host,
   }
 
   std::string host_port = url;
-  const std::size_t slash = url.find('/');
-  if (slash != std::string::npos) {
+  if (const std::size_t slash = url.find('/'); slash != std::string::npos) {
     host_port = url.substr(0, slash);
     base_path = url.substr(slash);
   }
 
   host = host_port;
   port = is_https ? 443 : 80;
-  const std::size_t colon = host_port.rfind(':');
-  if (colon != std::string::npos) {
+  if (const std::size_t colon = host_port.rfind(':');
+      colon != std::string::npos) {
     host = host_port.substr(0, colon);
     try {
       port = std::stoi(host_port.substr(colon + 1));
-    } catch (...) {
-      throw std::runtime_error("Invalid adapter base_url port: " +
-                               cfg.base_url);
+    } catch (const std::exception &) {
+      throw AdapterException("Invalid adapter base_url port: " + cfg.base_url);
     }
   }
 
   if (host.empty()) {
-    throw std::runtime_error("LLM host is empty; check adapter host/base_url");
+    throw AdapterException("LLM host is empty; check adapter host/base_url");
   }
 }
 
@@ -144,7 +147,7 @@ inline std::string post_json(const AdapterConfig &cfg, const std::string &path,
   }
 #else
   if (is_https) {
-    throw std::runtime_error(
+    throw AdapterException(
         "HTTPS adapter endpoint configured but OpenSSL support is disabled");
   }
   httplib::Client cli(host, port);
@@ -160,11 +163,11 @@ inline std::string post_json(const AdapterConfig &cfg, const std::string &path,
 #endif
 
   if (!res) {
-    throw std::runtime_error("LLM request failed (Network / Timeout error)");
+    throw AdapterException("LLM request failed (Network / Timeout error)");
   }
   if (res->status != 200) {
-    throw std::runtime_error("LLM request failed with status " +
-                             std::to_string(res->status) + ": " + res->body);
+    throw AdapterException("LLM request failed with status " +
+                           std::to_string(res->status) + ": " + res->body);
   }
 
   return res->body;
@@ -228,7 +231,7 @@ inline void post_json_stream_raw(
   }
 #else
   if (is_https) {
-    throw std::runtime_error(
+    throw AdapterException(
         "HTTPS adapter endpoint configured but OpenSSL support is disabled");
   }
   httplib::Client cli(host, port);
@@ -250,12 +253,12 @@ inline void post_json_stream_raw(
 #endif
 
   if (!res) {
-    throw std::runtime_error(
+    throw AdapterException(
         "LLM streaming request failed (Network / Timeout error)");
   }
   if (res->status != 200) {
-    throw std::runtime_error("LLM streaming request failed with status " +
-                             std::to_string(res->status) + ": " + res->body);
+    throw AdapterException("LLM streaming request failed with status " +
+                           std::to_string(res->status) + ": " + res->body);
   }
 }
 
@@ -295,8 +298,11 @@ stream_sse_events_ex(const AdapterConfig &cfg, const std::string &path,
                                   &event_data, &flush_event,
                                   &should_continue]() {
     std::size_t newline_pos = std::string::npos;
-    while (should_continue && (newline_pos = line_buffer.find(
-                                   '\n', consumed)) != std::string::npos) {
+    while (should_continue) {
+      newline_pos = line_buffer.find('\n', consumed);
+      if (newline_pos == std::string::npos) {
+        break;
+      }
       std::string line = line_buffer.substr(consumed, newline_pos - consumed);
       consumed = newline_pos + 1;
       if (!line.empty() && line.back() == '\r') {
@@ -357,7 +363,7 @@ stream_sse_events_ex(const AdapterConfig &cfg, const std::string &path,
 
   if (!callback_error.empty()) {
     std::cerr << "[Adapter] Callback failed: " << callback_error << std::endl;
-    throw std::runtime_error(callback_error);
+    throw AdapterException(callback_error);
   }
 }
 
@@ -376,7 +382,7 @@ stream_sse_events(const AdapterConfig &cfg, const std::string &path,
 
 inline json normalize_messages_for_provider(const json &messages) {
   if (!messages.is_array()) {
-    throw std::runtime_error("messages must be an array");
+    throw AdapterException("messages must be an array");
   }
 
   json normalized = json::array();
@@ -416,7 +422,7 @@ inline json normalize_messages_for_provider(const json &messages) {
   }
 
   if (normalized.empty()) {
-    throw std::runtime_error(
+    throw AdapterException(
         "messages array has no valid provider-compatible items");
   }
   return normalized;
@@ -476,13 +482,13 @@ public:
     json response_json = json::parse(body);
 
     if (response_json.contains("error")) {
-      throw std::runtime_error(
+      throw AdapterException(
           extract_error_message(response_json["error"], "LLM provider error"));
     }
     if (!response_json.contains("choices") ||
         !response_json["choices"].is_array() ||
         response_json["choices"].empty()) {
-      throw std::runtime_error("Invalid LLM response format");
+      throw AdapterException("Invalid LLM response format");
     }
 
     const json choice = response_json["choices"][0];
@@ -575,7 +581,7 @@ public:
             }
 
             if (chunk.contains("error")) {
-              throw std::runtime_error(
+                throw AdapterException(
                   extract_error_message(chunk["error"], "Stream Error"));
             }
 

@@ -5,9 +5,8 @@
 #include <string>
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#undef ERROR
+#include <WinSock2.h>
+#include <WS2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 using SocketHandle = SOCKET;
 constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET;
@@ -27,13 +26,12 @@ namespace velix::communication {
 
 class SocketException : public std::runtime_error {
 public:
-  explicit SocketException(const std::string &msg) : std::runtime_error(msg) {}
+  using std::runtime_error::runtime_error;
 };
 
 class SocketTimeoutException : public SocketException {
 public:
-  explicit SocketTimeoutException(const std::string &msg)
-      : SocketException(msg) {}
+  using SocketException::SocketException;
 };
 
 /**
@@ -46,8 +44,8 @@ inline void init_winsock_global() {
   static bool initialized = false;
   if (!initialized) {
     WSADATA wsa_data;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsa_data);
-    if (result != 0) {
+    if (const int result = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+        result != 0) {
       throw SocketException("WSAStartup failed: " + std::to_string(result));
     }
     initialized = true;
@@ -77,7 +75,7 @@ inline std::string get_socket_error() {
 
 class SocketWrapper {
 private:
-  SocketHandle socket_handle;
+  SocketHandle socket_handle{INVALID_SOCKET_HANDLE};
 
 #ifndef _WIN32
   static void set_close_on_exec(SocketHandle handle) {
@@ -98,7 +96,7 @@ private:
 #endif
 
 public:
-  SocketWrapper() : socket_handle(INVALID_SOCKET_HANDLE) {
+  SocketWrapper() {
     init_winsock_global();
   }
 
@@ -138,18 +136,20 @@ public:
 #endif
   }
 
-  void bind(const std::string &address, uint16_t port) {
+  void bind(const std::string &address, uint16_t port) const {
     if (socket_handle == INVALID_SOCKET_HANDLE) {
       throw SocketException("Socket not created");
     }
 
     // Fix Issue #5: Enable SO_REUSEADDR to allow immediate rebind after restart
-    int reuse = 1;
 #ifdef _WIN32
-    if (setsockopt(socket_handle, SOL_SOCKET, SO_REUSEADDR, (char *)&reuse,
+    if (const int reuse = 1;
+        setsockopt(socket_handle, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char *>(&reuse),
                    sizeof(reuse)) == SOCKET_ERROR) {
 #else
-    if (setsockopt(socket_handle, SOL_SOCKET, SO_REUSEADDR, &reuse,
+    if (const int reuse = 1;
+        setsockopt(socket_handle, SOL_SOCKET, SO_REUSEADDR, &reuse,
                    sizeof(reuse)) == -1) {
 #endif
       throw SocketException("setsockopt SO_REUSEADDR failed: " +
@@ -161,8 +161,9 @@ public:
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
 
-    int result = inet_pton(AF_INET, address.c_str(), &server_addr.sin_addr);
-    if (result <= 0) {
+    if (const int result =
+            inet_pton(AF_INET, address.c_str(), &server_addr.sin_addr);
+        result <= 0) {
       throw SocketException("Invalid address: " + address);
     }
 
@@ -179,7 +180,7 @@ public:
     }
   }
 
-  void listen(int backlog = 5) {
+  void listen(int backlog = 5) const {
     if (socket_handle == INVALID_SOCKET_HANDLE) {
       throw SocketException("Socket not created");
     }
@@ -192,7 +193,7 @@ public:
     }
   }
 
-  SocketWrapper accept() {
+  SocketWrapper accept() const {
     if (socket_handle == INVALID_SOCKET_HANDLE) {
       throw SocketException("Socket not created");
     }
@@ -221,7 +222,7 @@ public:
     return client;
   }
 
-  void connect(const std::string &address, uint16_t port) {
+  void connect(const std::string &address, uint16_t port) const {
     if (socket_handle == INVALID_SOCKET_HANDLE) {
       throw SocketException("Socket not created");
     }
@@ -231,8 +232,9 @@ public:
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
 
-    int result = inet_pton(AF_INET, address.c_str(), &server_addr.sin_addr);
-    if (result <= 0) {
+    if (const int result =
+            inet_pton(AF_INET, address.c_str(), &server_addr.sin_addr);
+        result <= 0) {
       throw SocketException("Invalid address: " + address);
     }
 
@@ -254,20 +256,22 @@ public:
    * Works on both Windows and POSIX systems.
    * Issue #6: Production systems need timeouts.
    */
-  void set_timeout_ms(int timeout_ms) {
+  void set_timeout_ms(int timeout_ms) const {
     if (socket_handle == INVALID_SOCKET_HANDLE) {
       throw SocketException("Socket not created");
     }
 
 #ifdef _WIN32
     // Windows uses milliseconds directly
-    if (setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout_ms,
-                   sizeof(timeout_ms)) == SOCKET_ERROR) {
+    if (setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO,
+             reinterpret_cast<const char *>(&timeout_ms),
+             sizeof(timeout_ms)) == SOCKET_ERROR) {
       throw SocketException("setsockopt SO_RCVTIMEO failed: " +
                             get_socket_error());
     }
-    if (setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout_ms,
-                   sizeof(timeout_ms)) == SOCKET_ERROR) {
+    if (setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO,
+             reinterpret_cast<const char *>(&timeout_ms),
+             sizeof(timeout_ms)) == SOCKET_ERROR) {
       throw SocketException("setsockopt SO_SNDTIMEO failed: " +
                             get_socket_error());
     }
@@ -289,11 +293,13 @@ public:
 #endif
   }
 
-  int send(const char *data, int len) {
+  int send(const char *data, int len) const {
 #ifdef _WIN32
-    int result = ::send(socket_handle, data, len, 0);
-    if (result == SOCKET_ERROR) {
+    if (const int result = ::send(socket_handle, data, len, 0);
+        result == SOCKET_ERROR) {
       throw SocketException("Send failed: " + get_socket_error());
+    } else {
+      return result;
     }
 #else
     // Use MSG_NOSIGNAL when available (Linux). On platforms where it
@@ -303,23 +309,26 @@ public:
 #ifdef MSG_NOSIGNAL
     flags = MSG_NOSIGNAL;
 #endif
-    int result = ::send(socket_handle, data, len, flags);
-    if (result == -1) {
+    if (const int result = ::send(socket_handle, data, len, flags);
+        result == -1) {
       throw SocketException("Send failed: " + get_socket_error());
+    } else {
+      return result;
     }
 #endif
-    return result;
   }
 
-  int recv(char *buffer, int len) {
+  int recv(char *buffer, int len) const {
 #ifdef _WIN32
-    int result = ::recv(socket_handle, buffer, len, 0);
-    if (result == SOCKET_ERROR) {
-      const int err = WSAGetLastError();
-      if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+    if (const int result = ::recv(socket_handle, buffer, len, 0);
+        result == SOCKET_ERROR) {
+      if (const int err = WSAGetLastError();
+          err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
         throw SocketTimeoutException("Recv timeout: " + get_socket_error());
       }
       throw SocketException("Recv failed: " + get_socket_error());
+    } else {
+      return result;
     }
 #else
     // Fix Issue #3: Handle EINTR (interrupted system call) - retry on signal
@@ -334,8 +343,8 @@ public:
       }
       throw SocketException("Recv failed: " + get_socket_error());
     }
-#endif
     return result;
+#endif
   }
 
   void close() {

@@ -28,7 +28,6 @@ struct CompacterConfig {
 	int scheduler_timeout_ms{30000};
 	std::string summary_tree_id{"TREE_HANDLER"};
 	int summary_source_pid{1000};
-	std::string history_file{"memory/history.json"};
 };
 
 std::string now_iso8601() {
@@ -84,7 +83,6 @@ CompacterConfig load_compacter_config() {
 		cfg.scheduler_timeout_ms = j.value("scheduler_timeout_ms", cfg.scheduler_timeout_ms);
 		cfg.summary_tree_id = j.value("summary_tree_id", cfg.summary_tree_id);
 		cfg.summary_source_pid = j.value("summary_source_pid", cfg.summary_source_pid);
-		cfg.history_file = j.value("history_file", cfg.history_file);
 	} catch (const std::exception& e) {
 		LOG_ERROR(std::string("Failed parsing config/compacter.json: ") + e.what());
 	}
@@ -354,16 +352,23 @@ CompactResult compact_history_if_needed(const nlohmann::json& history, const std
 
 	if (!history.is_array()) {
 		result.history = nlohmann::json::array();
+		result.skip_reason = "invalid_history";
 		return result;
 	}
 
 	result.history = history;
 	if (!cfg.enabled) {
+		result.skip_reason = "disabled";
 		return result;
 	}
 
 	const std::size_t total_tokens = estimate_history_tokens(history);
 	if (total_tokens <= cfg.max_history_tokens_before_compact || history.size() <= cfg.keep_recent_turns + 1) {
+		if (history.size() <= cfg.keep_recent_turns + 1) {
+			result.skip_reason = "below_preserve_limit";
+		} else {
+			result.skip_reason = "below_token_threshold";
+		}
 		return result;
 	}
 
@@ -386,6 +391,7 @@ CompactResult compact_history_if_needed(const nlohmann::json& history, const std
 		llm_summary = request_llm_summary(older, cfg, scheduler_port);
 	} catch (const std::exception& e) {
 		LOG_WARN(std::string("Compaction skipped because summary generation failed: ") + e.what());
+		result.skip_reason = "summary_generation_failed";
 		return result;
 	}
 
@@ -406,16 +412,19 @@ CompactResult compact_history_if_needed(const nlohmann::json& history, const std
 	}
 
 	try {
-		const std::string target_history_file = history_file_override.empty() ? cfg.history_file : history_file_override;
-		persist_compacted_history(target_history_file, compacted);
+		if (!history_file_override.empty()) {
+			persist_compacted_history(history_file_override, compacted);
+		}
 	} catch (const std::exception& e) {
 		LOG_WARN(std::string("Compaction summary created but persistence failed: ") + e.what());
+		result.skip_reason = "persist_failed";
 		return result;
 	}
 
 	result.history = compacted;
 	result.summary = llm_summary;
 	result.compacted = true;
+	result.skip_reason.clear();
 
 	LOG_INFO("History compacted with LLM summary: tokens=" + std::to_string(total_tokens) +
 			 ", keep_recent_turns=" + std::to_string(cfg.keep_recent_turns) +

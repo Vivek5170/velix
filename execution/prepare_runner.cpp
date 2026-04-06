@@ -2,6 +2,7 @@
 
 #include "../utils/process_spawner.hpp"
 
+#include <exception>
 #include <fstream>
 #include <iostream>
 

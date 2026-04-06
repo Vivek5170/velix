@@ -8,8 +8,10 @@
 #include "../vendor/nlohmann/json.hpp"
 
 #include <atomic>
+#include <exception>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 
 using json = nlohmann::json;
@@ -18,6 +20,30 @@ namespace velix::core {
 
 namespace {
 
+struct TransparentStringHash {
+  using is_transparent = void;
+
+  std::size_t operator()(std::string_view value) const noexcept {
+    return std::hash<std::string_view>{}(value);
+  }
+
+  std::size_t operator()(const std::string &value) const noexcept {
+    return operator()(std::string_view(value));
+  }
+
+  std::size_t operator()(const char *value) const noexcept {
+    return operator()(std::string_view(value));
+  }
+};
+
+struct TransparentStringEqual {
+  using is_transparent = void;
+
+  bool operator()(std::string_view lhs, std::string_view rhs) const noexcept {
+    return lhs == rhs;
+  }
+};
+
 struct BusConfig {
   int max_client_threads = 64;
   int port = 5174;
@@ -25,7 +51,7 @@ struct BusConfig {
 
 class BusService {
 public:
-  BusService() : running_(false) {}
+  BusService() = default;
 
   void start(int port_override = -1) {
     if (running_.exchange(true))
@@ -47,38 +73,8 @@ public:
                    "bus", "BUS_ROOT", -1, "startup");
 
       while (running_) {
-        try {
-          velix::communication::SocketWrapper *server_socket = nullptr;
-          {
-            std::lock_guard<std::mutex> lock(server_mutex_);
-            if (!server_socket_ || !server_socket_->is_open()) {
-              break;
-            }
-            server_socket = server_socket_.get();
-          }
-
-          if (server_socket == nullptr || !server_socket->is_open()) {
-            break;
-          }
-
-          if (!server_socket->has_data(250)) {
-            continue;
-          }
-
-          velix::communication::SocketWrapper client;
-          client = server_socket->accept();
-
-          auto client_ptr =
-              std::make_shared<velix::communication::SocketWrapper>(
-                  std::move(client));
-          thread_pool_.try_submit([this, client_ptr]() mutable {
-            handle_session(std::move(*client_ptr));
-          });
-        } catch (const std::exception &e) {
-          if (running_) {
-            LOG_WARN_CTX("Bus accept error: " + std::string(e.what()), "bus",
-                         "", -1, "accept_error");
-          }
+        if (!accept_and_dispatch_once()) {
+          break;
         }
       }
     } catch (const std::exception &e) {
@@ -90,27 +86,76 @@ public:
 
   void stop() {
     running_ = false;
-    std::lock_guard<std::mutex> lock(server_mutex_);
-    if (server_socket_) {
-      server_socket_->close();
+
+    {
+      std::scoped_lock lock(server_mutex_);
+      if (server_socket_) {
+        server_socket_->close();
+      }
+    }
+
+    {
+      std::scoped_lock lock(registry_mutex_);
+      for (auto &entry : pid_sockets_) {
+        if (entry.second && entry.second->is_open()) {
+          entry.second->close();
+        }
+      }
+      pid_sockets_.clear();
+      delivery_mutexes_.clear();
+      tree_root_pid_map_.clear();
     }
   }
 
 private:
+  bool accept_and_dispatch_once() {
+    try {
+      velix::communication::SocketWrapper *server_socket = nullptr;
+      {
+        std::scoped_lock lock(server_mutex_);
+        if (server_socket_ && server_socket_->is_open()) {
+          server_socket = server_socket_.get();
+        }
+      }
+
+      if (server_socket == nullptr || !server_socket->is_open()) {
+        return false;
+      }
+
+      if (!server_socket->has_data(250)) {
+        return true;
+      }
+
+      velix::communication::SocketWrapper client = server_socket->accept();
+      auto client_ptr = std::make_shared<velix::communication::SocketWrapper>();
+      *client_ptr = std::move(client);
+      thread_pool_.try_submit([this, client_ptr]() mutable {
+        handle_session(std::move(*client_ptr));
+      });
+      return true;
+    } catch (const std::exception &e) {
+      if (running_) {
+        LOG_WARN_CTX("Bus accept error: " + std::string(e.what()), "bus", "",
+                     -1, "accept_error");
+      }
+      return running_.load();
+    }
+  }
+
   int resolve_target_pid(const json &msg, int requested_target_pid) {
     if (requested_target_pid != -1) {
       return requested_target_pid;
     }
 
-    std::lock_guard<std::mutex> lock(registry_mutex_);
-    auto handler_it = tree_root_pid_map_.find("TREE_HANDLER");
-    if (handler_it != tree_root_pid_map_.end()) {
+    std::scoped_lock lock(registry_mutex_);
+    if (const auto handler_it = tree_root_pid_map_.find("TREE_HANDLER");
+        handler_it != tree_root_pid_map_.end()) {
       return handler_it->second;
     }
 
     const std::string tree_id = msg.value("tree_id", std::string(""));
-    auto tree_it = tree_root_pid_map_.find(tree_id);
-    if (tree_it != tree_root_pid_map_.end()) {
+    if (const auto tree_it = tree_root_pid_map_.find(tree_id);
+        tree_it != tree_root_pid_map_.end()) {
       return tree_it->second;
     }
 
@@ -121,8 +166,8 @@ private:
     int registered_pid = -1;
     std::string registered_tree_id;
     bool registered_tree_root = false;
-    auto socket_ptr = std::make_shared<velix::communication::SocketWrapper>(
-        std::move(client_sock));
+    auto socket_ptr = std::make_shared<velix::communication::SocketWrapper>();
+    *socket_ptr = std::move(client_sock);
 
     try {
       while (running_ && socket_ptr->is_open()) {
@@ -136,7 +181,7 @@ private:
           registered_tree_id = msg.value("tree_id", std::string(""));
           registered_tree_root = msg.value("is_root", false);
           if (registered_pid > 0) {
-            std::lock_guard<std::mutex> lock(registry_mutex_);
+            std::scoped_lock lock(registry_mutex_);
             pid_sockets_[registered_pid] = socket_ptr;
             if (registered_tree_root && !registered_tree_id.empty()) {
               tree_root_pid_map_[registered_tree_id] = registered_pid;
@@ -159,17 +204,17 @@ private:
           }
         }
       }
-    } catch (...) {
-      // Disconnect handled by cleanup
+    } catch (const std::exception &) {
+      // Disconnect handled by cleanup.
     }
 
     if (registered_pid > 0) {
-      std::lock_guard<std::mutex> lock(registry_mutex_);
+      std::scoped_lock lock(registry_mutex_);
       pid_sockets_.erase(registered_pid);
       delivery_mutexes_.erase(registered_pid);
       if (!registered_tree_id.empty()) {
-        auto it = tree_root_pid_map_.find(registered_tree_id);
-        if (it != tree_root_pid_map_.end() && it->second == registered_pid) {
+        if (const auto it = tree_root_pid_map_.find(registered_tree_id);
+            it != tree_root_pid_map_.end() && it->second == registered_pid) {
           tree_root_pid_map_.erase(it);
         }
       }
@@ -181,7 +226,7 @@ private:
     std::shared_ptr<std::mutex> target_lock;
 
     {
-      std::lock_guard<std::mutex> lock(registry_mutex_);
+      std::scoped_lock lock(registry_mutex_);
       auto it = pid_sockets_.find(target_pid);
       if (it != pid_sockets_.end()) {
         target_socket = it->second;
@@ -201,7 +246,7 @@ private:
         push_msg["source_pid"] = source_pid;
 
         // Sequence delivery: lock the per-PID mutex
-        std::lock_guard<std::mutex> lock(*target_lock);
+        std::scoped_lock lock(*target_lock);
         velix::communication::send_json(*target_socket, push_msg.dump());
       } catch (const std::exception &e) {
         LOG_WARN_CTX("Failed to relay message to PID " +
@@ -216,7 +261,7 @@ private:
   }
 
   BusConfig config_;
-  std::atomic<bool> running_;
+  std::atomic<bool> running_{false};
   std::mutex server_mutex_;
   std::unique_ptr<velix::communication::SocketWrapper> server_socket_;
   velix::utils::ThreadPool thread_pool_{64, 256};
@@ -225,7 +270,9 @@ private:
   std::unordered_map<int, std::shared_ptr<velix::communication::SocketWrapper>>
       pid_sockets_;
   std::unordered_map<int, std::shared_ptr<std::mutex>> delivery_mutexes_;
-  std::unordered_map<std::string, int> tree_root_pid_map_;
+  std::unordered_map<std::string, int, TransparentStringHash,
+                     TransparentStringEqual>
+      tree_root_pid_map_;
 };
 
 BusService &bus_instance() {

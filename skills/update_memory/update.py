@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from runtime.sdk.python.velix_process import VelixProcess
@@ -20,6 +21,13 @@ class UpdateMemorySkill(VelixProcess):
             cur = cur.parent
         return Path.cwd()
 
+    def _extract_super_user(self, user_id: str) -> str:
+        """Accept either super_user or session_id in super_user_sN format."""
+        match = re.fullmatch(r"(.+)_s([0-9]+)", user_id)
+        if match:
+            return match.group(1)
+        return user_id
+
     def run(self) -> None:
         user_id = self.params.get("user_id", "").strip()
         target_file = self.params.get("target_file", "").strip()
@@ -38,8 +46,7 @@ class UpdateMemorySkill(VelixProcess):
             self._report_error("content is required for append")
             return
 
-        # Extract super_user: text before first '_'
-        super_user = user_id.split('_')[0]
+        super_user = self._extract_super_user(user_id)
         if not super_user:
             self._report_error("Could not determine super_user from user_id")
             return

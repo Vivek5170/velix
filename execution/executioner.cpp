@@ -10,6 +10,7 @@
 #include "../vendor/nlohmann/json.hpp"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -33,6 +34,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -44,13 +46,42 @@ namespace velix::core {
 
 namespace {
 
+class ExecutionerException : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+struct TransparentStringHash {
+    using is_transparent = void;
+
+    std::size_t operator()(std::string_view value) const noexcept {
+        return std::hash<std::string_view>{}(value);
+    }
+
+    std::size_t operator()(const std::string& value) const noexcept {
+        return operator()(std::string_view(value));
+    }
+
+    std::size_t operator()(const char* value) const noexcept {
+        return operator()(std::string_view(value));
+    }
+};
+
+struct TransparentStringEqual {
+    using is_transparent = void;
+
+    bool operator()(std::string_view lhs, std::string_view rhs) const noexcept {
+        return lhs == rhs;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // SHA-256 — portable, no external deps, standard C++/C only
 // Based on the public domain implementation by Brad Conte.
 // ---------------------------------------------------------------------------
 namespace sha256_impl {
 
-static const uint32_t K[64] = {
+inline constexpr std::array<uint32_t, 64> K = {
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,
     0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
     0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
@@ -78,17 +109,27 @@ inline uint32_t sig0(uint32_t x){ return rotr(x,7)^rotr(x,18)^(x>>3);  }
 inline uint32_t sig1(uint32_t x){ return rotr(x,17)^rotr(x,19)^(x>>10); }
 
 struct Ctx {
-    uint8_t  data[64]{};
+    std::array<uint8_t, 64> data{};
     uint32_t datalen{0};
     uint64_t bitlen{0};
-    uint32_t state[8]{
+    std::array<uint32_t, 8> state{
         0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
         0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
     };
 };
 
-static void transform(Ctx &ctx, const uint8_t *data) {
-    uint32_t a,b,c,d,e,f,g,h,t1,t2,m[64];
+void transform(Ctx &ctx, const uint8_t *data) {
+    uint32_t a;
+    uint32_t b;
+    uint32_t c;
+    uint32_t d;
+    uint32_t e;
+    uint32_t f;
+    uint32_t g;
+    uint32_t h;
+    uint32_t t1;
+    uint32_t t2;
+    std::array<uint32_t, 64> m{};
     for (int i=0,j=0;i<16;++i,j+=4)
         m[i]=(uint32_t(data[j])<<24)|(uint32_t(data[j+1])<<16)|
              (uint32_t(data[j+2])<<8)|uint32_t(data[j+3]);
@@ -105,18 +146,28 @@ static void transform(Ctx &ctx, const uint8_t *data) {
     ctx.state[4]+=e;ctx.state[5]+=f;ctx.state[6]+=g;ctx.state[7]+=h;
 }
 
-static void update(Ctx &ctx, const uint8_t *data, size_t len) {
+void update(Ctx &ctx, const uint8_t *data, size_t len) {
     for (size_t i=0;i<len;++i){
         ctx.data[ctx.datalen++]=data[i];
-        if (ctx.datalen==64){ transform(ctx,ctx.data); ctx.bitlen+=512; ctx.datalen=0; }
+        if (ctx.datalen==64){ transform(ctx,ctx.data.data()); ctx.bitlen+=512; ctx.datalen=0; }
     }
 }
 
-static std::string finalise(Ctx &ctx) {
+std::string finalise(Ctx &ctx) {
     uint32_t i=ctx.datalen;
     ctx.data[i++]=0x80;
-    if (ctx.datalen<56){ while(i<56) ctx.data[i++]=0x00; }
-    else { while(i<64) ctx.data[i++]=0x00; transform(ctx,ctx.data); memset(ctx.data,0,56); }
+    if (ctx.datalen<56){
+        while(i<56) {
+            ctx.data[i++]=0x00;
+        }
+    }
+    else {
+        while(i<64) {
+            ctx.data[i++]=0x00;
+        }
+        transform(ctx,ctx.data.data());
+        std::fill(ctx.data.begin(), ctx.data.begin() + 56, 0);
+    }
     ctx.bitlen+=uint64_t(ctx.datalen)*8;
     ctx.data[63]=uint8_t(ctx.bitlen);
     ctx.data[62]=uint8_t(ctx.bitlen>>8);
@@ -126,8 +177,8 @@ static std::string finalise(Ctx &ctx) {
     ctx.data[58]=uint8_t(ctx.bitlen>>40);
     ctx.data[57]=uint8_t(ctx.bitlen>>48);
     ctx.data[56]=uint8_t(ctx.bitlen>>56);
-    transform(ctx,ctx.data);
-    uint8_t hash[32];
+    transform(ctx,ctx.data.data());
+    std::array<uint8_t, 32> hash{};
     for (int j=0;j<4;++j){
         hash[j]    =uint8_t(ctx.state[0]>>(24-j*8));
         hash[j+4]  =uint8_t(ctx.state[1]>>(24-j*8));
@@ -139,14 +190,14 @@ static std::string finalise(Ctx &ctx) {
         hash[j+28] =uint8_t(ctx.state[7]>>(24-j*8));
     }
     std::ostringstream oss;
-    for (int j=0;j<32;++j)
-        oss<<std::hex<<std::setw(2)<<std::setfill('0')<<int(hash[j]);
+    for (const auto byte : hash)
+        oss<<std::hex<<std::setw(2)<<std::setfill('0')<<int(byte);
     return oss.str();
 }
 
 } // namespace sha256_impl
 
-static std::string sha256(const std::string &text) {
+std::string sha256(std::string_view text) {
     sha256_impl::Ctx ctx;
     sha256_impl::update(ctx,
         reinterpret_cast<const uint8_t*>(text.data()), text.size());
@@ -162,20 +213,25 @@ public:
                            int wait_ms   = 30000,
                            int retry_ms  = 50) {
 #ifndef _WIN32
-        fd_ = ::open(lock_file.string().c_str(), O_CREAT | O_RDWR, 0644);
+        fd_ = ::open(lock_file.string().c_str(), O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
         if (fd_ < 0)
-            throw std::runtime_error("lock open failed: " + lock_file.string());
+            throw ExecutionerException("lock open failed: " + lock_file.string());
+        // Enforce owner-only permissions even when opening an existing lock file.
+        if (::fchmod(fd_, S_IRUSR | S_IWUSR) != 0) {
+            ::close(fd_); fd_ = -1;
+            throw ExecutionerException("lock chmod failed: " + lock_file.string());
+        }
         const int attempts = std::max(1, wait_ms / std::max(1, retry_ms));
         for (int i = 0; i < attempts; ++i) {
             if (::flock(fd_, LOCK_EX | LOCK_NB) == 0) return;
             if (errno != EWOULDBLOCK && errno != EAGAIN) {
                 ::close(fd_); fd_ = -1;
-                throw std::runtime_error("lock acquire failed: " + lock_file.string());
+                throw ExecutionerException("lock acquire failed: " + lock_file.string());
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(retry_ms));
         }
         ::close(fd_); fd_ = -1;
-        throw std::runtime_error("lock timeout: " + lock_file.string());
+        throw ExecutionerException("lock timeout: " + lock_file.string());
 #else
         handle_ = CreateFileA(lock_file.string().c_str(),
                               GENERIC_WRITE, 0, nullptr,
@@ -189,7 +245,7 @@ public:
                                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (handle_ != INVALID_HANDLE_VALUE) return;
             }
-            throw std::runtime_error("lock timeout: " + lock_file.string());
+            throw ExecutionerException("lock timeout: " + lock_file.string());
         }
 #endif
     }
@@ -226,7 +282,7 @@ struct ExecutionerConfig {
     std::string cache_root          = ".velix/build_cache";
 };
 
-static ExecutionerConfig load_config() {
+ExecutionerConfig load_config() {
     ExecutionerConfig cfg;
     for (const char *p : {"config/executioner.json",
                           "../config/executioner.json",
@@ -270,7 +326,7 @@ public:
     // Followers must call wait().
     std::pair<std::shared_ptr<PrepareSlot>, bool>
     enter(const std::string &key) {
-        std::lock_guard<std::mutex> g(mu_);
+        std::scoped_lock g(mu_);
         auto it = map_.find(key);
         if (it != map_.end())
             return {it->second, false};
@@ -281,7 +337,7 @@ public:
 
     void finish(const std::string &key, std::shared_ptr<PrepareSlot> slot) {
         {
-            std::lock_guard<std::mutex> g(slot->mu);
+            std::scoped_lock g(slot->mu);
             slot->state = PrepareSlot::State::ready;
         }
         slot->cv.notify_all();
@@ -291,7 +347,7 @@ public:
     void fail(const std::string &key, std::shared_ptr<PrepareSlot> slot,
               const std::string &error) {
         {
-            std::lock_guard<std::mutex> g(slot->mu);
+            std::scoped_lock g(slot->mu);
             slot->state = PrepareSlot::State::failed;
             slot->error = error;
         }
@@ -320,12 +376,13 @@ public:
 
 private:
     void erase(const std::string &key) {
-        std::lock_guard<std::mutex> g(mu_);
+        std::scoped_lock g(mu_);
         map_.erase(key);
     }
 
     std::mutex mu_;
-    std::unordered_map<std::string, std::shared_ptr<PrepareSlot>> map_;
+    std::unordered_map<std::string, std::shared_ptr<PrepareSlot>,
+                       TransparentStringHash, TransparentStringEqual> map_;
 };
 
 // ---------------------------------------------------------------------------
@@ -360,7 +417,8 @@ public:
 
 private:
     mutable std::shared_mutex mu_;
-    std::unordered_map<std::string, CachedPackage> map_;
+    std::unordered_map<std::string, CachedPackage,
+                       TransparentStringHash, TransparentStringEqual> map_;
 };
 
 // ---------------------------------------------------------------------------
@@ -382,7 +440,7 @@ public:
             const std::string host =
                 velix::communication::resolve_bind_host("EXECUTIONER", "127.0.0.1");
             {
-                std::lock_guard<std::mutex> lk(server_mu_);
+                std::scoped_lock lk(server_mu_);
                 server_socket_ = std::make_unique<velix::communication::SocketWrapper>();
                 server_socket_->create_tcp_socket();
                 server_socket_->bind(host, static_cast<uint16_t>(port));
@@ -396,7 +454,7 @@ public:
 #endif
                 std::shared_ptr<velix::communication::SocketWrapper> srv;
                 {
-                    std::lock_guard<std::mutex> lk(server_mu_);
+                    std::scoped_lock lk(server_mu_);
                     if (!server_socket_ || !server_socket_->is_open()) break;
                     // non-owning view — safe because stop() waits for accept loop to exit
                     srv = std::shared_ptr<velix::communication::SocketWrapper>(
@@ -427,21 +485,28 @@ public:
                                 const json r = {{"status","error"},
                                     {"error","executioner_busy"}};
                                 velix::communication::send_json(*cp, r.dump());
-                            } catch (...) {}
+                            } catch (const std::exception &) {
+                                // Best-effort busy response only.
+                            }
                         }).detach();
-                    } catch (...) {}
+                    } catch (const std::system_error &) {
+                        // Thread creation failure while rejecting under load.
+                    }
                 }
             }
         } catch (const std::exception &e) {
+            const bool was_running = running_.load();
             running_ = false;
-            LOG_ERROR("Executioner startup failed: " + std::string(e.what()));
+            if (was_running) {
+                LOG_ERROR("Executioner startup failed: " + std::string(e.what()));
+            }
             throw;
         }
     }
 
     void stop() {
         running_ = false;
-        std::lock_guard<std::mutex> lk(server_mu_);
+        std::scoped_lock lk(server_mu_);
         if (server_socket_ && server_socket_->is_open())
             server_socket_->close();
 #ifndef _WIN32
@@ -562,10 +627,10 @@ private:
             feed(p.lexically_relative(pkg_path).string());
             feed("\n");
             std::ifstream in(p, std::ios::binary);
-            char buf[65536];
-            while (in.read(buf, sizeof(buf)) || in.gcount() > 0) {
+            std::array<char, 65536> buf{};
+            while (in.read(buf.data(), static_cast<std::streamsize>(buf.size())) || in.gcount() > 0) {
                 sha256_impl::update(ctx,
-                    reinterpret_cast<const uint8_t*>(buf),
+                    reinterpret_cast<const uint8_t*>(buf.data()),
                     static_cast<size_t>(in.gcount()));
             }
             feed("\n");
@@ -837,7 +902,7 @@ private:
                                     LOG_WARN("Cache stale state '" + sv +
                                              "', re-preparing: " + cache_dir.string());
                                 }
-                            } catch (...) {
+                            } catch (const json::exception &) {
                                 fs::remove(status_file, ec);
                                 LOG_WARN("Corrupt status file, re-preparing: " +
                                          status_file.string());
@@ -881,7 +946,9 @@ private:
                             out << json({{"status","failed"},
                                          {"error",fail_reason},
                                          {"log_file",prepare_log.string()}}).dump(2);
-                        } catch (...) {}
+                        } catch (const std::exception &) {
+                            // Keep original prepare failure as primary signal.
+                        }
                         coalescer_.fail(cache_key, slot, fail_reason);
                         return prep;
                     }
@@ -891,7 +958,7 @@ private:
                         FileLockGuard fl(lock_file, config_.cache_lock_wait_ms);
                         std::ofstream out(status_file);
                         out << json({{"status","ready"}}).dump(2);
-                    } catch (...) {
+                    } catch (const std::exception &) {
                         // Non-fatal: cache will re-prepare next time
                         LOG_WARN("Failed to write ready status: " + status_file.string());
                     }

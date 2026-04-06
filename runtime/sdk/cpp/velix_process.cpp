@@ -7,6 +7,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <string_view>
 #include <stdexcept>
 #include <vector>
 
@@ -15,8 +16,8 @@
 #include "../../../utils/string_utils.hpp"
 
 #ifdef _WIN32
-#include <psapi.h>
-#include <windows.h>
+#include <Psapi.h>
+#include <Windows.h>
 #else
 #include <signal.h>
 #include <sys/types.h>
@@ -27,57 +28,77 @@ namespace velix {
 namespace core {
 
 namespace {
-bool is_supported_intent_value(const std::string &intent) {
+bool is_supported_intent_value(std::string_view intent) {
   return intent == "JOIN_PARENT_TREE" || intent == "NEW_TREE";
+}
+
+std::optional<std::string> read_env_var(const char *name) {
+#ifdef _WIN32
+  char *value = nullptr;
+  std::size_t len = 0;
+  const errno_t err = _dupenv_s(&value, &len, name);
+  if (err != 0 || value == nullptr) {
+    return std::nullopt;
+  }
+
+  std::string out(value);
+  std::free(value);
+  return out;
+#else
+  if (const char *value = std::getenv(name); value != nullptr) {
+    return std::string(value);
+  }
+  return std::nullopt;
+#endif
 }
 
 // Helper function to parse environment variables
 void parse_environment_variables(int &parent_pid, std::string &entry_trace_id,
                                  std::string &launch_intent, json &params,
                                  std::string &user_id) {
-  char *env_parent_pid = std::getenv("VELIX_PARENT_PID");
-  if (env_parent_pid) {
-    parent_pid = std::atoi(env_parent_pid);
+  if (const auto env_parent_pid = read_env_var("VELIX_PARENT_PID");
+      env_parent_pid.has_value()) {
+    parent_pid = std::atoi(env_parent_pid->c_str());
   }
 
-  char *env_trace_id = std::getenv("VELIX_TRACE_ID");
-  if (env_trace_id) {
-    entry_trace_id = env_trace_id;
+  if (const auto env_trace_id = read_env_var("VELIX_TRACE_ID");
+      env_trace_id.has_value()) {
+    entry_trace_id = *env_trace_id;
   }
 
-  char *env_intent = std::getenv("VELIX_INTENT");
-  if (env_intent) {
-    launch_intent = env_intent;
+  if (const auto env_intent = read_env_var("VELIX_INTENT");
+      env_intent.has_value()) {
+    launch_intent = *env_intent;
   }
 
-  char *env_params = std::getenv("VELIX_PARAMS");
-  if (env_params) {
+  if (const auto env_params = read_env_var("VELIX_PARAMS");
+      env_params.has_value()) {
     try {
-      params = json::parse(env_params);
-    } catch (...) {
+      params = json::parse(*env_params);
+    } catch (const nlohmann::json::parse_error &) {
       params = json::object();
     }
   }
 
-  char *env_user_id = std::getenv("VELIX_USER_ID");
-  if (env_user_id) {
-    user_id = env_user_id;
+  if (const auto env_user_id = read_env_var("VELIX_USER_ID");
+      env_user_id.has_value()) {
+    user_id = *env_user_id;
   }
 }
 
 // Helper function for intent validation
-std::string validate_launch_intent(const std::string &role, int parent_pid,
-                                   const std::string &launch_intent) {
+std::string validate_launch_intent(std::string_view role, int parent_pid,
+                                   std::string_view launch_intent) {
   if (launch_intent != "JOIN_PARENT_TREE" && launch_intent != "NEW_TREE") {
     if (role == "handler") {
       return "JOIN_PARENT_TREE";
     }
     return (parent_pid > 0) ? "JOIN_PARENT_TREE" : "NEW_TREE";
   }
-  return launch_intent;
+  return std::string(launch_intent);
 }
 
-bool is_transient_socket_error(const std::string &err) {
+bool is_transient_socket_error(std::string_view err) {
   return err.find("timed out") != std::string::npos ||
          err.find("timeout") != std::string::npos ||
          err.find("errno 11") != std::string::npos ||
@@ -107,12 +128,12 @@ void connect_with_retries(velix::communication::SocketWrapper &socket,
   }
 }
 
-std::string resolve_effective_mode(const std::string &mode,
-                                   const std::string &convo_id,
-                                   const std::string &effective_user_id,
+std::string resolve_effective_mode(std::string_view mode,
+                                   std::string_view convo_id,
+                                   std::string_view effective_user_id,
                                    bool is_handler) {
   if (!mode.empty()) {
-    return mode;
+    return std::string(mode);
   }
   if (convo_id.empty() && effective_user_id.empty()) {
     return "simple";
@@ -243,22 +264,32 @@ VelixProcess::VelixProcess(std::string name, std::string r)
 #endif
 }
 
-VelixProcess::~VelixProcess() {
-  shutdown();
+VelixProcess::~VelixProcess() noexcept {
+  try {
+    shutdown_impl(false);
+  } catch (...) {
+  }
   VelixProcess::instance_ = nullptr;
 }
 
 void VelixProcess::shutdown() {
+  shutdown_impl(true);
+}
+
+void VelixProcess::shutdown_impl(bool invoke_hook) {
   if (is_running.load()) {
     is_running.store(false);
     force_terminate.store(true);
 
-    try {
-      on_shutdown();
-    } catch (const std::exception &e) {
-      LOG_WARN("VelixProcess on_shutdown() failed: " + std::string(e.what()));
-    } catch (...) {
-      LOG_WARN("VelixProcess on_shutdown() failed with unknown exception");
+    if (invoke_hook) {
+      try {
+        on_shutdown();
+      } catch (const std::exception &e) {
+        LOG_WARN("VelixProcess on_shutdown() failed: " +
+                 std::string(e.what()));
+      } catch (...) {
+        LOG_WARN("VelixProcess on_shutdown() failed with unknown exception");
+      }
     }
 
     // Wake up the idle IO thread immediately so it can send the final heartbeat

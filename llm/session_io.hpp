@@ -17,12 +17,11 @@ namespace velix::llm {
 // ── Conversation struct ────────────────────────────────────────────────────
 //
 // Two types:
-//   "user"    – permanent, one per user_id, owned by no specific pid.
-//               Only processes in TREE_HANDLER can use them.
-//               Storage: memory/conversations/users/{sanitized_user_id}.json
+//   "user"    – session-based user context addressed by session_id.
+//               Storage: memory/sessions/users/{super_user}/{session_id}/{session_id}.json
 //
 //   "process" – ephemeral, bound to creator_pid; only that pid can use it.
-//               Storage: memory/conversations/proc/{creator_pid}/{convo_id}.json
+//               Storage: memory/sessions/procs/{creator_pid}/{session_id}/{session_id}.json
 //
 struct Conversation {
 	std::string convo_id;
@@ -34,18 +33,18 @@ struct Conversation {
 	long last_activity_ms = 0;
 
 	int turn_count = 0;
+	uint64_t current_context_tokens = 0;
 	uint64_t total_tokens_used = 0;
-
 	std::vector<json> messages;      // [{role, content, timestamp_ms}, ...]
 	json metadata = json::object();  // reserved for future per-convo policy
 };
 
-// ── ConversationManager ───────────────────────────────────────────────────
+// ── SessionIO ───────────────────────────────────────────────────
 
-class ConversationManager {
+class SessionIO {
 public:
-	explicit ConversationManager(const std::string& storage_path = "memory/conversations");
-	~ConversationManager();
+	explicit SessionIO(const std::string& storage_path = "memory/sessions");
+	~SessionIO();
 
 	// ── Request normalisation ─────────────────────────────────────────────
 
@@ -57,8 +56,8 @@ public:
 	 *       → stateless request
 	 *   { mode:"conversation", user_id:"", convo_id:""|"proc_N_XXXXX", source_pid:N }
 	 *       → process conversation; empty convo_id creates a new process convo
-	 *   { mode:"user_conversation", user_id:"alice", convo_id:"", source_pid:N, tree_id:"TREE_HANDLER" }
-	 *       → user conversation with deterministic id user_{sanitized_user_id}
+	 *   { mode:"user_conversation", user_id:"terminal_vivek_s1", convo_id:"", source_pid:N, tree_id:"TREE_HANDLER" }
+	 *       → user session conversation keyed by the provided session_id
 	 *
 	 * Always sets resolved convo_id and user_id on the normalised output so the
 	 * scheduler can pass them to the supervisor for access validation.
@@ -85,14 +84,16 @@ public:
 	 * No-op for simple mode.
 	 */
 	bool persist_assistant_response(const json& normalized_request,
-	                                const std::string& assistant_text);
+	                                const std::string& assistant_text,
+	                                uint64_t tokens_used = 0);
 
 	/**
 	 * Persist an assistant turn that includes tool_calls. Content may be empty.
 	 */
 	bool persist_assistant_tool_call(const json& normalized_request,
 	                                 const std::string& assistant_text,
-	                                 const json& tool_calls);
+	                                 const json& tool_calls,
+	                                 uint64_t tokens_used = 0);
 
 	// ── CRUD ──────────────────────────────────────────────────────────────
 
@@ -161,7 +162,7 @@ private:
 	std::string process_convo_path(int creator_pid, const std::string& convo_id) const;
 	std::string convo_path_from_struct(const Conversation& convo) const;
 
-	/** Infer storage path from convo_id prefix ("user_" vs "proc_"). */
+	/** Infer storage path from session_id/convo_id naming conventions. */
 	std::string infer_convo_path(const std::string& convo_id) const;
 
 	std::string generate_process_convo_id(int creator_pid);

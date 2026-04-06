@@ -55,18 +55,6 @@
  *      "pattern_key":"...", "description":"..." }
  */
 
-// ─── Platform detection
-// ───────────────────────────────────────────────────────
-#if defined(_WIN32) || defined(_WIN64)
-#define VELIX_WINDOWS 1
-#elif defined(__APPLE__)
-#define VELIX_MACOS 1
-#define VELIX_POSIX 1
-#else
-#define VELIX_LINUX 1
-#define VELIX_POSIX 1
-#endif
-
 #include "../../runtime/sdk/cpp/velix_process.hpp"
 #include "../../utils/string_utils.hpp"
 
@@ -80,6 +68,7 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <set>
 #include <stdexcept>
@@ -89,26 +78,26 @@
 
 // ── POSIX-only headers
 // ────────────────────────────────────────────────────────
-#ifdef VELIX_POSIX
+#if !defined(_WIN32) && !defined(_WIN64)
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
-#ifdef VELIX_MACOS
+#if defined(__APPLE__)
 #include <util.h> // forkpty on macOS (links -lutil)
 #endif
-#ifdef VELIX_LINUX
+#if !defined(__APPLE__)
 #include <pty.h> // forkpty on Linux (links -lutil)
 #endif
 #endif
 
 // ── Windows-only headers
 // ──────────────────────────────────────────────────────
-#ifdef VELIX_WINDOWS
+#if defined(_WIN32) || defined(_WIN64)
 #define WIN32_LEAN_AND_MEAN
 #include <processthreadsapi.h> // ConPTY
-#include <windows.h>
+#include <Windows.h>
 #include <winternl.h>
 // ConPTY requires Windows 10 1809+
 #endif
@@ -135,13 +124,54 @@ struct TerminalConfig {
   std::vector<std::string> entries;
 };
 
-static TerminalConfig g_cfg;
-static std::mutex g_skill_log_mx;
+class TerminalSkillException : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+static TerminalConfig &skill_config() {
+  static TerminalConfig cfg;
+  return cfg;
+}
+
+static std::mutex &skill_log_mutex() {
+  static std::mutex mx;
+  return mx;
+}
+
+static std::mutex &approval_mutex() {
+  static std::mutex mx;
+  return mx;
+}
+
+static std::set<std::string, std::less<>> &session_allowlist() {
+  static std::set<std::string, std::less<>> allowlist;
+  return allowlist;
+}
+
+static std::optional<std::string> read_env_var(const char *name) {
+#if defined(_WIN32) || defined(_WIN64)
+  char *value = nullptr;
+  std::size_t len = 0;
+  const errno_t err = _dupenv_s(&value, &len, name);
+  if (err != 0 || value == nullptr) {
+    return std::nullopt;
+  }
+  std::string out(value);
+  std::free(value);
+  return out;
+#else
+  if (const char *value = std::getenv(name); value != nullptr) {
+    return std::string(value);
+  }
+  return std::nullopt;
+#endif
+}
 
 static void skill_log(const std::string &stage,
                       const json &fields = json::object()) {
   try {
-    std::lock_guard<std::mutex> lock(g_skill_log_mx);
+    std::scoped_lock lock(skill_log_mutex());
     fs::create_directories("logs");
     std::ofstream out("logs/approval_trace.log", std::ios::app);
     if (!out.is_open()) {
@@ -154,7 +184,7 @@ static void skill_log(const std::string &stage,
         {"stage", stage},
         {"fields", fields}};
     out << record.dump() << "\n";
-  } catch (...) {
+  } catch (const std::exception &) {
     // Best-effort logging only.
   }
 }
@@ -162,12 +192,12 @@ static void skill_log(const std::string &stage,
 static std::string expand_home(const std::string &p) {
   if (p.empty() || p[0] != '~')
     return p;
-#ifdef VELIX_WINDOWS
-  const char *h = std::getenv("USERPROFILE");
+#if defined(_WIN32) || defined(_WIN64)
+  const auto h = read_env_var("USERPROFILE");
 #else
-  const char *h = std::getenv("HOME");
+  const auto h = read_env_var("HOME");
 #endif
-  return std::string(h ? h : "/tmp") + p.substr(1);
+  return std::string(h.has_value() ? *h : "/tmp") + p.substr(1);
 }
 
 static TerminalConfig load_config(const std::string &path) {
@@ -179,17 +209,16 @@ static TerminalConfig load_config(const std::string &path) {
                   std::istreambuf_iterator<char>());
   try {
     json j = json::parse(raw, nullptr, true, true);
-    auto gs = [](const json &o, const char *k,
-                 const std::string &d) -> std::string {
+    auto gs = [](const json &o, const char *k, const std::string &d) {
       return (o.contains(k) && o[k].is_string()) ? o[k].get<std::string>() : d;
     };
-    auto gi = [](const json &o, const char *k, int d) -> int {
+    auto gi = [](const json &o, const char *k, int d) {
       return (o.contains(k) && o[k].is_number()) ? o[k].get<int>() : d;
     };
-    auto gb = [](const json &o, const char *k, bool d) -> bool {
+    auto gb = [](const json &o, const char *k, bool d) {
       return (o.contains(k) && o[k].is_boolean()) ? o[k].get<bool>() : d;
     };
-    auto gz = [](const json &o, const char *k, size_t d) -> size_t {
+    auto gz = [](const json &o, const char *k, size_t d) {
       return (o.contains(k) && o[k].is_number()) ? o[k].get<size_t>() : d;
     };
 
@@ -218,7 +247,7 @@ static TerminalConfig load_config(const std::string &path) {
           if (e.is_string())
             cfg.entries.push_back(e.get<std::string>());
     }
-  } catch (...) {
+  } catch (const nlohmann::json::exception &) {
   }
   return cfg;
 }
@@ -227,15 +256,12 @@ static TerminalConfig load_config(const std::string &path) {
 //  Allowlist
 // ============================================================================
 
-static std::mutex g_al_mx;
-static std::set<std::string> g_session_al;
-
 static fs::path perm_al_path() {
-  return fs::path(expand_home(g_cfg.permanent_path));
+  return fs::path(expand_home(skill_config().permanent_path));
 }
 
-static std::set<std::string> load_perm_al() {
-  std::set<std::string> out;
+static std::set<std::string, std::less<>> load_perm_al() {
+  std::set<std::string, std::less<>> out;
   std::ifstream f(perm_al_path());
   std::string line;
   while (std::getline(f, line)) {
@@ -246,7 +272,7 @@ static std::set<std::string> load_perm_al() {
   return out;
 }
 
-static void save_perm_al(const std::set<std::string> &keys) {
+static void save_perm_al(const std::set<std::string, std::less<>> &keys) {
   auto p = perm_al_path();
   fs::create_directories(p.parent_path());
   std::ofstream f(p, std::ios::trunc);
@@ -256,24 +282,24 @@ static void save_perm_al(const std::set<std::string> &keys) {
 }
 
 static bool is_approved(const std::string &key) {
-  std::lock_guard<std::mutex> lk(g_al_mx);
-  for (const auto &e : g_cfg.entries)
+  std::scoped_lock lk(approval_mutex());
+  for (const auto &e : skill_config().entries)
     if (e == key)
       return true;
-  if (g_session_al.count(key))
+  if (session_allowlist().count(key))
     return true;
   return load_perm_al().count(key) > 0;
 }
 static void approve_session(const std::string &key) {
-  std::lock_guard<std::mutex> lk(g_al_mx);
-  g_session_al.insert(key);
+  std::scoped_lock lk(approval_mutex());
+  session_allowlist().insert(key);
 }
 static void approve_permanent(const std::string &key) {
-  std::lock_guard<std::mutex> lk(g_al_mx);
+  std::scoped_lock lk(approval_mutex());
   auto p = load_perm_al();
   p.insert(key);
   save_perm_al(p);
-  g_session_al.insert(key);
+  session_allowlist().insert(key);
 }
 
 // ============================================================================
@@ -372,21 +398,22 @@ static DetectResult detect_dangerous(const std::string &cmd) {
 static fs::path resolve_cwd(const std::string &mode, const std::string &sub) {
   fs::path base;
   if (mode == "tmp")
-    base = fs::path(g_cfg.playground_root) / "tmp";
+    base = fs::path(skill_config().playground_root) / "tmp";
   else if (mode == "repo")
-    base = fs::path(g_cfg.playground_root) / "repo";
+    base = fs::path(skill_config().playground_root) / "repo";
   else
-    base = fs::path(g_cfg.playground_root);
+    base = fs::path(skill_config().playground_root);
   if (!sub.empty())
     base /= sub;
 
   fs::path abs = fs::weakly_canonical(fs::absolute(base));
-  fs::path root = fs::weakly_canonical(fs::absolute(g_cfg.playground_root));
+  fs::path root =
+      fs::weakly_canonical(fs::absolute(skill_config().playground_root));
 
-  if (!g_cfg.allow_path_escape) {
+  if (!skill_config().allow_path_escape) {
     auto rs = fs::relative(abs, root).native();
     if (rs.size() >= 2 && rs[0] == '.' && rs[1] == '.')
-      throw std::runtime_error("cwd escapes sandbox: " + abs.string());
+      throw TerminalSkillException("cwd escapes sandbox: " + abs.string());
   }
   fs::create_directories(abs);
   return abs;
@@ -407,7 +434,7 @@ struct ExecResult {
 // ============================================================================
 
 static std::string trunc(const std::string &s) {
-  size_t mx = g_cfg.max_output_chars;
+  size_t mx = skill_config().max_output_chars;
   if (s.size() <= mx)
     return s;
   size_t head = mx * 2 / 5, tail = mx - head, omit = s.size() - head - tail;
@@ -419,7 +446,7 @@ static std::string trunc(const std::string &s) {
 //  POSIX — plain pipe exec  (foreground + background non-PTY)
 // ============================================================================
 
-#ifdef VELIX_POSIX
+#if !defined(_WIN32) && !defined(_WIN64)
 
 static ExecResult posix_exec(const std::string &cmd,
                              const std::vector<std::string> &args,
@@ -432,11 +459,11 @@ static ExecResult posix_exec(const std::string &cmd,
 
   int so[2], se[2];
   if (::pipe(so) || ::pipe(se))
-    throw std::runtime_error("pipe: " + std::string(strerror(errno)));
+    throw TerminalSkillException("pipe: " + std::string(strerror(errno)));
 
   pid_t pid = ::fork();
   if (pid < 0)
-    throw std::runtime_error("fork: " + std::string(strerror(errno)));
+    throw TerminalSkillException("fork: " + std::string(strerror(errno)));
 
   if (pid == 0) {
     ::close(so[0]);
@@ -525,7 +552,7 @@ static ExecResult posix_exec_pty(const std::string &cmd,
   int master_fd = -1;
   pid_t pid = ::forkpty(&master_fd, nullptr, nullptr, &ws);
   if (pid < 0)
-    throw std::runtime_error("forkpty: " + std::string(strerror(errno)));
+    throw TerminalSkillException("forkpty: " + std::string(strerror(errno)));
 
   if (pid == 0) {
     // Child — we already have a controlling terminal from forkpty
@@ -591,13 +618,13 @@ static ExecResult posix_exec_pty(const std::string &cmd,
   return res;
 }
 
-#endif // VELIX_POSIX
+#endif // POSIX
 
 // ============================================================================
 //  Windows exec  (CreateProcess — plain pipes)
 // ============================================================================
 
-#ifdef VELIX_WINDOWS
+#if defined(_WIN32) || defined(_WIN64)
 
 static ExecResult win_exec(const std::string &cmd,
                            const std::vector<std::string> &args,
@@ -611,7 +638,7 @@ static ExecResult win_exec(const std::string &cmd,
   HANDLE hStdoutR, hStdoutW, hStderrR, hStderrW;
   if (!CreatePipe(&hStdoutR, &hStdoutW, &sa, 0) ||
       !CreatePipe(&hStderrR, &hStderrW, &sa, 0))
-    throw std::runtime_error("CreatePipe failed");
+    throw TerminalSkillException("CreatePipe failed");
   SetHandleInformation(hStdoutR, HANDLE_FLAG_INHERIT, 0);
   SetHandleInformation(hStderrR, HANDLE_FLAG_INHERIT, 0);
 
@@ -630,8 +657,8 @@ static ExecResult win_exec(const std::string &cmd,
     CloseHandle(hStdoutW);
     CloseHandle(hStderrR);
     CloseHandle(hStderrW);
-    throw std::runtime_error("CreateProcess failed: " +
-                             std::to_string(GetLastError()));
+    throw TerminalSkillException("CreateProcess failed: " +
+                   std::to_string(GetLastError()));
   }
   CloseHandle(hStdoutW);
   CloseHandle(hStderrW);
@@ -747,8 +774,8 @@ static ExecResult win_exec_pty(const std::string &cmd,
   if (!ok) {
     fnClose(hPC);
     CloseHandle(hPipeOutR);
-    throw std::runtime_error("CreateProcessW (ConPTY) failed: " +
-                             std::to_string(GetLastError()));
+    throw TerminalSkillException("CreateProcessW (ConPTY) failed: " +
+                                 std::to_string(GetLastError()));
   }
 
   // Read output
@@ -780,7 +807,7 @@ static ExecResult win_exec_pty(const std::string &cmd,
   return res;
 }
 
-#endif // VELIX_WINDOWS
+#endif // WINDOWS
 
 // ============================================================================
 //  Platform dispatcher
@@ -789,11 +816,11 @@ static ExecResult win_exec_pty(const std::string &cmd,
 static ExecResult run_cmd(const std::string &cmd,
                           const std::vector<std::string> &args,
                           const fs::path &cwd, int timeout_sec, bool use_pty) {
-#ifdef VELIX_POSIX
+#if !defined(_WIN32) && !defined(_WIN64)
   return use_pty ? posix_exec_pty(cmd, args, cwd, timeout_sec)
                  : posix_exec(cmd, args, cwd, timeout_sec);
 #endif
-#ifdef VELIX_WINDOWS
+#if defined(_WIN32) || defined(_WIN64)
   return use_pty ? win_exec_pty(cmd, args, cwd, timeout_sec)
                  : win_exec(cmd, args, cwd, timeout_sec);
 #endif
@@ -817,7 +844,7 @@ normalize_exec_request(const std::string &cmd,
   if (!looks_like_shell_command(cmd, args)) {
     return {cmd, args};
   }
-#ifdef VELIX_WINDOWS
+#if defined(_WIN32) || defined(_WIN64)
   return {"cmd.exe", {"/C", cmd}};
 #else
   return {"/bin/sh", {"-lc", cmd}};
@@ -845,12 +872,12 @@ public:
 
   void run() override {
     // ── 0. Config ───────────────────────────────────────────────────────
-    g_cfg = load_config("../../config/terminal.json");
+    skill_config() = load_config("../../config/terminal.json");
 
     // ── 1. Parse params ─────────────────────────────────────────────────
     std::string cmd = params.value("cmd", "");
-    int timeout_sec = params.value("timeout_sec", g_cfg.default_timeout_sec);
-    timeout_sec = std::clamp(timeout_sec, 1, g_cfg.max_timeout_sec);
+    int timeout_sec = params.value("timeout_sec", skill_config().default_timeout_sec);
+    timeout_sec = std::clamp(timeout_sec, 1, skill_config().max_timeout_sec);
     std::string cwd_mode = params.value("cwd_mode", "playground");
     std::string sub_cwd = params.value("cwd", "");
     bool use_pty = params.value("pty", false);
@@ -976,12 +1003,12 @@ private:
       skill_log("approval_skip_force", {{"command", full_cmd}});
       return approved_ok("force flag set");
     }
-    if (g_cfg.approval_mode == "off") {
+    if (skill_config().approval_mode == "off") {
       skill_log("approval_skip_mode_off", {{"command", full_cmd}});
       return approved_ok("approval disabled");
     }
 
-    bool must_prompt = (g_cfg.approval_mode == "manual");
+    bool must_prompt = (skill_config().approval_mode == "manual");
     DetectResult det;
     if (!must_prompt) {
       det = detect_dangerous(full_cmd);
@@ -1039,8 +1066,9 @@ private:
     // Register hook under approval_mx so bus_listener_thread
     // always sees either nullptr or a fully constructed lambda.
     {
-      std::lock_guard<std::mutex> lk(approval_mx);
-      on_bus_event = [&, trace](const json &msg) {
+      std::scoped_lock lk(approval_mx);
+      on_bus_event = [&approval_mx, &approval_cv, &got_reply, &reply_scope,
+                      trace](const json &msg) {
         // Called from bus_listener_thread — must be fast.
         if (msg.value("purpose", "") != "APPROVAL_REPLY")
           return;
@@ -1048,7 +1076,7 @@ private:
         if (pl.value("approval_trace", "") != trace)
           return;
 
-        std::lock_guard<std::mutex> ilk(approval_mx);
+        std::scoped_lock ilk(approval_mx);
         reply_scope = pl.value("scope", "deny");
         got_reply = true;
         skill_log("approval_reply_received",
@@ -1066,20 +1094,20 @@ private:
                   {"pattern_key", pattern_key}});
     skill_log("approval_request_sent",
           {{"approval_trace", trace},
-           {"timeout_sec", g_cfg.approval_timeout}});
+           {"timeout_sec", skill_config().approval_timeout}});
 
     bool timed_out_flag;
     {
       std::unique_lock<std::mutex> lk(approval_mx);
       skill_log("approval_wait_start", {{"approval_trace", trace}});
       timed_out_flag = !approval_cv.wait_for(
-          lk, std::chrono::seconds(g_cfg.approval_timeout),
+          lk, std::chrono::seconds(skill_config().approval_timeout),
           [&] { return got_reply; });
     }
 
     // Safely clear the hook
     {
-      std::lock_guard<std::mutex> lk(approval_mx);
+      std::scoped_lock lk(approval_mx);
       on_bus_event = nullptr;
     }
 
@@ -1087,7 +1115,7 @@ private:
       skill_log("approval_wait_timeout", {{"approval_trace", trace}});
       return {false, ApprovalScope::Deny,
               "Approval timed out after " +
-                  std::to_string(g_cfg.approval_timeout) + "s — denied.",
+                  std::to_string(skill_config().approval_timeout) + "s — denied.",
               pattern_key, description};
     }
 
@@ -1149,7 +1177,7 @@ int main() {
   TerminalSkill skill;
   try {
     skill.start();
-  } catch (const std::exception &ex) {
+  } catch (const std::exception &) {
     return 1;
   }
   return 0;

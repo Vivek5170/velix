@@ -16,8 +16,7 @@
 
 using json = nlohmann::json;
 
-namespace velix {
-namespace core {
+namespace velix::core {
 
 enum class ProcessStatus { STARTING, RUNNING, WAITING_LLM, FINISHED, ERROR };
 
@@ -28,7 +27,7 @@ public:
   // Global singleton pointer for OS Signal Handlers
   static VelixProcess *instance_;
 
-  virtual ~VelixProcess();
+  virtual ~VelixProcess() noexcept;
 
   // The single entrypoint for the Agent Developer to override
   virtual void run() = 0;
@@ -152,13 +151,17 @@ protected:
   // RAII Termination Reporter
   struct ResultGuard {
     VelixProcess *proc;
-    ResultGuard(VelixProcess *p) : proc(p) {}
-    ~ResultGuard() {
-      if (proc && !proc->result_reported && proc->parent_pid > 0) {
-        json completion = {{"status", "completed"},
-                           {"exit_reason", "normal"},
-                           {"pid", proc->velix_pid}};
-        proc->report_result(proc->parent_pid, completion, proc->entry_trace_id);
+    explicit ResultGuard(VelixProcess *p) : proc(p) {}
+    ~ResultGuard() noexcept {
+      try {
+        if (proc && !proc->result_reported && proc->parent_pid > 0) {
+          json completion = {{"status", "completed"},
+                             {"exit_reason", "normal"},
+                             {"pid", proc->velix_pid}};
+          proc->report_result(proc->parent_pid, completion,
+                              proc->entry_trace_id);
+        }
+      } catch (...) {
       }
     }
   };
@@ -166,6 +169,7 @@ protected:
   // Internal SDK Methods
   void run_kernel_io_loop();
   void bus_listener_loop(); // Handles IPM_PUSH messages from the router
+  void shutdown_impl(bool invoke_hook);
   uint64_t get_current_memory_usage_mb() const;
   std::string call_llm_internal(
       const std::string &convo_id, const std::string &user_message,
@@ -189,7 +193,6 @@ protected:
   static int resolve_port(const std::string &service_name, int fallback);
 };
 
-} // namespace core
-} // namespace velix
+} // namespace velix::core
 
 #endif // VELIX_PROCESS_HPP

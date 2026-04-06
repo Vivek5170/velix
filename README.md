@@ -127,10 +127,6 @@ Terminal 1:
 ./build/integration_kernel
 ```
 
-Terminal 2:
-
-```bash
-./build/chat_handler
 ```
 
 ### 3) Start the terminal gateway (Python client)
@@ -138,7 +134,7 @@ Terminal 2:
 Terminal 3:
 
 ```bash
-python3 chat/terminal.py --host 127.0.0.1 --port 6060
+python3 chat/terminal.py
 ```
 
 ### 4) Python skills require `uv`

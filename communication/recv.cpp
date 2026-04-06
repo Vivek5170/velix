@@ -4,22 +4,21 @@
 
 #if __has_include(<nlohmann/json.hpp>)
     #include <nlohmann/json.hpp>
-    #define VELIX_HAS_NLOHMANN_JSON 1
+    inline constexpr bool kHasNlohmannJson = true;
 #elif __has_include("../vendor/nlohmann/json.hpp")
     #include "../vendor/nlohmann/json.hpp"
-    #define VELIX_HAS_NLOHMANN_JSON 1
+    inline constexpr bool kHasNlohmannJson = true;
 #else
-    #define VELIX_HAS_NLOHMANN_JSON 0
+    inline constexpr bool kHasNlohmannJson = false;
 #endif
 
 namespace velix::communication {
 
-static void recv_all(SocketWrapper& socket, void* data, std::size_t len) {
+static void recv_all(SocketWrapper& socket, char* data, std::size_t len) {
     std::size_t total = 0;
-    char* ptr = static_cast<char*>(data);
 
     while (total < len) {
-        int rec = socket.recv(ptr + total, static_cast<int>(len - total));
+        auto rec = socket.recv(data + total, static_cast<int>(len - total));
         if (rec == 0) {
             throw SocketException("connection closed");
         }
@@ -31,7 +30,7 @@ static void recv_all(SocketWrapper& socket, void* data, std::size_t len) {
 }
 
 static void validate_json_if_available(const std::string& msg) {
-#if VELIX_HAS_NLOHMANN_JSON
+#if __has_include(<nlohmann/json.hpp>) || __has_include("../vendor/nlohmann/json.hpp")
     try {
         [[maybe_unused]] auto parsed = nlohmann::json::parse(msg);
     } catch (const std::exception& e) {
@@ -48,11 +47,11 @@ std::string recv_json(SocketWrapper& socket) {
     }
 
     std::uint32_t net_len = 0;
-    recv_all(socket, &net_len, sizeof(net_len));
+    recv_all(socket, reinterpret_cast<char*>(&net_len), sizeof(net_len));
 
     std::uint32_t len = ntohl(net_len);
-    constexpr std::uint32_t MAX_MESSAGE_SIZE = 10U * 1024U * 1024U;
-    if (len == 0 || len > MAX_MESSAGE_SIZE) {
+    if (constexpr std::uint32_t kMaxMessageSize = 10U * 1024U * 1024U;
+        len == 0 || len > kMaxMessageSize) {
         throw SocketException("invalid message size");
     }
 

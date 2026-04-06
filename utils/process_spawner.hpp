@@ -7,6 +7,7 @@
 #include <sstream>
 #include <array>
 #include <stdexcept>
+#include <thread>
 #include <chrono>
 
 #ifdef _WIN32
@@ -26,6 +27,11 @@ struct ProcessResult {
     std::string stderr_content;
     bool success = false;
     bool timed_out = false;
+};
+
+class ProcessSpawnerException : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
 class ProcessSpawner {
@@ -52,10 +58,10 @@ public:
         HANDLE hChildStd_OUT_Rd = NULL;
         HANDLE hChildStd_OUT_Wr = NULL;
         if (!CreatePipe(&hChildStd_OUT_Rd, &hChildStd_OUT_Wr, &saAttr, 0)) {
-            throw std::runtime_error("Stdout CreatePipe failed");
+            throw ProcessSpawnerException("Stdout CreatePipe failed");
         }
         if (!SetHandleInformation(hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0)) {
-            throw std::runtime_error("Stdout SetHandleInformation failed");
+            throw ProcessSpawnerException("Stdout SetHandleInformation failed");
         }
 
         std::string cmd_line = "\"" + command + "\"";
@@ -93,17 +99,17 @@ public:
         if (!bSuccess) {
             CloseHandle(hChildStd_OUT_Wr);
             CloseHandle(hChildStd_OUT_Rd);
-            throw std::runtime_error("CreateProcess failed with error: " + std::to_string(GetLastError()));
+            throw ProcessSpawnerException("CreateProcess failed with error: " + std::to_string(GetLastError()));
         }
 
         CloseHandle(hChildStd_OUT_Wr); // Close write end in parent
 
-        char lpBuffer[4096];
+        std::array<char, 4096> lpBuffer{};
         DWORD nBytesRead;
         std::ostringstream oss;
-        while (ReadFile(hChildStd_OUT_Rd, lpBuffer, sizeof(lpBuffer) - 1, &nBytesRead, NULL) && nBytesRead > 0) {
-            lpBuffer[nBytesRead] = '\0';
-            oss << lpBuffer;
+        while (ReadFile(hChildStd_OUT_Rd, lpBuffer.data(), static_cast<DWORD>(lpBuffer.size() - 1), &nBytesRead, NULL) && nBytesRead > 0) {
+            lpBuffer[static_cast<std::size_t>(nBytesRead)] = '\0';
+            oss << lpBuffer.data();
         }
 
         WaitForSingleObject(piProcInfo.hProcess, INFINITE);
@@ -120,14 +126,14 @@ public:
 
 #else
         // POSIX implementation using pipe, fork, and execve/execvp
-        int pipefd[2];
-        if (pipe(pipefd) == -1) {
-            throw std::runtime_error("pipe() failed");
+        std::array<int, 2> pipefd{};
+        if (pipe(pipefd.data()) == -1) {
+            throw ProcessSpawnerException("pipe() failed");
         }
 
         pid_t pid = fork();
         if (pid == -1) {
-            throw std::runtime_error("fork() failed");
+            throw ProcessSpawnerException("fork() failed");
         }
 
         if (pid == 0) {
@@ -142,10 +148,17 @@ public:
                 setenv(key.c_str(), val.c_str(), 1);
             }
 
-            std::vector<char*> argv;
-            argv.push_back(const_cast<char*>(command.c_str()));
+            std::vector<std::string> argv_storage;
+            argv_storage.reserve(args.size() + 1);
+            argv_storage.push_back(command);
             for (const auto& arg : args) {
-                argv.push_back(const_cast<char*>(arg.c_str()));
+                argv_storage.push_back(arg);
+            }
+
+            std::vector<char*> argv;
+            argv.reserve(argv_storage.size() + 1);
+            for (auto& arg : argv_storage) {
+                argv.push_back(arg.data());
             }
             argv.push_back(nullptr);
 
@@ -155,12 +168,12 @@ public:
             // Parent process
             close(pipefd[1]); // close write end
 
-            char buffer[4096];
+            std::array<char, 4096> buffer{};
             std::ostringstream oss;
             ssize_t bytes_read;
-            while ((bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
-                buffer[bytes_read] = '\0';
-                oss << buffer;
+            while ((bytes_read = read(pipefd[0], buffer.data(), buffer.size() - 1)) > 0) {
+                buffer[static_cast<std::size_t>(bytes_read)] = '\0';
+                oss << buffer.data();
             }
             close(pipefd[0]);
 
@@ -200,10 +213,10 @@ public:
         HANDLE hChildStd_OUT_Rd = NULL;
         HANDLE hChildStd_OUT_Wr = NULL;
         if (!CreatePipe(&hChildStd_OUT_Rd, &hChildStd_OUT_Wr, &saAttr, 0)) {
-            throw std::runtime_error("Stdout CreatePipe failed");
+            throw ProcessSpawnerException("Stdout CreatePipe failed");
         }
         if (!SetHandleInformation(hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0)) {
-            throw std::runtime_error("Stdout SetHandleInformation failed");
+            throw ProcessSpawnerException("Stdout SetHandleInformation failed");
         }
 
         std::string cmd_line = "\"" + command + "\"";
@@ -240,7 +253,7 @@ public:
         if (!ok) {
             CloseHandle(hChildStd_OUT_Wr);
             CloseHandle(hChildStd_OUT_Rd);
-            throw std::runtime_error("CreateProcess failed with error: " + std::to_string(GetLastError()));
+            throw ProcessSpawnerException("CreateProcess failed with error: " + std::to_string(GetLastError()));
         }
 
         CloseHandle(hChildStd_OUT_Wr);
@@ -258,12 +271,12 @@ public:
             result.success = (result.exit_code == 0);
         }
 
-        char lpBuffer[4096];
+        std::array<char, 4096> lpBuffer{};
         DWORD nBytesRead;
         std::ostringstream oss;
-        while (ReadFile(hChildStd_OUT_Rd, lpBuffer, sizeof(lpBuffer) - 1, &nBytesRead, NULL) && nBytesRead > 0) {
-            lpBuffer[nBytesRead] = '\0';
-            oss << lpBuffer;
+        while (ReadFile(hChildStd_OUT_Rd, lpBuffer.data(), static_cast<DWORD>(lpBuffer.size() - 1), &nBytesRead, NULL) && nBytesRead > 0) {
+            lpBuffer[static_cast<std::size_t>(nBytesRead)] = '\0';
+            oss << lpBuffer.data();
         }
         result.stdout_content = oss.str();
 
@@ -272,14 +285,14 @@ public:
         CloseHandle(hChildStd_OUT_Rd);
 
 #else
-        int pipefd[2];
-        if (pipe(pipefd) == -1) {
-            throw std::runtime_error("pipe() failed");
+        std::array<int, 2> pipefd{};
+        if (pipe(pipefd.data()) == -1) {
+            throw ProcessSpawnerException("pipe() failed");
         }
 
         pid_t pid = fork();
         if (pid == -1) {
-            throw std::runtime_error("fork() failed");
+            throw ProcessSpawnerException("fork() failed");
         }
 
         if (pid == 0) {
@@ -298,10 +311,17 @@ public:
                 setenv(key.c_str(), val.c_str(), 1);
             }
 
-            std::vector<char*> argv;
-            argv.push_back(const_cast<char*>(command.c_str()));
+            std::vector<std::string> argv_storage;
+            argv_storage.reserve(args.size() + 1);
+            argv_storage.push_back(command);
             for (const auto& arg : args) {
-                argv.push_back(const_cast<char*>(arg.c_str()));
+                argv_storage.push_back(arg);
+            }
+
+            std::vector<char*> argv;
+            argv.reserve(argv_storage.size() + 1);
+            for (auto& arg : argv_storage) {
+                argv.push_back(arg.data());
             }
             argv.push_back(nullptr);
 
@@ -320,7 +340,7 @@ public:
                 done = true;
                 break;
             }
-            usleep(20000);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
         if (!done) {
@@ -337,12 +357,12 @@ public:
             result.success = false;
         }
 
-        char buffer[4096];
+        std::array<char, 4096> buffer{};
         std::ostringstream oss;
         ssize_t bytes_read;
-        while ((bytes_read = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
-            buffer[bytes_read] = '\0';
-            oss << buffer;
+        while ((bytes_read = read(pipefd[0], buffer.data(), buffer.size() - 1)) > 0) {
+            buffer[static_cast<std::size_t>(bytes_read)] = '\0';
+            oss << buffer.data();
         }
         close(pipefd[0]);
         result.stdout_content = oss.str();
@@ -421,10 +441,17 @@ public:
                 setenv(key.c_str(), val.c_str(), 1);
             }
 
-            std::vector<char*> argv;
-            argv.push_back(const_cast<char*>(command.c_str()));
+            std::vector<std::string> argv_storage;
+            argv_storage.reserve(args.size() + 1);
+            argv_storage.push_back(command);
             for (const auto& arg : args) {
-                argv.push_back(const_cast<char*>(arg.c_str()));
+                argv_storage.push_back(arg);
+            }
+
+            std::vector<char*> argv;
+            argv.reserve(argv_storage.size() + 1);
+            for (auto& arg : argv_storage) {
+                argv.push_back(arg.data());
             }
             argv.push_back(nullptr);
 

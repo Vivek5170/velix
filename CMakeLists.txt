@@ -42,7 +42,7 @@ set(KERNEL_SOURCES
     execution/run_launcher.cpp
     execution/runtime_adapters/runtime_adapters.cpp
     llm/scheduler.cpp
-    llm/conversation_manager.cpp
+    llm/session_io.cpp
     llm/compacter.cpp
     llm/session_manager.cpp
     ${COMM_SOURCES}
@@ -61,7 +61,7 @@ endif()
 add_executable(chat_handler 
     chat/handler.cpp 
     runtime/sdk/cpp/velix_process.cpp
-    llm/conversation_manager.cpp
+    llm/session_io.cpp
     llm/compacter.cpp
     llm/session_manager.cpp
     ${COMM_SOURCES}

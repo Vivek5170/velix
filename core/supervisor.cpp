@@ -30,7 +30,7 @@
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
 #include "../utils/thread_pool.hpp"
-#include "../llm/conversation_manager.hpp"
+#include "../llm/session_io.hpp"
 #include "../vendor/nlohmann/json.hpp"
 
 #include <atomic>
@@ -49,7 +49,7 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <windows.h>
+#include <Windows.h>
 #else
 #include <cerrno>
 #include <csignal>
@@ -289,12 +289,7 @@ public:
   SupervisorService()
       : config_(load_supervisor_config()),
         thread_pool_(config_.max_client_threads,
-                     config_.max_client_threads * 4),
-        running_(false),
-        registry_(std::make_shared<ProcessRegistry>()),
-        termination_engine_(std::make_shared<TerminationEngine>()),
-        handler_os_pid_(-1),
-        handler_velix_pid_(-1) {
+                     config_.max_client_threads * 4) {
     register_system_handler_tree();
   }
 
@@ -321,7 +316,7 @@ public:
       const std::string bind_host =
           velix::communication::resolve_bind_host("SUPERVISOR", "127.0.0.1");
       {
-        std::lock_guard<std::mutex> lock(server_mutex_);
+        std::scoped_lock lock(server_mutex_);
         server_socket_ =
             std::make_shared<velix::communication::SocketWrapper>();
         server_socket_->create_tcp_socket();
@@ -338,7 +333,7 @@ public:
           velix::communication::SocketWrapper client;
           std::shared_ptr<velix::communication::SocketWrapper> server_socket;
           {
-            std::lock_guard<std::mutex> lock(server_mutex_);
+            std::scoped_lock lock(server_mutex_);
             server_socket = server_socket_;
           }
 
@@ -355,7 +350,8 @@ public:
               thread_pool_.try_submit([this, client_ptr]() mutable {
                 try {
                   handle_client(std::move(*client_ptr));
-                } catch (...) {
+                } catch (const std::exception &) {
+                  // Worker errors are already handled in handle_client.
                 }
               });
 
@@ -365,7 +361,8 @@ public:
                            {"error",
                             "supervisor busy: max client threads reached"}};
               velix::communication::send_json(*client_ptr, busy.dump());
-            } catch (...) {
+            } catch (const std::exception &) {
+              // Best-effort rejection path.
             }
           }
         } catch (const std::exception &e) {
@@ -388,14 +385,13 @@ public:
   }
 
   void stop() {
-    const bool was_running = running_.exchange(false);
-    if (!was_running) {
+    if (const bool was_running = running_.exchange(false); !was_running) {
       join_watchdog();
       return;
     }
 
     {
-      std::lock_guard<std::mutex> lock(server_mutex_);
+      std::scoped_lock lock(server_mutex_);
       if (server_socket_ && server_socket_->is_open()) {
         server_socket_->close();
       }
@@ -439,10 +435,10 @@ private:
   // ─────────────────────────────────────────────────────────────────────
 
   // ProcessRegistry: owns all structural state (process/tree tables)
-  std::shared_ptr<ProcessRegistry> registry_;
+  std::shared_ptr<ProcessRegistry> registry_{std::make_shared<ProcessRegistry>()};
 
   // TerminationEngine: performs OS-level termination
-  std::shared_ptr<TerminationEngine> termination_engine_;
+  std::shared_ptr<TerminationEngine> termination_engine_{std::make_shared<TerminationEngine>()};
 
   // Conversation tracking (specialized state - not in registry)
   std::mutex conversation_mutex_;
@@ -451,7 +447,7 @@ private:
   std::unordered_map<std::string, ConvMetadata>
       convo_metadata_;  // convo_id -> metadata
 
-  velix::llm::ConversationManager convo_manager_;
+  velix::llm::SessionIO convo_manager_;
 
   // Network layer
   std::mutex server_mutex_;
@@ -459,12 +455,12 @@ private:
 
   velix::utils::ThreadPool thread_pool_;
 
-  std::atomic<bool> running_;
+  std::atomic<bool> running_{false};
   std::thread watchdog_thread_;
 
   // Handler lifecycle tracking
-  std::atomic<int> handler_os_pid_;
-  std::atomic<int> handler_velix_pid_;
+  std::atomic<int> handler_os_pid_{-1};
+  std::atomic<int> handler_velix_pid_{-1};
   bool handler_needs_restart_ = false;
   std::chrono::steady_clock::time_point handler_dead_since_;
 
@@ -555,9 +551,9 @@ private:
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
-    if (!CreateProcessA(NULL, cmd_buffer.data(), NULL, NULL, FALSE,
-                        CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS, NULL,
-                        NULL, &si, &pi)) {
+    if (!CreateProcessA(nullptr, cmd_buffer.data(), nullptr, nullptr, FALSE,
+              CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS, nullptr,
+              nullptr, &si, &pi)) {
       LOG_ERROR_CTX("CreateProcessA failed when spawning handler", "supervisor",
                     "TREE_HANDLER", -1, "handler_spawn_error");
       return;
@@ -671,8 +667,6 @@ private:
     } catch (const std::exception &e) {
       const std::string err = e.what();
       if (is_expected_disconnect_error(err)) {
-        LOG_DEBUG_CTX(std::string("Supervisor client disconnected: ") + err,
-                      "supervisor", "", -1, "client_disconnect");
         return;
       }
 
@@ -681,7 +675,8 @@ private:
       try {
         json error = {{"status", "error"}, {"error", err}};
         velix::communication::send_json(client_sock, error.dump());
-      } catch (...) {
+      } catch (const std::exception &) {
+        // Client likely disconnected; request handling already failed.
       }
     }
   }
@@ -1142,7 +1137,7 @@ private:
 
       // FIX #8: Add conversation cleanup (TTL enforcement)
       {
-        std::lock_guard<std::mutex> lock(conversation_mutex_);
+        std::scoped_lock lock(conversation_mutex_);
         std::vector<std::string> expired_convos;
         for (auto &[convo_id, metadata] : convo_metadata_) {
           uint64_t age_sec = (now_ms - metadata.created_at_ms) / 1000;

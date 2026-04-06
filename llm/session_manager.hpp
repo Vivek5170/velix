@@ -18,11 +18,15 @@ namespace velix::llm {
 //   {super_user}_s{N}   e.g. "terminal_vivek_s1", "terminal_vivek_s2"
 //
 // Storage layout  (storage_root = "memory", configurable):
-//   memory/sessions/{session_id}/
-//     {session_id}.json       ← live conversation file (ConversationManager)
+//   memory/sessions/users/{super_user}/{session_id}/
+//     {session_id}.json       ← live session file (SessionIO)
 //     {session_id}_h1.json    ← history snapshot after 1st compact
 //     {session_id}_h2.json    ← history snapshot after 2nd compact
-//   memory/session_index.json ← {"users":{"terminal_vivek":["t_v_s1","t_v_s2"]}}
+//   memory/sessions/procs/{pid}/{session_id}/
+//     {session_id}.json       ← live process session file
+//     {session_id}_hN.json    ← process history snapshots
+//   memory/sessions/session_index.json
+//     {"users":{"terminal_vivek":["terminal_vivek_s1","terminal_vivek_s2"]}}
 //   memory/agentfiles/{super_user}/
 //     soul.md                 ← per-super-user persona
 //     user.md                 ← per-super-user persistent facts
@@ -77,6 +81,8 @@ class SessionManager {
   struct CompactResult {
     std::string session_id;    // same as input — no session switch
     std::string summary;
+    bool        compacted = false;
+    std::string compact_reason;
     int         tokens_before = 0;
     int         tokens_after  = 0;
   };
@@ -111,6 +117,8 @@ class SessionManager {
 
   // ── Path helpers (public so scheduler can locate the live file) ──────────
   std::string session_dir(const std::string& session_id) const;
+  // Resolves the current live session file by choosing the non-_h JSON file.
+  // Falls back to "{session_id}.json" when no live file exists yet.
   std::string live_convo_path(const std::string& session_id) const;
   std::string history_snapshot_path(const std::string& session_id, int n) const;
   std::string agentfile_path(const std::string& super_user,
@@ -137,7 +145,8 @@ class SessionManager {
   void save_snapshot(const std::string& session_id, const json& history);
   void write_seeded_history(const std::string& session_id,
                             const std::string& summary,
-                            bool               add_continue_turn);
+                            bool               add_continue_turn,
+                            const json&        retained_recent = json::array());
 
 };
 

@@ -4,6 +4,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -62,17 +63,13 @@ struct ProcessInfo {
  */
 struct TreeInfo {
   std::string tree_id;
-  int root_pid;
-  uint64_t created_at_ms;
+  int root_pid{-1};
+  uint64_t created_at_ms{0};
 
-  std::atomic<TreeStatus> status;
-  std::atomic<int> llm_request_count;
+  std::atomic<TreeStatus> status{TreeStatus::ACTIVE};
+  std::atomic<int> llm_request_count{0};
 
-  TreeInfo()
-      : root_pid(-1),
-        created_at_ms(0),
-        status(TreeStatus::ACTIVE),
-        llm_request_count(0) {}
+  TreeInfo() = default;
 
   TreeInfo(const TreeInfo &other)
       : tree_id(other.tree_id),
@@ -157,10 +154,10 @@ public:
 
   RegisterResult register_process(
       int os_pid,
-      const std::string &tree_id,  // empty = create new tree
+      std::string_view tree_id,  // empty = create new tree
       int parent_pid,
-      const std::string &role,
-      const std::string &trace_id,
+      std::string_view role,
+      std::string_view trace_id,
       ProcessStatus initial_status,
       double initial_memory_mb,
       bool is_system_handler);
@@ -201,7 +198,7 @@ public:
     int root_pid;
   };
 
-  TreeStatusResult get_tree_status(const std::string &tree_id);
+  TreeStatusResult get_tree_status(std::string_view tree_id);
 
   /**
    * Get all processes in a tree.
@@ -210,14 +207,14 @@ public:
    *
    * Returns vector of pids only (not ProcessInfo).
    */
-  std::vector<int> get_tree_processes(const std::string &tree_id);
+  std::vector<int> get_tree_processes(std::string_view tree_id);
 
   /**
    * Compute total memory usage for a tree (from live processes).
    *
    * Lock: shared_lock(registry_mutex) + read from atomic fields
    */
-  double compute_tree_memory_mb(const std::string &tree_id);
+  double compute_tree_memory_mb(std::string_view tree_id);
 
   // ─── Watchdog Snapshots ────────────────────────────────────────────
   /**
@@ -243,7 +240,7 @@ public:
    * Important: Does NOT perform OS termination. Caller must use
    * TerminationEngine.
    */
-  std::vector<int> kill_tree(const std::string &tree_id);
+  std::vector<int> kill_tree(std::string_view tree_id);
 
   // ─── Process Termination ───────────────────────────────────────────
   /**
@@ -278,14 +275,14 @@ public:
    *
    * Returns true if tree was marked COMPLETED.
    */
-  bool mark_tree_completed_if_done(const std::string &tree_id);
+  bool mark_tree_completed_if_done(std::string_view tree_id);
 
   /**
    * Mark a tree as FAILED.
    *
    * Lock: unique_lock(registry_mutex)
    */
-  void mark_tree_failed(const std::string &tree_id);
+  void mark_tree_failed(std::string_view tree_id);
 
   // ─── Tree Creation ─────────────────────────────────────────────────
   /**
@@ -296,7 +293,7 @@ public:
    * FIX #7: Added explicit tree_id parameter for clarity.
    * If empty string provided, auto-generates ID as "TREE_<counter>"
    */
-  std::string create_tree(const std::string &explicit_id = "");
+  std::string create_tree(std::string_view explicit_id = "");
 
   // ─── Utilities ─────────────────────────────────────────────────────
   /**
@@ -340,13 +337,12 @@ private:
 
   std::unordered_map<int, std::shared_ptr<ProcessInfo>> process_table_;
   std::unordered_map<std::string, TreeInfo> tree_table_;
-  std::unordered_map<std::string, std::unordered_set<int>>
-      tree_process_index_;
+  std::unordered_map<std::string, std::unordered_set<int>> tree_process_index_;
   std::unordered_map<int, std::unordered_set<int>> process_children_;
 
   // ─── Telemetry Counters (atomic) ────────────────────────────────────
-  std::atomic<uint64_t> process_counter_;
-  std::atomic<uint64_t> tree_counter_;
+  std::atomic<uint64_t> process_counter_{1000};
+  std::atomic<uint64_t> tree_counter_{1};
 
   // ─── Helper methods (assumes caller holds appropriate lock) ─────────
   void on_process_registered_unlocked_(const ProcessInfo &process);

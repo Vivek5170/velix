@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <fstream>
+#include <sstream>
 
 using namespace velix::core;
 using namespace velix::communication;
@@ -269,6 +271,26 @@ public:
   }
 
 private:
+  static bool is_session_id_format(const std::string &value) {
+    const auto pos = value.rfind("_s");
+    if (pos == std::string::npos || pos + 2 >= value.size()) {
+      return false;
+    }
+    const std::string suffix = value.substr(pos + 2);
+    return !suffix.empty() &&
+           std::all_of(suffix.begin(), suffix.end(), [](unsigned char c) {
+             return std::isdigit(c) != 0;
+           });
+  }
+
+  static std::string extract_super_user(const std::string &value) {
+    if (!is_session_id_format(value)) {
+      return value;
+    }
+    const auto pos = value.rfind("_s");
+    return value.substr(0, pos);
+  }
+
   static bool is_valid_user_id(const std::string &user_id) {
     if (user_id.empty() || user_id.size() > 128) {
       return false;
@@ -286,7 +308,7 @@ private:
   }
 
   static fs::path known_users_root() {
-    return fs::path("memory") / "conversations" / "users";
+    return fs::path("memory") / "sessions" / "users";
   }
 
   void initialize_known_users() {
@@ -297,12 +319,7 @@ private:
       std::unordered_set<std::string> discovered;
       for (const auto &entry : fs::directory_iterator(root)) {
         const fs::path p = entry.path();
-        if (entry.is_regular_file() && p.extension() == ".json") {
-          const std::string id = p.stem().string();
-          if (!id.empty()) {
-            discovered.insert(id);
-          }
-        } else if (entry.is_directory()) {
+        if (entry.is_directory()) {
           const std::string id = p.filename().string();
           if (!id.empty()) {
             discovered.insert(id);
@@ -331,6 +348,77 @@ private:
     }
     std::sort(users.begin(), users.end());
     return users;
+  }
+
+  struct ContextUsage {
+    uint64_t current_tokens{0};
+    uint64_t max_tokens{0};
+    bool valid{false};
+  };
+
+  ContextUsage read_context_usage(const std::string &session_id) const {
+    ContextUsage out;
+    if (session_id.empty()) {
+      return out;
+    }
+
+    const std::string super_user = extract_super_user(session_id);
+    const fs::path convo = fs::path("memory") / "sessions" / "users" / super_user /
+                           session_id / (session_id + ".json");
+    auto read_text = [](const fs::path &p) -> std::string {
+      std::ifstream in(p);
+      if (!in.is_open()) {
+        return "";
+      }
+      std::ostringstream ss;
+      ss << in.rdbuf();
+      return ss.str();
+    };
+
+    auto estimate_tokens = [](const std::string &text) -> uint64_t {
+      return static_cast<uint64_t>(text.size() / 4);
+    };
+
+    uint64_t layered_tokens = 0;
+    layered_tokens += estimate_tokens(
+        read_text(fs::path("memory") / "general_guidelines.md"));
+    layered_tokens +=
+        estimate_tokens(read_text(fs::path("memory") / "agentfiles" /
+                                  super_user / "soul.md"));
+    layered_tokens +=
+        estimate_tokens(read_text(fs::path("memory") / "agentfiles" /
+                                  super_user / "user.md"));
+
+    try {
+      std::ifstream in(convo);
+      if (in.is_open()) {
+        json j;
+        in >> j;
+        const uint64_t convo_tokens =
+            j.value("current_context_tokens", static_cast<uint64_t>(0));
+        out.current_tokens = convo_tokens + layered_tokens;
+        out.valid = true;
+      }
+    } catch (...) {
+      return ContextUsage{};
+    }
+
+    // Mirror scheduler fallback defaults.
+    out.max_tokens = 8192;
+    try {
+      std::ifstream cfg("config/compacter.json");
+      if (!cfg.is_open()) {
+        cfg.open("../config/compacter.json");
+      }
+      if (cfg.is_open()) {
+        json c;
+        cfg >> c;
+        out.max_tokens = c.value("max_context_tokens", out.max_tokens);
+      }
+    } catch (...) {
+    }
+
+    return out;
   }
 
   bool ensure_known_user(const std::string &user_id) {
@@ -384,17 +472,25 @@ private:
           // Ask scheduler for all super users
           const std::string raw =
               send_session_control("", "list_super_users", "");
-          std::vector<std::string> users;
+          std::unordered_set<std::string> users_set;
           try {
             const json r = json::parse(raw);
             if (r.contains("users") && r["users"].is_array()) {
               for (const auto &u : r["users"]) {
                 if (u.is_string())
-                  users.push_back(u.get<std::string>());
+                  users_set.insert(u.get<std::string>());
               }
             }
           } catch (...) {
           }
+
+          // Fallback to filesystem-discovered users if session index is stale.
+          for (const auto &uid : snapshot_known_users()) {
+            users_set.insert(uid);
+          }
+
+          std::vector<std::string> users(users_set.begin(), users_set.end());
+          std::sort(users.begin(), users.end());
 
           json j_users = json::array();
           {
@@ -436,6 +532,31 @@ private:
                 }
               }
             } catch (...) {
+              // Fallback parser for legacy textual listing:
+              // "Sessions for <super_user>:\n  <sid>\n  <sid>\n"
+              std::istringstream iss(raw);
+              std::string line;
+              std::lock_guard<std::mutex> lock(sessions_mutex);
+              while (std::getline(iss, line)) {
+                if (line.rfind("Sessions for ", 0) == 0) {
+                  continue;
+                }
+                const auto first = line.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos) {
+                  continue;
+                }
+                const auto last = line.find_last_not_of(" \t\r\n");
+                line = line.substr(first, last - first + 1);
+                if (line.empty()) {
+                  continue;
+                }
+                if (extract_super_user(line) != super_user ||
+                    !is_session_id_format(line)) {
+                  continue;
+                }
+                bool active = (sessions.count(line) > 0);
+                j_sessions.push_back({{"id", line}, {"active", active}});
+              }
             }
             send_json(client,
                       json{{"type", "session_list"}, {"sessions", j_sessions}}
@@ -470,10 +591,7 @@ private:
         }
 
         actual_super_user = user_id;
-        const auto s_pos = actual_super_user.find("_s");
-        if (s_pos != std::string::npos && s_pos > 0) {
-          actual_super_user = actual_super_user.substr(0, s_pos);
-        }
+        actual_super_user = extract_super_user(actual_super_user);
 
         if (!ensure_known_user(actual_super_user)) {
           send_json(client, json{{"type", "error"},
@@ -518,17 +636,26 @@ private:
 
     if (force_new) {
       resolved_session_id = send_session_control(user_id, "new", "");
-    } else if (user_id.find("_s") != std::string::npos) {
-      // If user_id already contains an _s suffix (e.g. terminal_vivek_s1 or
-      // vivek_s_dev), use it directly. This allows resuming an older specific
-      // session or a named session.
+    } else if (is_session_id_format(user_id)) {
+      // If user_id is already a strict _s{N} session id, use it directly.
       resolved_session_id = user_id;
     } else {
       resolved_session_id = send_session_control(user_id, "get_or_create", "");
     }
 
     if (resolved_session_id.empty()) {
-      resolved_session_id = user_id + "_s1";
+      try {
+        send_json(client, json{{"type", "error"},
+                               {"message", "failed to resolve session_id from scheduler"},
+                               {"user_id", user_id}}
+                              .dump());
+      } catch (...) {
+      }
+      try {
+        client.close();
+      } catch (...) {
+      }
+      return;
     }
 
     session->user_id = resolved_session_id;
@@ -719,6 +846,12 @@ private:
         send_to_client({{"type", "token"},
                         {"data", std::string("[Velix Error] ") + e.what()}});
       }
+      const ContextUsage usage = read_context_usage(session->active_session_id);
+      if (usage.valid && usage.max_tokens > 0) {
+        send_to_client({{"type", "context_usage"},
+                        {"current_tokens", usage.current_tokens},
+                        {"max_tokens", usage.max_tokens}});
+      }
       send_to_client({{"type", "end"}});
     }
   }
@@ -889,10 +1022,14 @@ private:
           "[Compacted: " + session->active_session_id + "]";
       try {
         const json r = json::parse(raw);
-        if (r.contains("tokens_before") && r.contains("tokens_after")) {
+        if (r.value("session_compacted", false) &&
+            r.contains("tokens_before") && r.contains("tokens_after")) {
           status_msg =
               "[Compacted: " + std::to_string(r.value("tokens_before", 0)) +
               " → " + std::to_string(r.value("tokens_after", 0)) + " tokens]";
+        } else if (!r.value("session_compacted", true)) {
+          const std::string reason = r.value("compact_reason", "below_compaction_limit");
+          status_msg = "[Compaction skipped: " + reason + "]";
         }
       } catch (...) {
       }
@@ -901,8 +1038,17 @@ private:
 
     // ── /sessions ──────────────────────────────────────────────────────────
     command_table_["/sessions"] = [this](auto session, const auto &send) {
-      const std::string listing =
+      std::string listing = "(no sessions)";
+      const std::string raw =
           send_session_control(session->super_user, "list", "");
+      try {
+        const json r = json::parse(raw);
+        listing = r.value("listing", listing);
+      } catch (...) {
+        if (!raw.empty()) {
+          listing = raw;
+        }
+      }
       send({{"type", "token"}, {"data", listing}});
     };
 
@@ -973,12 +1119,9 @@ private:
                   << response.value("message_type", "(none)") << std::endl;
         return "";
       }
-      if (action == "list") {
-        return response.value("listing", "(no sessions)");
-      }
-      if (action == "compact" || action == "list_super_users") {
+      if (action == "list" || action == "compact" || action == "list_super_users") {
         // Return the full JSON so caller can read tokens_before/tokens_after or
-        // users array.
+        // users/sessions arrays.
         return raw;
       }
       return response.value("session_id", "");

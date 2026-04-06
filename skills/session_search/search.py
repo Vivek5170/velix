@@ -23,6 +23,34 @@ class SessionSearchSkill(VelixProcess):
         self.index_db = self.root / "memory" / ".session_search_index.db"
         self.manifest_json = self.root / "memory" / ".session_search_manifest.json"
 
+    @staticmethod
+    def _extract_super_user(session_id: str) -> str:
+        pos = session_id.rfind("_s")
+        if pos != -1 and pos + 2 < len(session_id):
+            suffix = session_id[pos + 2 :]
+            if suffix.isdigit():
+                return session_id[:pos]
+        return session_id
+
+    @classmethod
+    def _is_session_id(cls, value: str) -> bool:
+        if not value:
+            return False
+        return cls._extract_super_user(value) != value
+
+    @staticmethod
+    def _parse_proc_session(session_id: str) -> tuple[str, str] | None:
+        if not session_id.startswith("proc_"):
+            return None
+        rest = session_id[5:]
+        sep = rest.find("_")
+        if sep == -1:
+            return None
+        pid = rest[:sep]
+        if not pid.isdigit():
+            return None
+        return pid, session_id
+
     def _find_velix_root(self) -> Path:
         """Walk up from CWD looking for the memory directory."""
         cur = Path.cwd()
@@ -78,18 +106,52 @@ class SessionSearchSkill(VelixProcess):
         return conn
 
     def _scan_convo_files(self, user_id: str) -> list[Path]:
-        """Return all session snapshot JSON files for the given super_user."""
+        """Return session JSON files scoped to the provided user/session identifier."""
         files: list[Path] = []
         if not self.sessions_root.exists():
             return files
 
-        super_user = user_id.split('_')[0] if user_id else ""
+        users_root = self.sessions_root / "users"
+        procs_root = self.sessions_root / "procs"
 
-        for session_dir in self.sessions_root.iterdir():
-            if session_dir.is_dir():
-                if super_user and not session_dir.name.startswith(super_user + "_"):
-                    continue
+        if not user_id:
+            if users_root.exists():
+                for super_dir in users_root.iterdir():
+                    if not super_dir.is_dir():
+                        continue
+                    for session_dir in super_dir.iterdir():
+                        if session_dir.is_dir():
+                            files.extend(session_dir.glob("*.json"))
+            if procs_root.exists():
+                for pid_dir in procs_root.iterdir():
+                    if not pid_dir.is_dir():
+                        continue
+                    for session_dir in pid_dir.iterdir():
+                        if session_dir.is_dir():
+                            files.extend(session_dir.glob("*.json"))
+            return files
+
+        proc_parts = self._parse_proc_session(user_id)
+        if proc_parts is not None:
+            pid, sid = proc_parts
+            session_dir = procs_root / pid / sid
+            if session_dir.exists() and session_dir.is_dir():
                 files.extend(session_dir.glob("*.json"))
+            return files
+
+        if self._is_session_id(user_id):
+            super_user = self._extract_super_user(user_id)
+            session_dir = users_root / super_user / user_id
+            if session_dir.exists() and session_dir.is_dir():
+                files.extend(session_dir.glob("*.json"))
+            return files
+
+        # Fallback: treat user_id as super_user and scan all their sessions.
+        super_dir = users_root / user_id
+        if super_dir.exists() and super_dir.is_dir():
+            for session_dir in super_dir.iterdir():
+                if session_dir.is_dir():
+                    files.extend(session_dir.glob("*.json"))
         return files
 
     def _index_file(self, conn: sqlite3.Connection, path: Path) -> int:
@@ -162,7 +224,7 @@ class SessionSearchSkill(VelixProcess):
 
         try:
             conn = self._open_db()
-            self._update_index(conn, "") # Index everything for complete search
+            self._update_index(conn, user_id)
             
             since_ms = 0
             if since_hours > 0:
@@ -191,9 +253,12 @@ class SessionSearchSkill(VelixProcess):
                 sql_params.append(since_ms)
 
             if user_id:
-                super_user = user_id.split('_')[0]
-                sql += " AND t.convo_id LIKE ?"
-                sql_params.append(super_user + "_%")
+                if self._is_session_id(user_id) or self._parse_proc_session(user_id):
+                    sql += " AND t.convo_id = ?"
+                    sql_params.append(user_id)
+                else:
+                    sql += " AND t.convo_id LIKE ?"
+                    sql_params.append(user_id + "_s%")
 
             sql += " ORDER BY score LIMIT ?"
             sql_params.append(limit)

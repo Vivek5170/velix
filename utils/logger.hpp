@@ -8,11 +8,12 @@
 #include <iomanip>
 #include <filesystem>
 #include <mutex>
+#include <string_view>
 
 namespace velix::utils {
 
 struct LogContext {
-    std::string module = "unknown";
+    std::string component = "unknown";
     std::string tree_id = "";
     int pid = -1;
     std::string event = "";
@@ -25,7 +26,7 @@ private:
     inline static bool initialized = false;
     inline static std::mutex write_mutex;
 
-    static std::string escape_json(const std::string& value) {
+    static std::string escape_json(std::string_view value) {
         std::string out;
         out.reserve(value.size() + 8);
         for (char c : value) {
@@ -62,14 +63,14 @@ private:
         return oss.str();
     }
 
-    static std::string build_json_line(const std::string& level,
-                                       const std::string& message,
+    static std::string build_json_line(std::string_view level,
+                                       std::string_view message,
                                        const LogContext& context) {
         std::ostringstream oss;
         oss << "{"
             << "\"timestamp\":\"" << escape_json(get_timestamp()) << "\"," 
             << "\"level\":\"" << escape_json(level) << "\"," 
-            << "\"module\":\"" << escape_json(context.module) << "\"," 
+            << "\"component\":\"" << escape_json(context.component) << "\"," 
             << "\"tree_id\":\"" << escape_json(context.tree_id) << "\"," 
             << "\"pid\":" << context.pid << ","
             << "\"event\":\"" << escape_json(context.event) << "\"," 
@@ -86,7 +87,7 @@ private:
 
 public:
     static void init(const std::string& directory = "logs") {
-        std::lock_guard<std::mutex> lock(write_mutex);
+        std::scoped_lock lock(write_mutex);
         log_dir = directory;
         std::filesystem::create_directories(log_dir);
         
@@ -107,7 +108,7 @@ public:
                     const LogContext& context = LogContext{}) {
         ensure_initialized();
         const std::string line = build_json_line(level, message, context);
-        std::lock_guard<std::mutex> lock(write_mutex);
+        std::scoped_lock lock(write_mutex);
 
         if (level == "ERROR") {
             std::cerr << line << std::endl;
@@ -154,7 +155,7 @@ public:
     }
 
     static void close() {
-        std::lock_guard<std::mutex> lock(write_mutex);
+        std::scoped_lock lock(write_mutex);
         if (log_file.is_open()) {
             log_file.close();
         }

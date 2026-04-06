@@ -9,7 +9,7 @@
 #include <thread>
 
 #ifdef _WIN32
-#include <windows.h>
+#include <Windows.h>
 #else
 #include <cerrno>
 #include <csignal>
@@ -60,7 +60,8 @@ void TerminationEngine::kill_processes(
   }
 }
 
-bool TerminationEngine::send_signal_to_os_process(int os_pid, int signal) {
+bool TerminationEngine::send_signal_to_os_process(int os_pid,
+                                                  int signal) const {
   if (os_pid <= 0) {
     return false;
   }
@@ -90,7 +91,7 @@ bool TerminationEngine::send_signal_to_os_process(int os_pid, int signal) {
 }
 
 void TerminationEngine::notify_bus_child_terminated(
-    const TerminationTarget &target, const std::string &reason) {
+  const TerminationTarget &target, const std::string &reason) const {
   if (target.trace_id.empty() || target.parent_pid <= 0) {
     return;
   }
@@ -114,8 +115,8 @@ void TerminationEngine::notify_bus_child_terminated(
                               {"pid", target.velix_pid}}}};
 
     velix::communication::send_json(bus_socket, termination_msg.dump());
-  } catch (...) {
-    // Best-effort: log but don't fail
+  } catch (const std::exception &) {
+    // Best-effort: bus may be unavailable during shutdown.
   }
 }
 
@@ -123,7 +124,7 @@ void TerminationEngine::notify_bus_child_terminated(
 // WatchdogEngine implementation
 // ──────────────────────────────────────────────────────────────────────────
 
-void WatchdogEngine::watchdog_loop(std::function<bool()> is_running) {
+void WatchdogEngine::watchdog_loop(const std::function<bool()> &is_running) {
   while (is_running()) {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(config_.watchdog_interval_ms));

@@ -9,8 +9,7 @@
 #include <vector>
 #include "logger.hpp"
 
-namespace velix {
-namespace utils {
+namespace velix::utils {
 
 /**
  * Fixed-size thread pool for handling asynchronous connections.
@@ -21,8 +20,7 @@ namespace utils {
 class ThreadPool {
 public:
   explicit ThreadPool(int thread_count, int max_queued)
-      : stop_(false), pending_count_(0),
-        capacity_(static_cast<std::size_t>(max_queued > 0 ? max_queued : 512)) {
+      : capacity_(static_cast<std::size_t>(max_queued > 0 ? max_queued : 512)) {
     workers_.reserve(static_cast<std::size_t>(thread_count));
     for (int i = 0; i < thread_count; ++i) {
       workers_.emplace_back([this] { worker_loop(); });
@@ -31,7 +29,7 @@ public:
 
   ~ThreadPool() {
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::scoped_lock lock(mutex_);
       stop_ = true;
     }
     cv_.notify_all();
@@ -52,7 +50,7 @@ public:
    */
   bool try_submit(std::function<void()> task) {
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::scoped_lock lock(mutex_);
       if (stop_ || pending_count_ >= capacity_) {
         return false;
       }
@@ -84,8 +82,6 @@ private:
         }
       } catch (const std::exception& e) {
         LOG_ERROR("ThreadPool worker caught exception: " + std::string(e.what()));
-      } catch (...) {
-        LOG_ERROR("ThreadPool worker caught unknown exception.");
       }
     }
   }
@@ -94,12 +90,11 @@ private:
   std::queue<std::function<void()>> tasks_;
   std::mutex mutex_;
   std::condition_variable cv_;
-  bool stop_;
-  std::size_t pending_count_;
+  bool stop_{false};
+  std::size_t pending_count_{0};
   const std::size_t capacity_;
 };
 
-} // namespace utils
-} // namespace velix
+} // namespace velix::utils
 
 #endif // VELIX_THREAD_POOL_HPP

@@ -1,5 +1,5 @@
 #include "scheduler.hpp"
-#include "conversation_manager.hpp"
+#include "session_io.hpp"
 #include "session_manager.hpp"
 #include "tools/registry.hpp"
 
@@ -92,7 +92,7 @@ std::priority_queue<TreeCandidate, std::vector<TreeCandidate>,
                     TreeCandidateCompare>
     ready_tree_queue;
 std::atomic<bool> shutting_down{false};
-ConversationManager conversation_manager;
+SessionIO session_io;
 SessionManager      session_manager;   // default storage_root = "memory"
 tools::ToolRegistry tool_registry;
 
@@ -635,10 +635,12 @@ json process_llm_request_stateless(
     }
   }
 
+  const uint64_t tokens_used = final_response.usage.value("total_tokens", static_cast<uint64_t>(0));
+
   if ((mode == "conversation" || mode == "user_conversation") &&
       !normalized_tool_calls.empty()) {
-    if (!conversation_manager.persist_assistant_tool_call(
-            req.payload, final_response.content, normalized_tool_calls)) {
+    if (!session_io.persist_assistant_tool_call(
+            req.payload, final_response.content, normalized_tool_calls, tokens_used)) {
       LOG_WARN("Failed to persist assistant tool-call turn for convo_id=" +
                req.payload.value("convo_id", std::string("")));
     }
@@ -646,8 +648,8 @@ json process_llm_request_stateless(
 
   if ((mode == "conversation" || mode == "user_conversation") &&
       !final_response.content.empty() && normalized_tool_calls.empty()) {
-    if (!conversation_manager.persist_assistant_response(
-            req.payload, final_response.content)) {
+    if (!session_io.persist_assistant_response(
+            req.payload, final_response.content, tokens_used)) {
       LOG_WARN("Failed to persist assistant response for convo_id=" +
                req.payload.value("convo_id", std::string("")));
     }
@@ -790,7 +792,7 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
             notify_supervisor_llm_request(req, cfg);
         req.payload["is_handler"] =
             supervisor_response.value("is_handler", false);
-        req.payload = conversation_manager.normalize_llm_request(req.payload);
+        req.payload = session_io.normalize_llm_request(req.payload);
         const std::string mode =
             req.payload.value("mode", std::string("simple"));
         if (mode == "conversation" || mode == "user_conversation") {
@@ -801,7 +803,7 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
           if (!req.payload.contains("messages") ||
               !req.payload["messages"].is_array()) {
             req.payload["messages"] =
-                conversation_manager.build_conversation_messages_safely(
+                session_io.build_conversation_messages_safely(
                     req.payload);
 
             const std::string session_id = req.payload.value("convo_id", "");
@@ -828,19 +830,20 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
               } catch (...) {}
 
               if (estimated_tokens > context_threshold * max_tokens) {
-                const Conversation convo = conversation_manager.get_conversation(session_id);
+                const Conversation convo = session_io.get_conversation(session_id);
                 json history = json::array();
                 for (const auto& m : convo.messages) {
                   if (m.is_object()) history.push_back(m);
                 }
                 const auto cr = session_manager.compact(session_id, history, true /*is_auto*/);
-                
-                req.payload["messages"] =
-                    conversation_manager.build_conversation_messages_safely(req.payload);
-                
-                req.payload["session_compacted"] = true;
-                req.payload["tokens_before"] = cr.tokens_before;
-                req.payload["tokens_after"] = cr.tokens_after;
+
+                if (cr.compacted) {
+                  req.payload["messages"] =
+                      session_io.build_conversation_messages_safely(req.payload);
+                  req.payload["session_compacted"] = true;
+                  req.payload["tokens_before"] = cr.tokens_before;
+                  req.payload["tokens_after"] = cr.tokens_after;
+                }
               }
             }
           }
@@ -1048,12 +1051,13 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
             const std::string sid = session_manager.new_session(super_user);
             reply["session_id"] = sid;
           } else if (action == "compact") {
-            // Fetch current history from CM, run compact (saves snapshot +
+            // Fetch current history from SessionIO, run compact (saves snapshot +
             // resets live convo with pre-seeded tool-call history).
-            const std::string session_id =
-                session_manager.get_or_create_active_session(super_user);
+            const std::string session_id = SessionManager::is_session_id(user_id)
+                                               ? user_id
+                                               : session_manager.get_or_create_active_session(super_user);
             const Conversation convo =
-                conversation_manager.get_conversation(session_id);
+                session_io.get_conversation(session_id);
             json history = json::array();
             for (const auto& m : convo.messages) {
               if (m.is_object()) history.push_back(m);
@@ -1064,7 +1068,8 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
             reply["summary"]         = cr.summary;
             reply["tokens_before"]   = cr.tokens_before;
             reply["tokens_after"]    = cr.tokens_after;
-            reply["session_compacted"] = true;
+            reply["session_compacted"] = cr.compacted;
+            reply["compact_reason"] = cr.compact_reason;
           } else if (action == "list") {
             const auto ids = session_manager.list_sessions(super_user);
             std::string listing = "Sessions for " + super_user + ":\n";
@@ -1072,6 +1077,7 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
               listing += "  " + id + "\n";
             }
             reply["listing"] = listing;
+            reply["sessions"] = ids;
           } else {
             reply["error"] = "unknown SESSION_CONTROL action: " + action;
           }

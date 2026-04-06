@@ -225,6 +225,8 @@ class TerminalGateway(Gateway):
         self._current_tool: Optional[str] = None
         self._tool_start_time: float      = 0.0
         self._session              = PromptSession()
+        self._current_context_tokens: int = 0
+        self._max_context_tokens: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle — context [A]
@@ -316,6 +318,12 @@ class TerminalGateway(Gateway):
             self.spinner.stop()
             _pt_print(f"\n{A_BOLD_RED}Error:{A_RESET} {_sanitize(event.get('message', event))}")
 
+        elif etype == "context_usage":
+            current = int(event.get("current_tokens", 0) or 0)
+            max_tokens = int(event.get("max_tokens", 0) or 0)
+            self._current_context_tokens = max(0, current)
+            self._max_context_tokens = max(0, max_tokens)
+
     # ------------------------------------------------------------------
     # Notify — context [B], NO Rich Console
     # ------------------------------------------------------------------
@@ -404,15 +412,25 @@ class TerminalGateway(Gateway):
     def get_next_input(self) -> Optional[str]:
         """Block until response done, THEN show prompt."""
         self._response_done.wait()
+        meter = self._format_context_meter()
         try:
             line = self._session.prompt(
-                HTML("<b><skyblue>You:</skyblue></b> ")
+                HTML(f"<b><skyblue>You{meter}:</skyblue></b> ")
             ).strip()
         except (EOFError, KeyboardInterrupt):
             return None
         if line.lower() in ("/exit", "/quit", "/bye", "exit"):
             return None
         return line
+
+    def _format_context_meter(self) -> str:
+        if self._max_context_tokens <= 0:
+            return ""
+        def fmt(v: int) -> str:
+            if v >= 1000:
+                return f"{v / 1000:.1f}k"
+            return str(v)
+        return f" [{fmt(self._current_context_tokens)}/{fmt(self._max_context_tokens)}]"
 
 
 # =========================================================================
@@ -435,84 +453,85 @@ def main() -> None:
             return v or None
         return None
 
+    def extract_super_user(value: str) -> str:
+        m = re.fullmatch(r"(.+)_s([0-9]+)", value)
+        if m:
+            return m.group(1)
+        return value
+
     def pick_persona_and_session(host: str, port: int, store: str) -> tuple[Optional[str], bool]:
         try:
             users = Gateway.list_users(host, port)
         except Exception as e:
             CONSOLE.print(f"[dim red]Note: identity listing unavailable: {e}[/]")
             users = []
-        saved = load_saved(store)
-        
-        super_user = None
-        if users or saved:
-            CONSOLE.print("\n[bold cyan]Handler Managed Identities (Personas):[/]")
+        saved_raw = load_saved(store)
+        saved = extract_super_user(saved_raw) if saved_raw else None
+        super_user: Optional[str] = None
+
+        if saved and all(str(u.get("id", "")).strip() != saved for u in users):
+            users = users + [{"id": saved, "active": False}]
+
+        CONSOLE.print("\n[bold cyan]Available Super Users:[/]")
+        if users:
             for i, u in enumerate(users, 1):
-                uid    = u.get("id", "??")
+                uid = str(u.get("id", "")).strip()
+                if not uid:
+                    continue
                 status = "[bold yellow]Active[/]" if u.get("active") else "[bold green]Free[/]"
                 CONSOLE.print(f"  {i}. {uid:24} {status}")
-            if saved:
-                busy = any(u.get("id") == saved and u.get("active") for u in users)
-                tag  = " [bold yellow](Busy)[/]" if busy else ""
-                CONSOLE.print(f"  [bold cyan]l[/]. Load last session ([bold white]{saved}[/]){tag}")
-            CONSOLE.print("  [bold cyan]n[/]. Create New Identity")
-            choice = input("\nSelect persona (leave blank for new): ").strip().lower()
-            if choice.isdigit() and users:
-                idx = int(choice) - 1
-                if 0 <= idx < len(users):
-                    t = users[idx]
-                    if t.get("active"):
-                        CONSOLE.print(f"[bold red]Error:[/] '{t['id']}' is already in use.")
-                        return pick_persona_and_session(host, port, store)
-                    super_user = t["id"]
-            if choice == "l" and saved:
-                if any(u.get("id") == saved and u.get("active") for u in users):
-                    CONSOLE.print(f"[bold red]Error:[/] '{saved}' is active elsewhere.")
-                    return pick_persona_and_session(host, port, store)
-                super_user = saved
-            elif choice == "n" or not choice:
-                custom = input("Enter new persona name (leave blank for random): ").strip()
-                super_user = custom if custom else "user_" + uuid.uuid4().hex[:8]
         else:
-            custom = input("Enter new persona name (leave blank for random): ").strip()
-            super_user = custom if custom else "user_" + uuid.uuid4().hex[:8]
+            CONSOLE.print("  [dim]No known super users yet.[/]")
+
+        if saved:
+            CONSOLE.print(f"  [bold cyan]l[/]. Use last saved user ([bold white]{saved}[/])")
+        CONSOLE.print("  [bold cyan]n[/]. Enter new super user")
+
+        choice = input("\nSelect super user (number / l / n): ").strip().lower()
+
+        if choice.isdigit() and users:
+            idx = int(choice) - 1
+            if 0 <= idx < len(users):
+                selected = str(users[idx].get("id", "")).strip()
+                if selected:
+                    super_user = selected
+        elif choice == "l" and saved:
+            super_user = saved
+        elif choice == "n" or not choice:
+            custom = input("Enter super user name: ").strip()
+            if custom:
+                super_user = custom
+
+        if not super_user:
+            CONSOLE.print("[bold red]Error:[/] invalid super user selection.")
+            return pick_persona_and_session(host, port, store)
 
         # Now select session
         try:
             sessions = Gateway.list_sessions(super_user, host, port)
         except Exception:
             sessions = []
-            
+
         if sessions:
             CONSOLE.print(f"\n[bold cyan]Sessions for {super_user}:[/]")
             for i, s_dict in enumerate(sessions, 1):
-                s_id = s_dict if isinstance(s_dict, str) else s_dict.get("id", "Unknown")
-                is_active = False if isinstance(s_dict, str) else s_dict.get("active", False)
+                s_id = str(s_dict.get("id", "Unknown"))
+                is_active = bool(s_dict.get("active", False))
                 status = "[bold yellow](Active)[/]" if is_active else "[bold green](Free)[/]"
                 CONSOLE.print(f"  {i}. {s_id} {status}")
             CONSOLE.print("  [bold cyan]n[/]. Create New Session")
             choice = input("\nSelect session (leave blank for latest, 'n' for new): ").strip().lower()
             if choice == "n":
-                s_name = input("Enter new session name (leave blank for auto _sN): ").strip()
-                if s_name:
-                    if s_name.startswith("_s"):
-                        return f"{super_user}{s_name}", False
-                    return f"{super_user}_s_{s_name}", False
                 return super_user, True
             if choice.isdigit():
                 idx = int(choice) - 1
                 if 0 <= idx < len(sessions):
-                    s_dict = sessions[idx]
-                    return s_dict if isinstance(s_dict, str) else s_dict.get("id"), False
+                    return str(sessions[idx].get("id", "")), False
             latest_dict = sessions[-1]
-            return latest_dict if isinstance(latest_dict, str) else latest_dict.get("id"), False # default to latest
+            return str(latest_dict.get("id", "")), False
 
         # No sessions exist yet
-        print("\n[Welcome to Velix! Let's set up your first session]")
-        s_name = input("Enter session name (leave blank for default _s1): ").strip()
-        if s_name:
-            if s_name.startswith("_s"):
-                return f"{super_user}{s_name}", False
-            return f"{super_user}_s_{s_name}", False
+        CONSOLE.print("\n[dim cyan]No sessions found; creating first session on connect.[/]")
         return super_user, False
 
     user_id = args.user_id
@@ -530,13 +549,7 @@ def main() -> None:
         gw.connect(force_new=force_new)
     except Exception as e:
         CONSOLE.print(f"[bold red]Connection Failed:[/] {e}")
-        if "already active" in str(e).lower():
-            CONSOLE.print("[yellow]Retrying with new identity...[/]")
-            user_id = "terminal_" + uuid.uuid4().hex[:8]
-            gw = TerminalGateway(args.host, args.port, user_id, args.user_store)
-            gw.connect(force_new=force_new)
-        else:
-            sys.exit(1)
+        sys.exit(1)
 
     with patch_stdout():
         gw.run()

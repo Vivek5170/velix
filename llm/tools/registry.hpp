@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -57,7 +58,7 @@ public:
     try {
       result = velix::utils::ProcessSpawner::run_sync_with_timeout(
           manifest.command, run_args, {}, 30000, run_cwd);
-    } catch (const std::exception &e) {
+    } catch (const std::runtime_error &e) {
       return {{"status", "error"},
               {"error", "tool_process_exception"},
               {"tool", name},
@@ -75,15 +76,24 @@ public:
     try {
       const json parsed = json::parse(result.stdout_content);
       output["parsed"] = parsed;
-    } catch (...) {
+    } catch (const nlohmann::json::parse_error &) {
+      // Tool stdout can legitimately be plain text.
     }
 
     return output;
   }
 
 private:
-  std::map<std::string, ToolManifest> manifests_;
+  std::map<std::string, ToolManifest, std::less<>> manifests_;
   json cached_schemas_ = json::array();
+
+  static std::string get_string_or(const json &obj, const char *key,
+                                   const std::string &fallback) {
+    if (obj.contains(key) && obj[key].is_string()) {
+      return obj[key].get<std::string>();
+    }
+    return fallback;
+  }
 
   static std::filesystem::path repo_root_from_cwd() {
     std::filesystem::path cur = std::filesystem::current_path();
@@ -131,21 +141,18 @@ private:
       try {
         std::ifstream in(manifest_path);
         in >> manifest_json;
-      } catch (...) {
+        } catch (const nlohmann::json::exception &) {
+        continue;
+        } catch (const std::ios_base::failure &) {
         continue;
       }
 
       ToolManifest manifest;
-      manifest.name = (manifest_json.contains("name") && manifest_json["name"].is_string()) ?
-          manifest_json["name"].get<std::string>() : dir_name;
-      manifest.type = (manifest_json.contains("type") && manifest_json["type"].is_string()) ?
-          manifest_json["type"].get<std::string>() : std::string("skill");
-      manifest.description = (manifest_json.contains("description") && manifest_json["description"].is_string()) ?
-          manifest_json["description"].get<std::string>() : std::string("");
-      manifest.runtime = (manifest_json.contains("runtime") && manifest_json["runtime"].is_string()) ?
-          manifest_json["runtime"].get<std::string>() : std::string("");
-      manifest.workdir = (manifest_json.contains("workdir") && manifest_json["workdir"].is_string()) ?
-          manifest_json["workdir"].get<std::string>() : std::string("");
+        manifest.name = get_string_or(manifest_json, "name", dir_name);
+        manifest.type = get_string_or(manifest_json, "type", "skill");
+        manifest.description = get_string_or(manifest_json, "description", "");
+        manifest.runtime = get_string_or(manifest_json, "runtime", "");
+        manifest.workdir = get_string_or(manifest_json, "workdir", "");
       if (manifest_json.contains("parameters") && manifest_json["parameters"].is_object()) {
         manifest.parameters = manifest_json["parameters"];
       } else {
@@ -154,8 +161,7 @@ private:
 
       if (manifest_json.contains("run") && manifest_json["run"].is_object()) {
         const json run = manifest_json["run"];
-        manifest.command = (run.contains("command") && run["command"].is_string()) ?
-            run["command"].get<std::string>() : std::string("");
+        manifest.command = get_string_or(run, "command", "");
         if (run.contains("args") && run["args"].is_array()) {
           for (const auto &arg : run["args"]) {
             if (arg.is_string()) {
@@ -172,20 +178,20 @@ private:
 
   std::vector<std::string> list_tool_names() const {
     std::vector<std::string> names;
-    for (const auto &entry : manifests_) {
-      names.push_back(entry.first);
+    for (const auto &[name, manifest] : manifests_) {
+      (void)manifest;
+      names.push_back(name);
     }
     return names;
   }
 
   void recompute_cached_schemas() {
     cached_schemas_ = json::array();
-    for (const auto &entry : manifests_) {
-      const ToolManifest &manifest = entry.second;
+    for (const auto &[name, manifest] : manifests_) {
       cached_schemas_.push_back(
           {{"type", "function"},
            {"function",
-            {{"name", manifest.name},
+            {{"name", name},
              {"description", manifest.description},
              {"parameters", manifest.parameters.is_object() ? manifest.parameters
                                                               : json::object()}}}});
@@ -203,8 +209,8 @@ private:
     }
 
     const std::filesystem::path repo_root = repo_root_from_cwd();
-    const std::filesystem::path from_repo = repo_root / path;
-    if (std::filesystem::exists(from_repo)) {
+    if (const std::filesystem::path from_repo = repo_root / path;
+        std::filesystem::exists(from_repo)) {
       return from_repo.string();
     }
 

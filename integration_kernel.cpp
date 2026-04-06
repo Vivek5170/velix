@@ -14,13 +14,17 @@
 
 namespace {
 
-std::atomic<bool> g_shutdown_requested{false};
+std::atomic<bool> &shutdown_requested() {
+  static std::atomic requested{false};
+  return requested;
+}
 
-void handle_signal(int) { g_shutdown_requested.store(true); }
+void handle_signal(int) { shutdown_requested().store(true); }
 
 void request_shutdown_once() {
-  static std::atomic<bool> already_called{false};
-  if (already_called.exchange(true)) {
+  static std::atomic already_called{false};
+  if (const bool was_already_called = already_called.exchange(true);
+      was_already_called) {
     return;
   }
 
@@ -38,14 +42,14 @@ bool wait_for_service(const std::string &service_name, int port,
   const std::string host =
       velix::communication::resolve_service_host(service_name, "127.0.0.1");
 
-  while (!g_shutdown_requested.load()) {
+  while (!shutdown_requested().load()) {
     try {
       velix::communication::SocketWrapper probe;
       probe.create_tcp_socket();
       probe.connect(host, static_cast<uint16_t>(port));
       probe.close();
       return true;
-    } catch (...) {
+    } catch (const std::exception &) {
       if (std::chrono::steady_clock::now() >= deadline) {
         return false;
       }
@@ -75,7 +79,13 @@ int main() {
 
   std::thread bus_thread([bus_port]() { velix::core::start_bus(bus_port); });
   std::thread executioner_thread([executioner_port]() {
-    velix::core::start_executioner(executioner_port);
+    try {
+      velix::core::start_executioner(executioner_port);
+    } catch (const std::exception &e) {
+      if (!shutdown_requested().load()) {
+        LOG_ERROR("Executioner thread failed: " + std::string(e.what()));
+      }
+    }
   });
   std::thread scheduler_thread(
       [scheduler_port]() { velix::llm::start_scheduler(scheduler_port); });
@@ -100,13 +110,20 @@ int main() {
   }
 
   std::thread signal_watcher([]() {
-    while (!g_shutdown_requested.load()) {
+    while (!shutdown_requested().load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     request_shutdown_once();
   });
 
-  velix::core::start_supervisor(supervisor_port);
+  try {
+    velix::core::start_supervisor(supervisor_port);
+  } catch (const std::exception &e) {
+    LOG_ERROR(std::string("Supervisor thread failed: ") + e.what());
+    if (!shutdown_requested().load()) {
+      request_shutdown_once();
+    }
+  }
 
   request_shutdown_once();
 

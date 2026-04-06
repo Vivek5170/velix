@@ -9,6 +9,7 @@ struct CompactResult {
     nlohmann::json history;
     bool compacted = false;
     std::string summary;
+    std::string skip_reason;
 };
 
 /**
