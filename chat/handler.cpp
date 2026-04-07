@@ -233,6 +233,7 @@ private:
                 if (!sender_uid.empty()) {
                     send_to_session(sender_uid,
                                     {{"type","approval_request"},
+                                     {"approval_trace", atrace},
                                      {"payload", payload}});
                 }
                 return;

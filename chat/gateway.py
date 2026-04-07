@@ -576,9 +576,13 @@ class Gateway(ABC):
             )
 
         elif t == "approval_request":
+            payload = event.get("payload", {})
+            trace = event.get("approval_trace", "")
+            if not trace and isinstance(payload, dict):
+                trace = str(payload.get("approval_trace", ""))
             self.on_approval_request(
-                event.get("approval_trace", ""),
-                event.get("payload", {}),
+                trace,
+                payload,
             )
 
         elif t == "approval_ack":

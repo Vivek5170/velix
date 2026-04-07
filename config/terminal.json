@@ -2,7 +2,7 @@
   "_comment": "Velix commandline skill configuration — loaded from ../../config/terminal.json",
   "approval": {
     "_comment_mode": "'smart' = pattern-match dangerous cmds and ask; 'off' = always allow; 'manual' = always ask",
-    "mode": "off",
+    "mode": "smart",
     "_comment_timeout_sec": "Seconds to wait for handler approval reply before auto-denying",
     "timeout_sec": 60
   },
@@ -21,9 +21,9 @@
     "allow_path_escape": true
   },
   "allowlist": {
-    "_comment_permanent_path": "Where permanent approvals are persisted. ~ is expanded.",
-    "permanent_path": "~/.velix/commandline_allowlist.txt",
-    "_comment_entries": "Patterns pre-approved at startup — no prompting needed for these",
+    "_comment_permanent_path": "Repo-local allowlist file (exact key match: mode:session_id:command)",
+    "permanent_path": ".velix/terminal/allowlist.txt",
+    "_comment_entries": "Exact pre-approved keys loaded at startup",
     "entries": []
   }
 }

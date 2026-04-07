@@ -120,7 +120,7 @@ struct TerminalConfig {
   std::string playground_root = "agent_playground";
   bool allow_path_escape = false;
 
-  std::string permanent_path = "~/.velix/commandline_allowlist.txt";
+  std::string permanent_path = ".velix/terminal/allowlist.txt";
   std::vector<std::string> entries;
 };
 
@@ -132,6 +132,11 @@ public:
 static TerminalConfig &skill_config() {
   static TerminalConfig cfg;
   return cfg;
+}
+
+static fs::path &config_root_dir() {
+  static fs::path dir = fs::current_path();
+  return dir;
 }
 
 static std::mutex &skill_log_mutex() {
@@ -200,8 +205,21 @@ static std::string expand_home(const std::string &p) {
   return std::string(h.has_value() ? *h : "/tmp") + p.substr(1);
 }
 
+static fs::path resolve_config_path(const std::string &p) {
+  fs::path raw(expand_home(p));
+  if (raw.is_absolute())
+    return raw;
+  return fs::absolute(config_root_dir() / raw);
+}
+
 static TerminalConfig load_config(const std::string &path) {
   TerminalConfig cfg;
+  try {
+    fs::path cfg_path = fs::absolute(path);
+    config_root_dir() = cfg_path.parent_path().parent_path();
+  } catch (const std::exception &) {
+    config_root_dir() = fs::current_path();
+  }
   std::ifstream f(path);
   if (!f.is_open())
     return cfg;
@@ -257,7 +275,15 @@ static TerminalConfig load_config(const std::string &path) {
 // ============================================================================
 
 static fs::path perm_al_path() {
-  return fs::path(expand_home(skill_config().permanent_path));
+  return resolve_config_path(skill_config().permanent_path);
+}
+
+static std::string exact_cmd_key(const std::string &s) {
+  size_t a = s.find_first_not_of(" \t\r\n");
+  if (a == std::string::npos)
+    return "";
+  size_t b = s.find_last_not_of(" \t\r\n");
+  return s.substr(a, b - a + 1);
 }
 
 static std::set<std::string, std::less<>> load_perm_al() {
@@ -999,16 +1025,24 @@ private:
   // ── Approval ──────────────────────────────────────────────────────────
 
   ApprovalResult check_approval(const std::string &full_cmd, bool force) {
+    const std::string uid = user_id.empty() ? std::string("anonymous") : user_id;
+    std::string mode = skill_config().approval_mode;
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    if (mode != "off" && mode != "manual" && mode != "smart")
+      mode = "smart";
+    const std::string exact_key = mode + ":" + uid + ":" + exact_cmd_key(full_cmd);
+
     if (force) {
       skill_log("approval_skip_force", {{"command", full_cmd}});
       return approved_ok("force flag set");
     }
-    if (skill_config().approval_mode == "off") {
+    if (mode == "off") {
       skill_log("approval_skip_mode_off", {{"command", full_cmd}});
       return approved_ok("approval disabled");
     }
 
-    bool must_prompt = (skill_config().approval_mode == "manual");
+    bool must_prompt = (mode == "manual");
     DetectResult det;
     if (!must_prompt) {
       det = detect_dangerous(full_cmd);
@@ -1016,12 +1050,14 @@ private:
         skill_log("approval_not_required", {{"command", full_cmd}});
         return approved_ok("");
       }
+      det.pattern_key = exact_key;
     } else {
-      det = {true, "manual_mode", "manual approval mode"};
+      det = {true, exact_key, "manual approval mode"};
     }
 
     skill_log("approval_required",
               {{"command", full_cmd},
+               {"approval_mode", mode},
                {"pattern_key", det.pattern_key},
                {"description", det.description}});
 
@@ -1120,9 +1156,9 @@ private:
     }
 
     ApprovalScope scope = reply_scope == "once"      ? ApprovalScope::Once
-                          : reply_scope == "session" ? ApprovalScope::Session
-                          : reply_scope == "always"  ? ApprovalScope::Always
-                                                     : ApprovalScope::Deny;
+          : reply_scope == "session" ? ApprovalScope::Session
+          : reply_scope == "always"  ? ApprovalScope::Always
+                 : ApprovalScope::Deny;
 
     if (scope == ApprovalScope::Deny) {
       skill_log("approval_denied",

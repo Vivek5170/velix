@@ -53,6 +53,7 @@ from .spinner import KawaiiSpinner
 # ─────────────────────────────────────────────────────────────────────────────
 
 _HISTORY_FILE = Path.home() / ".velix_history"
+_VALID_UI_APPROVE_MODES = {"all", "default"}
 
 
 def _fmt_tokens(n: int) -> str:
@@ -110,6 +111,10 @@ class TerminalGateway(Gateway):
         self._prompt_session    = PromptSession(
             history=FileHistory(str(_HISTORY_FILE))
         )
+        # Gate input so approval prompts don't race with main prompt session.
+        self._turn_done         = threading.Event()
+        self._turn_done.set()
+        self._approve_mode      = "default"  # all | default (runtime only)
 
         # Register extra commands
         self._register_terminal_commands()
@@ -195,9 +200,13 @@ class TerminalGateway(Gateway):
             # Don't print the bar here; it's printed in _handle_end instead.
 
         elif t == "approval_request":
+            payload = event.get("payload", {})
+            trace = event.get("approval_trace", "")
+            if not trace and isinstance(payload, dict):
+                trace = str(payload.get("approval_trace", ""))
             self.on_approval_request(
-                event.get("approval_trace", ""),
-                event.get("payload", {}),
+                trace,
+                payload,
             )
 
         elif t == "approval_ack":
@@ -206,6 +215,8 @@ class TerminalGateway(Gateway):
                 f"\n{S.DIM_CYAN}  ✓ Approval acknowledged"
                 f" (trace {trace[:8]}…){S.RST}"
             )
+            # Unblock input if a turn doesn't emit a terminal end frame.
+            self._turn_done.set()
 
         elif t == "session_switched":
             sid = event.get("session_id", "")
@@ -276,6 +287,10 @@ class TerminalGateway(Gateway):
         if isinstance(result, dict) and (result.get("error") or result.get("status") == "error"):
             failed = True
         self._spinner.stop(tool, dur, failed=failed)
+        if isinstance(result, dict):
+            note = result.get("approval_note", "")
+            if isinstance(note, str) and note.strip():
+                _pt_print(f"  {S.DIM_CYAN}↳ approval: {sanitize(note)}{S.RST}")
         self._current_tool    = ""
         self._tool_start_time = 0.0
 
@@ -302,6 +317,11 @@ class TerminalGateway(Gateway):
     def on_approval_request(self, approval_trace: str, payload: dict) -> None:
         """Interactive approval prompt in context [B]."""
         self._ensure_newline()
+        if self._spinner.is_running():
+            dur = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
+            self._spinner.stop(self._current_tool, dur, failed=False)
+            self._current_tool = ""
+            self._tool_start_time = 0.0
         cmd  = payload.get("command", payload.get("message", ""))
         desc = payload.get("description", "")
         _pt_print(f"\n{S.YELLOW}{'─' * 52}{S.RST}")
@@ -311,18 +331,35 @@ class TerminalGateway(Gateway):
             _pt_print(f"  Command : {S.WHITE}{sanitize(cmd)}{S.RST}")
         if desc:
             _pt_print(f"  Reason  : {sanitize(desc)}")
+        if approval_trace:
+            _pt_print(f"  Trace ID: {S.CYAN}{sanitize(approval_trace)}{S.RST}")
         _pt_print(f"{S.YELLOW}{'─' * 52}{S.RST}")
-        _pt_print("  Reply:  allow  /  deny  /  allow_all")
-        try:
-            ans = input("  > ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = "deny"
-        if ans not in ("allow", "deny", "allow_all"):
-            ans = "deny"
-        self.send_approval_reply(approval_trace, ans)
+
+        if self._approve_mode == "all":
+            _pt_print(f"  Mode    : {S.CYAN}all{S.RST} (auto-approved)")
+            self.send_approval_reply(approval_trace, "once")
+            return
+
+        _pt_print("  Reply:  allow  /  deny  /  whitelist")
+        ans = ""
+        while ans not in ("allow", "deny", "whitelist"):
+            try:
+                ans = input("  > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "deny"
+                break
+            if ans not in ("allow", "deny", "whitelist"):
+                _pt_print("  Please type exactly: allow / deny / whitelist")
+        scope = {
+            "allow": "once",
+            "deny": "deny",
+            "whitelist": "always",
+        }.get(ans, "deny")
+        self.send_approval_reply(approval_trace, scope)
 
     def on_session_switched(self, session_id: str) -> None:
         self._user_id = session_id
+        self._approve_mode = "default"
         _pt_print(f"\n{S.DIM_CYAN}  ↻ Session → {session_id}{S.RST}")
 
     def on_notify(self, event: dict) -> None:
@@ -341,6 +378,7 @@ class TerminalGateway(Gateway):
     def on_error(self, message: str) -> None:
         self._ensure_newline()
         _pt_print(f"\n{S.BOLD_RED}[Error]{S.RST} {sanitize(message)}")
+        self._turn_done.set()
 
     # ═══════════════════════════════════════════════════════════════════════
     # run() — main loop
@@ -373,7 +411,9 @@ class TerminalGateway(Gateway):
                                 )
                             continue
                         if cmd in self._forwarded_commands:
+                            self._turn_done.clear()
                             self.send_message(text)
+                            self._turn_done.wait()
                             continue
                         _pt_print(
                             f"{S.BOLD_RED}[Invalid command]{S.RST} "
@@ -382,7 +422,9 @@ class TerminalGateway(Gateway):
                         )
                         continue
 
+                    self._turn_done.clear()
                     self.send_message(text)
+                    self._turn_done.wait()
 
                 except (KeyboardInterrupt, EOFError):
                     break
@@ -423,6 +465,7 @@ class TerminalGateway(Gateway):
             bar = format_context_bar(self._ctx_current, self._ctx_max, pct)
             if bar:
                 _pt_print(bar)
+        self._turn_done.set()
 
     def _ensure_newline(self) -> None:
         """If we're mid-stream, print a newline first."""
@@ -564,6 +607,7 @@ class TerminalGateway(Gateway):
                 f"  {S.CYAN}/users{S.RST}                   — list all super-users",
                 f"  {S.CYAN}/list_sessions [user]{S.RST}    — list sessions",
                 f"  {S.CYAN}/switch <session_id>{S.RST}     — switch active session",
+                f"  {S.CYAN}/approvemode [all|default]{S.RST} — runtime auto-approval mode",
                 "",
                 f"{S.BOLD_CYAN}Handler-side commands (sent to server):{S.RST}",
                 f"  {S.CYAN}/new{S.RST}             — start a new session",
@@ -580,8 +624,23 @@ class TerminalGateway(Gateway):
             for line in lines:
                 _pt_print(line)
 
+        def _approvemode(args: str) -> None:
+            wanted = args.strip().lower()
+            if not wanted:
+                _pt_print(f"  approvemode = {S.CYAN}{self._approve_mode}{S.RST}")
+                return
+            if wanted not in _VALID_UI_APPROVE_MODES:
+                _pt_print(
+                    f"  {S.BOLD_RED}Invalid mode{S.RST}: {sanitize(wanted)}. "
+                    "Use one of: all | default"
+                )
+                return
+            self._approve_mode = wanted
+            _pt_print(f"  approvemode set to {S.CYAN}{wanted}{S.RST} (memory only)")
+
         self.register_command("/help",           _help)
         self.register_command("/users",          _users)
         self.register_command("/list_sessions",  _list_sessions)
         self.register_command("/switch",         _switch)
+        self.register_command("/approvemode",    _approvemode)
         # /exit and /quit handled by get_next_input()
