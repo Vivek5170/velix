@@ -323,9 +323,10 @@ class VelixProcess:
         retry_limit = _get_config("SDK_RETRY_LIMIT", 3)
         retry_delay = _get_config("SDK_RETRY_DELAY_MS", 500)
         llm_timeout_ms = _get_config("SDK_LLM_TIMEOUT_MS", 305000)
+        max_iterations = _get_config("SDK_MAX_ITERATIONS", 100)
 
         loop_count = 0
-        while self.is_running and loop_count < 10:
+        while self.is_running and loop_count < max_iterations:
             payload = dict(base_payload)
             payload["convo_id"] = active_convo_id
             payload["message_type"] = "LLM_REQUEST"
@@ -424,7 +425,7 @@ class VelixProcess:
             self._status = "WAITING_LLM"
 
         self._status = "ERROR"
-        return "Failure: Agent state machine exceeded max 10 iterations."
+        return f"Failure: Agent state machine exceeded max {max_iterations} iterations."
 
     def _execute_single_tool_call(
         self,

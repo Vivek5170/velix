@@ -261,11 +261,12 @@ class SessionSearchSkill(VelixProcess):
 
             if user_id:
                 if self._is_session_id(user_id) or self._parse_proc_session(user_id):
-                    sql += " AND t.convo_id = ?"
+                    sql += " AND (t.convo_id = ? OR t.convo_id GLOB ?)"
                     sql_params.append(user_id)
+                    sql_params.append(user_id + "_h*")
                 else:
-                    sql += " AND t.convo_id LIKE ?"
-                    sql_params.append(user_id + "_s%")
+                    sql += " AND t.convo_id GLOB ?"
+                    sql_params.append(user_id + "_s*")
 
             sql += " ORDER BY score LIMIT ?"
             sql_params.append(limit)

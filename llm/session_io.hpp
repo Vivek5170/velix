@@ -112,6 +112,9 @@ public:
 	/** Load a conversation by convo_id (from cache or disk). */
 	Conversation get_conversation(const std::string& convo_id);
 
+	/** Evict a conversation from in-memory cache so next access reloads from disk. */
+	void invalidate_conversation_cache(const std::string& convo_id);
+
 	/** Append a message; persists to disk. */
 	bool append_message(const std::string& convo_id, const std::string& role,
 	                    const std::string& content, uint64_t tokens_used = 0,

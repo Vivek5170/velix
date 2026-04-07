@@ -127,12 +127,6 @@ Terminal 1:
 ./build/integration_kernel
 ```
 
-Terminal 2:
-
-```bash
-./build/chat_handler
-```
-
 ### 3) Python requirements for terminal client
 
 The interactive terminal client requires Python 3.10+ and these packages:

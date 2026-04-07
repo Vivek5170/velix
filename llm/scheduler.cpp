@@ -39,9 +39,20 @@ namespace velix::llm {
 
 namespace {
 
+struct ModelConfig {
+  std::string model_name{"unknown"};
+  std::string model_type{"unknown"};
+  std::string active_adapter{"unknown"};
+  std::size_t context_length{0};
+  int max_simultaneous_llm_requests{0};
+  bool enabled{true};
+};
+
 struct SchedulerConfig {
   std::string active_adapter;
   adapters::AdapterConfig adapter_cfg;
+  ModelConfig model_info;
+  double auto_compact_threshold{0.70};
   int max_llm_keys{5};
   int max_client_threads{64}; // Tier 1: Lobby Pool Size
   int scheduler_wait_timeout_ms{65000};
@@ -260,9 +271,34 @@ SchedulerConfig load_scheduler_config() {
     cfg.adapter_cfg.timeout_ms = model_json.value("request_timeout_ms", 60000);
     cfg.scheduler_wait_timeout_ms =
         model_json.value("request_timeout_ms", 60000) + 5000;
-    cfg.max_llm_keys = model_json.value("max_simultaneous_llm_requests", 5);
+    cfg.model_info.active_adapter = cfg.active_adapter;
+    cfg.model_info.model_name =
+      adapter.value("model", model_json.value("model_name", std::string("unknown")));
+    cfg.model_info.model_type = adapter.value(
+      "api_style", model_json.value("model_type", std::string("unknown")));
+    cfg.model_info.enabled =
+      adapter.value("enabled", model_json.value("enabled", true));
+    cfg.model_info.max_simultaneous_llm_requests =
+      model_json.value("max_simultaneous_llm_requests", 5);
+    cfg.model_info.context_length =
+      model_json.value("max_context_tokens", std::size_t{0});
+
+    cfg.max_llm_keys = cfg.model_info.max_simultaneous_llm_requests;
     cfg.max_client_threads = model_json.value("max_client_threads", 64);
   }
+
+    {
+    json compacter_json;
+    if (load_json_with_fallback({"config/compacter.json",
+                   "../config/compacter.json",
+                   "build/config/compacter.json"},
+                  compacter_json) &&
+      compacter_json.contains("auto_compact_threshold") &&
+      compacter_json["auto_compact_threshold"].is_number()) {
+      cfg.auto_compact_threshold =
+        compacter_json["auto_compact_threshold"].get<double>();
+    }
+    }
 
   cfg.executioner_port = velix::utils::get_port("EXECUTIONER", 5172);
   cfg.supervisor_port = velix::utils::get_port("SUPERVISOR", 5173);
@@ -272,85 +308,6 @@ SchedulerConfig load_scheduler_config() {
   }
 
   return cfg;
-}
-
-struct ModelConfig {
-  std::string model_name{"unknown"};
-  std::string model_type{"unknown"};
-  std::size_t context_length{0};
-  bool enabled{true};
-};
-
-ModelConfig load_model_config() {
-  ModelConfig model_config;
-
-  for (const char *path : {"config/model.json", "../config/model.json",
-                           "build/config/model.json"}) {
-    std::ifstream in(path);
-    if (!in.is_open()) {
-      continue;
-    }
-
-    try {
-      json cfg;
-      in >> cfg;
-
-      model_config.model_name =
-          cfg.value("model_name", std::string("unknown"));
-      model_config.model_type =
-          cfg.value("model_type", std::string("unknown"));
-      model_config.enabled = cfg.value("enabled", true);
-
-      model_config.context_length =
-          cfg.value("max_context_tokens", std::size_t{0});
-    } catch (...) {
-    }
-
-    break;
-  }
-
-  return model_config;
-}
-
-double load_auto_compact_threshold() {
-  for (const char *path : {"config/compacter.json", "../config/compacter.json",
-                           "build/config/compacter.json"}) {
-    std::ifstream in(path);
-    if (!in.is_open()) {
-      continue;
-    }
-
-    try {
-      json cfg;
-      in >> cfg;
-
-      if (cfg.contains("auto_compact_threshold") &&
-          cfg["auto_compact_threshold"].is_number()) {
-        return cfg["auto_compact_threshold"].get<double>();
-      }
-    } catch (...) {
-    }
-  }
-
-  return 0.70;
-}
-
-std::size_t estimate_request_tokens(const json &messages) {
-  if (!messages.is_array()) {
-    return 0;
-  }
-
-  std::size_t total_chars = 0;
-  for (const auto &message : messages) {
-    if (!message.is_object()) {
-      continue;
-    }
-    if (message.contains("content") && message["content"].is_string()) {
-      total_chars += message["content"].get<std::string>().size();
-    }
-  }
-
-  return total_chars / 4;
 }
 
 void attach_session_alias_fields(json &reply) {
@@ -365,7 +322,8 @@ void attach_session_alias_fields(json &reply) {
 
 void handle_session_control(const json &envelope,
                             velix::communication::SocketWrapper &socket,
-                            SessionManager &sm, SessionIO &session_io_ref) {
+                            SessionManager &sm, SessionIO &session_io_ref,
+                            const SchedulerConfig &cfg) {
   const std::string action = envelope.value("action", std::string(""));
   const std::string user_id = envelope.value("user_id", std::string(""));
   const std::string title = envelope.value("title", std::string(""));
@@ -373,7 +331,7 @@ void handle_session_control(const json &envelope,
   json reply = {{"message_type", "SESSION_RESPONSE"}, {"action", action}};
 
   try {
-    const ModelConfig mc = load_model_config();
+    const ModelConfig &mc = cfg.model_info;
 
     const auto target = SessionManager::resolve_target(user_id);
     const std::string super_user = target.super_user;
@@ -427,6 +385,9 @@ void handle_session_control(const json &envelope,
       }
 
       const auto compact_result = sm.compact(target, history, false);
+      if (compact_result.compacted) {
+        session_io_ref.invalidate_conversation_cache(target);
+      }
 
       reply["session"] = sm.get_session_object(target, mc.context_length);
       reply["summary"] = compact_result.summary;
@@ -530,7 +491,8 @@ void handle_session_query(const json &envelope,
                           const tools::ToolRegistry &registry,
                           const std::unordered_map<std::string, TreeQueue>
                               &tree_queues_ref,
-                          std::mutex &queue_mutex_ref) {
+              std::mutex &queue_mutex_ref,
+              const SchedulerConfig &cfg) {
   const std::string query_type =
       envelope.value("query_type", std::string(""));
   const std::string user_id = envelope.value("user_id", std::string(""));
@@ -539,8 +501,8 @@ void handle_session_query(const json &envelope,
                 {"query_type", query_type}};
 
   try {
-    const ModelConfig mc = load_model_config();
-    const double threshold = load_auto_compact_threshold();
+    const ModelConfig &mc = cfg.model_info;
+    const double threshold = cfg.auto_compact_threshold;
 
     const auto target = SessionManager::resolve_target(user_id);
     const std::string super_user = target.super_user;
@@ -556,15 +518,28 @@ void handle_session_query(const json &envelope,
                               : sm.get_or_create_active_session(super_user);
 
       const auto info = sm.get_session_info(target);
-        reply["session"] =
+      reply["session"] =
           SessionManager::build_session_object(info, mc.context_length);
+      const std::string mode =
+          (target.rfind("proc_", 0) == 0) ? "conversation"
+                                          : "user_conversation";
+      const auto usage = sm.compute_context_usage(
+          target, json::array(), registry, mode, mc.context_length);
+
+      reply["session_tokens"] = usage.session_tokens;
+      reply["system_prompt_tokens"] = usage.system_prompt_tokens;
+      reply["tool_schema_tokens"] = usage.tool_schema_tokens;
+      reply["request_tokens"] = usage.request_tokens;
+      reply["total_context_tokens"] = usage.total_context_tokens;
+      reply["max_context_tokens"] = usage.max_context_tokens;
+      reply["context_fill_pct"] = usage.context_fill_pct;
       reply["auto_compact_threshold_pct"] =
           static_cast<int>(threshold * 100);
 
-      if (mc.context_length > 0) {
+      if (usage.max_context_tokens > 0) {
         const double fill =
-            static_cast<double>(info.live_stats.current_context_tokens) /
-            static_cast<double>(mc.context_length);
+            static_cast<double>(usage.total_context_tokens) /
+            static_cast<double>(usage.max_context_tokens);
         reply["context_warning"] = (fill >= threshold);
       }
     } else if (query_type == "queue_depth") {
@@ -592,7 +567,11 @@ void handle_session_query(const json &envelope,
     } else if (query_type == "model_info") {
       reply["model_name"] = mc.model_name;
       reply["model_type"] = mc.model_type;
+      reply["active_adapter"] = mc.active_adapter;
       reply["context_length"] = mc.context_length;
+      reply["max_context_tokens"] = mc.context_length;
+      reply["max_simultaneous_llm_requests"] =
+          mc.max_simultaneous_llm_requests;
       reply["enabled"] = mc.enabled;
       reply["auto_compact_threshold_pct"] =
           static_cast<int>(threshold * 100);
@@ -1003,7 +982,18 @@ json process_llm_request_stateless(
     }
   }
 
-  const uint64_t tokens_used = final_response.usage.value("total_tokens", static_cast<uint64_t>(0));
+    // Persist only assistant-output growth in session history. total_tokens
+    // includes prompt tokens, which are already represented by prior turns.
+    const uint64_t completion_tokens =
+      final_response.usage.value("completion_tokens", static_cast<uint64_t>(0));
+      const uint64_t completion_estimate =
+        !final_response.content.empty()
+          ? static_cast<uint64_t>(final_response.content.size() / 4)
+          : static_cast<uint64_t>(normalized_tool_calls.dump().size() / 4);
+    const uint64_t tokens_used =
+      completion_tokens > 0
+        ? completion_tokens
+          : completion_estimate;
 
   if ((mode == "conversation" || mode == "user_conversation") &&
       !normalized_tool_calls.empty()) {
@@ -1178,16 +1168,14 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
                     req.payload);
           }
 
-          const ModelConfig model_cfg = load_model_config();
-          const double auto_compact_threshold = load_auto_compact_threshold();
           const std::string convo_id =
               req.payload.value("convo_id", std::string(""));
-          const std::size_t request_tokens =
-              estimate_request_tokens(req.payload["messages"]);
+            const auto usage = session_manager.compute_context_usage(
+              convo_id, req.payload["messages"], tool_registry, mode,
+              cfg.model_info.context_length);
 
           const auto guard_result = session_manager.run_auto_compact_guard(
-              convo_id, request_tokens, model_cfg.context_length,
-              auto_compact_threshold, session_io);
+              convo_id, usage, cfg.auto_compact_threshold, session_io);
 
           req.payload["auto_compacted"] = guard_result.compacted;
           req.payload["compact_skip_reason"] = guard_result.skip_reason;
@@ -1384,12 +1372,12 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
 
       if (message_type == "SESSION_CONTROL") {
         handle_session_control(envelope, *client_socket_ptr, session_manager,
-                               session_io);
+                               session_io, cfg);
         return;
       }
       if (message_type == "SESSION_QUERY") {
         handle_session_query(envelope, *client_socket_ptr, session_manager,
-                             tool_registry, tree_queues, queue_mutex);
+                             tool_registry, tree_queues, queue_mutex, cfg);
         return;
       }
     }

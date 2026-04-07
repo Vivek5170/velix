@@ -455,13 +455,29 @@ class Gateway(ABC):
         """Called when a tool execution completes."""
         self.deliver({"type": "tool_finish", "tool": tool, "result": result})
 
-    def on_context_usage(self, current: int, maximum: int, pct: float) -> None:
+    def on_context_usage(
+        self,
+        current: int,
+        maximum: int,
+        pct: float,
+        *,
+        session_tokens: int = 0,
+        system_prompt_tokens: int = 0,
+        tool_schema_tokens: int = 0,
+        request_tokens: int = 0,
+        total_context_tokens: int = 0,
+    ) -> None:
         """Called whenever the handler reports context window usage."""
         self.deliver({
             "type":           "context_usage",
             "current_tokens": current,
             "max_tokens":     maximum,
             "pct":            pct,
+            "session_tokens": session_tokens,
+            "system_prompt_tokens": system_prompt_tokens,
+            "tool_schema_tokens": tool_schema_tokens,
+            "request_tokens": request_tokens,
+            "total_context_tokens": total_context_tokens,
         })
 
     def on_approval_request(self, approval_trace: str, payload: dict) -> None:
@@ -552,6 +568,11 @@ class Gateway(ABC):
                 event.get("current_tokens", 0),
                 event.get("max_tokens", 0),
                 event.get("pct", 0.0),
+                session_tokens=event.get("session_tokens", 0),
+                system_prompt_tokens=event.get("system_prompt_tokens", 0),
+                tool_schema_tokens=event.get("tool_schema_tokens", 0),
+                request_tokens=event.get("request_tokens", 0),
+                total_context_tokens=event.get("total_context_tokens", 0),
             )
 
         elif t == "approval_request":

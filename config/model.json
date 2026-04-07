@@ -29,7 +29,7 @@
       "model": "llama3",
       "enable_tools": true,
       "enable_streaming": true,
-      "api_key_env": null,
+      "api_key_env": "",
       "stop_tokens": []
     }
   },

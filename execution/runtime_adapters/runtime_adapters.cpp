@@ -75,6 +75,32 @@ bool path_looks_local_binary(const std::string &command) {
          (command.rfind("./", 0) == 0 || command.rfind("../", 0) == 0);
 }
 
+bool ends_with_exe_case_insensitive(const std::string &value) {
+  if (value.size() < 4) {
+    return false;
+  }
+  const std::size_t start = value.size() - 4;
+  return std::tolower(static_cast<unsigned char>(value[start])) == '.' &&
+         std::tolower(static_cast<unsigned char>(value[start + 1])) == 'e' &&
+         std::tolower(static_cast<unsigned char>(value[start + 2])) == 'x' &&
+         std::tolower(static_cast<unsigned char>(value[start + 3])) == 'e';
+}
+
+void normalize_local_binary_for_platform(std::string &command) {
+  if (!path_looks_local_binary(command)) {
+    return;
+  }
+#ifdef _WIN32
+  if (!ends_with_exe_case_insensitive(command)) {
+    command += ".exe";
+  }
+#else
+  if (ends_with_exe_case_insensitive(command)) {
+    command.resize(command.size() - 4);
+  }
+#endif
+}
+
 } // namespace
 
 bool select_runtime_adapter(const json &manifest,
@@ -95,6 +121,7 @@ bool select_runtime_adapter(const json &manifest,
   const json run = manifest.value("run", json::object());
   const std::string entry = manifest.value("entry", std::string(""));
   runtime.run_command = run.value("command", std::string(""));
+  normalize_local_binary_for_platform(runtime.run_command);
 
   runtime.run_args.clear();
   if (run.contains("args") && run["args"].is_array()) {

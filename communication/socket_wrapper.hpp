@@ -5,8 +5,17 @@
 #include <string>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#ifdef ERROR
+#undef ERROR
+#endif
 #pragma comment(lib, "ws2_32.lib")
 using SocketHandle = SOCKET;
 constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET;

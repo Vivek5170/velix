@@ -99,7 +99,8 @@ class VelixProcess {
     if (systemMessage) nextMessages.push({ role: 'system', content: systemMessage });
     if (userMessage) nextMessages.push({ role: 'user', content: userMessage });
 
-    const maxIterations = 15;
+    const parsedMaxIterations = Number.parseInt(process.env.SDK_MAX_ITERATIONS || '100', 10);
+    const maxIterations = Number.isFinite(parsedMaxIterations) ? parsedMaxIterations : 100;
     for (let i = 0; i < maxIterations; i++) {
       this.status = 'WAITING_LLM';
 
@@ -156,7 +157,7 @@ class VelixProcess {
     }
 
     this.status = 'ERROR';
-    return 'Failure: Agent state machine exceeded max iterations.';
+    return `Failure: Agent state machine exceeded max ${maxIterations} iterations.`;
   }
 
   #extractToolCalls(reply) {

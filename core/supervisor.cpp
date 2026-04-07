@@ -34,6 +34,7 @@
 #include "../vendor/nlohmann/json.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <functional>
@@ -49,6 +50,12 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>
 #else
 #include <cerrno>
@@ -67,6 +74,41 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr int kDefaultSupervisorPort = 5173;
+
+bool ends_with_exe_case_insensitive(const std::string &value) {
+  if (value.size() < 4) {
+    return false;
+  }
+  const std::size_t start = value.size() - 4;
+  return std::tolower(static_cast<unsigned char>(value[start])) == '.' &&
+         std::tolower(static_cast<unsigned char>(value[start + 1])) == 'e' &&
+         std::tolower(static_cast<unsigned char>(value[start + 2])) == 'x' &&
+         std::tolower(static_cast<unsigned char>(value[start + 3])) == 'e';
+}
+
+bool looks_like_path(const std::string &value) {
+  if (value.empty()) {
+    return false;
+  }
+  return value.rfind("./", 0) == 0 || value.rfind("../", 0) == 0 ||
+         value.rfind('/', 0) == 0 || value.find('/') != std::string::npos ||
+         value.find('\\') != std::string::npos;
+}
+
+void normalize_binary_path_for_platform(std::string &binary_path) {
+  if (!looks_like_path(binary_path)) {
+    return;
+  }
+#ifdef _WIN32
+  if (!ends_with_exe_case_insensitive(binary_path)) {
+    binary_path += ".exe";
+  }
+#else
+  if (ends_with_exe_case_insensitive(binary_path)) {
+    binary_path.resize(binary_path.size() - 4);
+  }
+#endif
+}
 
 struct SupervisorConfig {
   int heartbeat_timeout_sec = 15;
@@ -152,6 +194,7 @@ SupervisorConfig load_supervisor_config() {
 
     const json hcfg = cfg.value("handler", json::object());
     config.handler_binary = hcfg.value("binary", config.handler_binary);
+    normalize_binary_path_for_platform(config.handler_binary);
     config.handler_auto_restart =
         hcfg.value("auto_restart", config.handler_auto_restart);
     config.handler_restart_delay_ms =

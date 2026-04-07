@@ -96,6 +96,10 @@ class TerminalGateway(Gateway):
         # Context window usage (updated by on_context_usage)
         self._ctx_current       = 0
         self._ctx_max           = 0
+        self._ctx_session       = 0
+        self._ctx_system        = 0
+        self._ctx_tool_schema   = 0
+        self._ctx_request       = 0
 
         # Spinner for tool calls
         self._spinner           = KawaiiSpinner()
@@ -109,6 +113,20 @@ class TerminalGateway(Gateway):
 
         # Register extra commands
         self._register_terminal_commands()
+
+        # Valid slash commands handled by server-side command parser.
+        # Unknown slash commands should be blocked locally.
+        self._forwarded_commands = {
+            "/new",
+            "/compact",
+            "/undo",
+            "/sessions",
+            "/title",
+            "/session_info",
+            "/model_info",
+            "/scheduler_info",
+            "/context",
+        }
 
     # ═══════════════════════════════════════════════════════════════════════
     # Gateway abstract interface
@@ -164,8 +182,16 @@ class TerminalGateway(Gateway):
             self._handle_tool_finish(event)
 
         elif t == "context_usage":
-            self._ctx_current = int(event.get("current_tokens", 0) or 0)
-            self._ctx_max     = int(event.get("max_tokens",     0) or 0)
+            self.on_context_usage(
+                int(event.get("current_tokens", 0) or 0),
+                int(event.get("max_tokens", 0) or 0),
+                float(event.get("pct", 0.0) or 0.0),
+                session_tokens=int(event.get("session_tokens", 0) or 0),
+                system_prompt_tokens=int(event.get("system_prompt_tokens", 0) or 0),
+                tool_schema_tokens=int(event.get("tool_schema_tokens", 0) or 0),
+                request_tokens=int(event.get("request_tokens", 0) or 0),
+                total_context_tokens=int(event.get("total_context_tokens", 0) or 0),
+            )
             # Don't print the bar here; it's printed in _handle_end instead.
 
         elif t == "approval_request":
@@ -182,7 +208,10 @@ class TerminalGateway(Gateway):
             )
 
         elif t == "session_switched":
-            self.on_session_switched(event.get("session_id", ""))
+            sid = event.get("session_id", "")
+            if sid:
+                self._user_id = sid
+            _pt_print(f"\n{S.DIM_CYAN}  ↻ Session → {sid}{S.RST}")
 
         elif t == "error":
             self._ensure_newline()
@@ -250,9 +279,25 @@ class TerminalGateway(Gateway):
         self._current_tool    = ""
         self._tool_start_time = 0.0
 
-    def on_context_usage(self, current: int, maximum: int, pct: float) -> None:
-        self._ctx_current = max(0, current)
-        self._ctx_max     = max(0, maximum)
+    def on_context_usage(
+        self,
+        current: int,
+        maximum: int,
+        pct: float,
+        *,
+        session_tokens: int = 0,
+        system_prompt_tokens: int = 0,
+        tool_schema_tokens: int = 0,
+        request_tokens: int = 0,
+        total_context_tokens: int = 0,
+    ) -> None:
+        _ = pct  # kept for signature parity with base gateway hook
+        self._ctx_current     = max(0, total_context_tokens if total_context_tokens > 0 else current)
+        self._ctx_max         = max(0, maximum)
+        self._ctx_session     = max(0, session_tokens)
+        self._ctx_system      = max(0, system_prompt_tokens)
+        self._ctx_tool_schema = max(0, tool_schema_tokens)
+        self._ctx_request     = max(0, request_tokens)
 
     def on_approval_request(self, approval_trace: str, payload: dict) -> None:
         """Interactive approval prompt in context [B]."""
@@ -277,7 +322,7 @@ class TerminalGateway(Gateway):
         self.send_approval_reply(approval_trace, ans)
 
     def on_session_switched(self, session_id: str) -> None:
-        super().on_session_switched(session_id)
+        self._user_id = session_id
         _pt_print(f"\n{S.DIM_CYAN}  ↻ Session → {session_id}{S.RST}")
 
     def on_notify(self, event: dict) -> None:
@@ -327,7 +372,15 @@ class TerminalGateway(Gateway):
                                     f"{S.BOLD_RED}[Command error]{S.RST} {exc}"
                                 )
                             continue
-                        # Unknown /command → forward to LLM
+                        if cmd in self._forwarded_commands:
+                            self.send_message(text)
+                            continue
+                        _pt_print(
+                            f"{S.BOLD_RED}[Invalid command]{S.RST} "
+                            f"{sanitize(cmd)} is not a valid command. "
+                            f"Use /help to see available commands."
+                        )
+                        continue
 
                     self.send_message(text)
 

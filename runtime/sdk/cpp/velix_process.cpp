@@ -924,6 +924,9 @@ std::string VelixProcess::call_llm_internal(
     }
   }
 
+  const int max_iterations =
+      velix::utils::get_config("SDK_MAX_ITERATIONS", 100);
+
   auto dispatch_llm_request = [&](const json &request_payload,
                                   bool request_streaming) -> std::string {
     const std::string trace_id = velix::utils::generate_uuid();
@@ -963,7 +966,7 @@ std::string VelixProcess::call_llm_internal(
   };
 
   int loop_count = 0;
-  while (is_running && loop_count < 10) {
+  while (is_running && loop_count < max_iterations) {
     json payload = base_payload;
     payload["convo_id"] = active_convo_id;
 
@@ -1101,7 +1104,8 @@ std::string VelixProcess::call_llm_internal(
   }
 
   status.store(ProcessStatus::ERROR);
-  return "Failure: Agent state machine exceeded max 10 iterations.";
+  return "Failure: Agent state machine exceeded max " +
+         std::to_string(max_iterations) + " iterations.";
 }
 
 } // namespace core

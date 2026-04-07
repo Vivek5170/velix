@@ -464,6 +464,14 @@ Conversation SessionIO::get_conversation(const std::string& convo_id) {
 	return loaded;
 }
 
+void SessionIO::invalidate_conversation_cache(const std::string& convo_id) {
+	if (convo_id.empty()) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(convo_mutex_);
+	convo_cache_.erase(convo_id);
+}
+
 bool SessionIO::append_message_unlocked(Conversation& convo,
                                                    const std::string& role,
                                                    const std::string& content,

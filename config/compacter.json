@@ -5,7 +5,9 @@
   "summary_max_tokens": 2000,
   "summary_temp": 0.2,
   "summary_top_p": 0.9,
-  "scheduler_timeout_ms": 30000,
+  "scheduler_timeout_ms": 307000,
+  "summary_retry_count": 2,
+  "summary_retry_backoff_ms": 250,
   "summary_tree_id": "TREE_HANDLER",
   "summary_source_pid": 1000
 }

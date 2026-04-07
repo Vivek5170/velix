@@ -1,5 +1,6 @@
 #include "session_manager.hpp"
 #include "session_io.hpp"
+#include "tools/registry.hpp"
 #include "../utils/logger.hpp"
 #include "compacter.hpp"
 
@@ -41,6 +42,36 @@ void SessionManager::validate_super_user_name(const std::string &super_user) {
           "super_user name must be alphanumeric (hyphens allowed)");
     }
   }
+}
+
+uint64_t SessionManager::estimate_tokens(const std::string &text) {
+  return static_cast<uint64_t>(text.size() / 4);
+}
+
+uint64_t SessionManager::estimate_request_tokens(const json &request_messages) {
+  if (!request_messages.is_array()) {
+    return 0;
+  }
+
+  // request_messages can be fully hydrated (system + long history + current
+  // turn). Session history is already accounted in session_tokens, so only
+  // count the pending tail input that is not yet persisted.
+  uint64_t total = 0;
+  for (auto it = request_messages.rbegin(); it != request_messages.rend(); ++it) {
+    const auto &message = *it;
+    if (!message.is_object()) {
+      continue;
+    }
+    const std::string role = message.value("role", std::string(""));
+    if (role == "assistant") {
+      break;
+    }
+    if ((role == "user" || role == "tool") &&
+        message.contains("content") && message["content"].is_string()) {
+      total += estimate_tokens(message["content"].get<std::string>());
+    }
+  }
+  return total;
 }
 
 // ── Static helpers ────────────────────────────────────────────────────────
@@ -95,7 +126,7 @@ std::string SessionManager::session_dir(const std::string &session_id) const {
 
 std::string
 SessionManager::live_convo_path(const std::string &session_id) const {
-  return session_dir(session_id) + "/active.json";
+  return session_dir(session_id) + "/" + session_id + ".json";
 }
 
 std::string SessionManager::history_snapshot_path(const std::string &session_id,
@@ -473,7 +504,6 @@ void SessionManager::save_snapshot(const std::string &session_id,
 
 void SessionManager::write_seeded_history(const std::string &session_id,
                                           const std::string &summary,
-                                          bool add_continue_turn,
                                           const json &retained_recent) {
   // Synthetic tool-call history injected at the start of the reset session.
   // No actual skill is executed — the summary is already known.
@@ -481,7 +511,6 @@ void SessionManager::write_seeded_history(const std::string &session_id,
   // user  → "retrieve previous continuation session summary"
   // asst  → tool_call(session_search, {"query":"continue previous session"})
   // tool  → "[PREVIOUS SESSION SUMMARY]\n{summary}"
-  // user  → "continue..."   (only when is_auto=true / add_continue_turn=true)
   //
   json messages = json::array();
 
@@ -513,10 +542,6 @@ void SessionManager::write_seeded_history(const std::string &session_id,
         messages.push_back(m);
       }
     }
-  }
-
-  if (add_continue_turn) {
-    messages.push_back({{"role", "user"}, {"content", "continue..."}});
   }
 
   // Write as a bare messages array into the live conversation file.
@@ -653,7 +678,7 @@ SessionManager::compact(const std::string &session_id, const json &history,
 
   // 3. Overwrite the live conversation file with the pre-seeded history.
   // The session_id stays the same — only the content is reset.
-  write_seeded_history(session_id, summary, is_auto, retained_recent);
+  write_seeded_history(session_id, summary, retained_recent);
 
   // Estimate tokens after (the pre-seeded history is small).
   // user(~6w) + assistant(tool_call~10w) + tool(summary) ≈ summary/4 + 50
@@ -669,8 +694,8 @@ SessionManager::compact(const std::string &session_id, const json &history,
 }
 
 SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
-    const std::string &convo_id, std::size_t estimated_request_tokens,
-    std::size_t max_context_tokens, double auto_compact_threshold,
+  const std::string &convo_id, const ContextUsage &usage,
+  double auto_compact_threshold,
     SessionIO &session_io) {
   AutoCompactGuardResult result;
 
@@ -678,7 +703,7 @@ SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
     result.skip_reason = "missing_convo_id";
     return result;
   }
-  if (max_context_tokens == 0) {
+  if (usage.max_context_tokens == 0) {
     result.skip_reason = "unknown_context_limit";
     return result;
   }
@@ -687,12 +712,31 @@ SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
   }
 
   const double fill_ratio =
-      static_cast<double>(estimated_request_tokens) /
-      static_cast<double>(max_context_tokens);
+      static_cast<double>(usage.total_context_tokens) /
+      static_cast<double>(usage.max_context_tokens);
   if (fill_ratio < auto_compact_threshold) {
+    // LOG_INFO_CTX(
+    //   "Auto-compact skipped for " + convo_id +
+    //     " ratio=" + std::to_string(fill_ratio) +
+    //     " threshold=" + std::to_string(auto_compact_threshold) +
+    //     " total=" + std::to_string(usage.total_context_tokens) +
+    //     " max=" + std::to_string(usage.max_context_tokens),
+    //   "session_mgr", "", -1, "session_compact_guard_skip");
     result.skip_reason = "below_compaction_limit";
     return result;
   }
+
+    LOG_INFO_CTX(
+      "Auto-compact trigger for " + convo_id +
+        " ratio=" + std::to_string(fill_ratio) +
+        " threshold=" + std::to_string(auto_compact_threshold) +
+        " parts(session=" + std::to_string(usage.session_tokens) +
+        ",system=" + std::to_string(usage.system_prompt_tokens) +
+        ",tools=" + std::to_string(usage.tool_schema_tokens) +
+        ",request=" + std::to_string(usage.request_tokens) +
+        ",total=" + std::to_string(usage.total_context_tokens) +
+        ",max=" + std::to_string(usage.max_context_tokens) + ")",
+      "session_mgr", "", -1, "session_compact_guard_trigger");
 
   result.threshold_exceeded = true;
   result.compact_attempted = true;
@@ -711,11 +755,49 @@ SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
   result.tokens_before = compact_result.tokens_before;
   result.tokens_after = compact_result.tokens_after;
 
+  if (result.compacted) {
+    // compact() writes seeded history directly to disk. Evict any cached pre-
+    // compact conversation so the next read/persist path reloads seeded state.
+    session_io.invalidate_conversation_cache(convo_id);
+  }
+
   if (!result.compacted && result.skip_reason.empty()) {
     result.skip_reason = "below_compaction_limit";
   }
 
   return result;
+}
+
+SessionManager::ContextUsage SessionManager::compute_context_usage(
+    const std::string &session_id, const json &request_messages,
+    const tools::ToolRegistry &tools, const std::string &mode,
+    std::size_t max_context_tokens) const {
+  ContextUsage usage;
+
+  const SessionInfo info = get_session_info(session_id);
+  usage.session_tokens = info.live_stats.current_context_tokens;
+
+  const std::string prompt_user_id =
+      (mode == "user_conversation") ? session_id : std::string("");
+  const std::string system_prompt =
+      SessionIO::build_layered_system_prompt(mode, "", prompt_user_id);
+  usage.system_prompt_tokens = estimate_tokens(system_prompt);
+
+  usage.tool_schema_tokens =
+      estimate_tokens(tools.get_tool_schemas().dump());
+  usage.request_tokens = estimate_request_tokens(request_messages);
+
+  usage.total_context_tokens = usage.session_tokens + usage.system_prompt_tokens +
+                               usage.tool_schema_tokens + usage.request_tokens;
+  usage.max_context_tokens = static_cast<uint64_t>(max_context_tokens);
+  if (usage.max_context_tokens > 0) {
+    usage.context_fill_pct =
+        static_cast<double>(usage.total_context_tokens) /
+        static_cast<double>(usage.max_context_tokens) *
+        100.0;
+  }
+
+  return usage;
 }
 
 } // namespace velix::llm

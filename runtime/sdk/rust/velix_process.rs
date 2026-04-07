@@ -131,8 +131,11 @@ impl VelixProcess {
             next_messages.push(json!({"role": "user", "content": user_message}));
         }
 
-        const MAX_ITERATIONS: usize = 15;
-        for i in 0..MAX_ITERATIONS {
+        let max_iterations = env::var("SDK_MAX_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(100);
+        for i in 0..max_iterations {
             self.set_status("WAITING_LLM");
 
             let mut payload = base_payload.clone();
@@ -204,7 +207,10 @@ impl VelixProcess {
         }
 
         self.set_status("ERROR");
-        Ok("Failure: Agent state machine exceeded max iterations.".to_string())
+        Ok(format!(
+            "Failure: Agent state machine exceeded max {} iterations.",
+            max_iterations
+        ))
     }
 
     pub fn execute_tool(&self, name: &str, params: Value) -> Result<Value, String> {

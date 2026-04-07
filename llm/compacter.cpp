@@ -4,7 +4,9 @@
 #include "../communication/socket_wrapper.hpp"
 #include "../utils/logger.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <thread>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -23,9 +25,51 @@ struct CompacterConfig {
 	double summary_temp{0.2};
 	double summary_top_p{0.9};
 	int scheduler_timeout_ms{30000};
+	int summary_retry_count{2};
+	int summary_retry_backoff_ms{250};
 	std::string summary_tree_id{"TREE_HANDLER"};
 	int summary_source_pid{1000};
 };
+
+bool is_transient_summary_error(const std::string& error_text) {
+	return error_text.find("Recv timeout") != std::string::npos ||
+		   error_text.find("Resource temporarily unavailable") != std::string::npos ||
+		   error_text.find("errno 11") != std::string::npos ||
+		   error_text.find("scheduler_request_deadline_exceeded") != std::string::npos ||
+		   error_text.find("deadline_exceeded") != std::string::npos;
+}
+
+std::string classify_summary_skip_reason(const std::string& error_text) {
+	if (is_transient_summary_error(error_text)) {
+		return "summary_queue_timeout";
+	}
+	if (error_text.find("Scheduler summarization failed:") != std::string::npos) {
+		return "summary_model_error";
+	}
+	return "summary_generation_failed";
+}
+
+int load_scheduler_wait_timeout_ms() {
+	std::ifstream model_file("config/model.json");
+	if (!model_file.is_open()) {
+		model_file.open("../config/model.json");
+	}
+	if (!model_file.is_open()) {
+		model_file.open("build/config/model.json");
+	}
+	if (!model_file.is_open()) {
+		return 65000;
+	}
+
+	try {
+		nlohmann::json model;
+		model_file >> model;
+		const int request_timeout_ms = model.value("request_timeout_ms", 60000);
+		return request_timeout_ms + 5000;
+	} catch (...) {
+		return 65000;
+	}
+}
 
 std::string now_iso8601() {
 	const auto now = std::chrono::system_clock::now();
@@ -76,6 +120,9 @@ CompacterConfig load_compacter_config() {
 		cfg.summary_temp = j.value("summary_temp", cfg.summary_temp);
 		cfg.summary_top_p = j.value("summary_top_p", cfg.summary_top_p);
 		cfg.scheduler_timeout_ms = j.value("scheduler_timeout_ms", cfg.scheduler_timeout_ms);
+		cfg.summary_retry_count = j.value("summary_retry_count", cfg.summary_retry_count);
+		cfg.summary_retry_backoff_ms =
+			j.value("summary_retry_backoff_ms", cfg.summary_retry_backoff_ms);
 		cfg.summary_tree_id = j.value("summary_tree_id", cfg.summary_tree_id);
 		cfg.summary_source_pid = j.value("summary_source_pid", cfg.summary_source_pid);
 	} catch (const std::exception& e) {
@@ -87,6 +134,23 @@ CompacterConfig load_compacter_config() {
 	}
 	if (cfg.keep_recent_turns == 0) {
 		cfg.keep_recent_turns = 1;
+	}
+	if (cfg.summary_retry_count < 0) {
+		cfg.summary_retry_count = 0;
+	}
+	if (cfg.summary_retry_backoff_ms < 0) {
+		cfg.summary_retry_backoff_ms = 0;
+	}
+
+	// Prevent compacter-side timeout from expiring before scheduler-side wait.
+	const int scheduler_wait_timeout_ms = load_scheduler_wait_timeout_ms();
+	const int aligned_timeout_ms = scheduler_wait_timeout_ms + 2000;
+	if (cfg.scheduler_timeout_ms < aligned_timeout_ms) {
+		LOG_INFO("Raising compacter scheduler_timeout_ms from " +
+				 std::to_string(cfg.scheduler_timeout_ms) + " to " +
+				 std::to_string(aligned_timeout_ms) +
+				 " to align with scheduler wait budget");
+		cfg.scheduler_timeout_ms = aligned_timeout_ms;
 	}
 
 	return cfg;
@@ -319,12 +383,44 @@ CompactResult compact_history_if_needed(const nlohmann::json& history) {
 	}
 
 	std::string llm_summary;
-	try {
-		const int scheduler_port = load_scheduler_port();
-		llm_summary = request_llm_summary(older, cfg, scheduler_port);
-	} catch (const std::exception& e) {
-		LOG_WARN(std::string("Compaction skipped because summary generation failed: ") + e.what());
-		result.skip_reason = "summary_generation_failed";
+	const int scheduler_port = load_scheduler_port();
+	std::string last_error;
+	const int attempts = cfg.summary_retry_count + 1;
+	for (int attempt = 1; attempt <= attempts; ++attempt) {
+		try {
+			llm_summary = request_llm_summary(older, cfg, scheduler_port);
+			last_error.clear();
+			break;
+		} catch (const std::exception& e) {
+			last_error = e.what();
+			const bool transient = is_transient_summary_error(last_error);
+			LOG_WARN(
+				"Compaction summary attempt " + std::to_string(attempt) + "/" +
+				std::to_string(attempts) + " failed: " + last_error +
+				" [scheduler_port=" + std::to_string(scheduler_port) +
+				", timeout_ms=" + std::to_string(cfg.scheduler_timeout_ms) +
+				", older_turns=" + std::to_string(older.size()) +
+				", transient=" + std::string(transient ? "true" : "false") +
+				"]");
+
+			if (!transient || attempt == attempts) {
+				break;
+			}
+			if (cfg.summary_retry_backoff_ms > 0) {
+				std::this_thread::sleep_for(
+					std::chrono::milliseconds(cfg.summary_retry_backoff_ms * attempt));
+			}
+		}
+	}
+
+	if (llm_summary.empty()) {
+		const std::string skip_reason = classify_summary_skip_reason(last_error);
+		LOG_WARN(
+			"Compaction skipped because summary generation failed after retries: " +
+			last_error +
+			" [skip_reason=" + skip_reason +
+			", possible causes: scheduler saturation, nested compaction contention, provider latency]");
+		result.skip_reason = skip_reason;
 		return result;
 	}
 

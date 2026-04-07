@@ -141,7 +141,7 @@ func (p *VelixProcess) callLLMInternal(convoID, userMessage, systemMessage, user
 		nextMessages = append(nextMessages, map[string]any{"role": "user", "content": userMessage})
 	}
 
-	const maxIterations = 15
+	maxIterations := readEnvInt("SDK_MAX_ITERATIONS", 100)
 	for i := 0; i < maxIterations; i++ {
 		p.Status = "WAITING_LLM"
 
@@ -238,7 +238,7 @@ func (p *VelixProcess) callLLMInternal(convoID, userMessage, systemMessage, user
 	}
 
 	p.Status = "ERROR"
-	return "Failure: Agent state machine exceeded max iterations.", nil
+	return fmt.Sprintf("Failure: Agent state machine exceeded max %d iterations.", maxIterations), nil
 }
 
 func extractToolCalls(reply map[string]any) []map[string]any {

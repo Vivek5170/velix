@@ -116,184 +116,6 @@ struct Session {
 
 namespace detail {
 
-// Read a text file from disk; return "" on failure.
-static std::string read_file(const fs::path& p) {
-    std::ifstream f(p);
-    if (!f.is_open()) return "";
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
-// Rough token estimate: 1 token ≈ 4 chars.
-static uint64_t estimate_tokens(const std::string& text) {
-    return static_cast<uint64_t>(text.size() / 4);
-}
-
-// Read max_context_tokens from config/model.json.
-static uint64_t read_max_context_tokens() {
-    for (const char* p : {"config/model.json", "../config/model.json",
-                           "build/config/model.json"}) {
-        std::ifstream f(p);
-        if (!f.is_open()) continue;
-        try {
-            json j; f >> j;
-            return j.value("max_context_tokens", static_cast<uint64_t>(8192));
-        } catch (...) {}
-    }
-    return 8192;
-}
-
-// Read model metadata from config/model.json.
-static json read_model_info() {
-    for (const char* p : {"config/model.json", "../config/model.json",
-                           "build/config/model.json"}) {
-        std::ifstream f(p);
-        if (!f.is_open()) continue;
-        try {
-            json j; f >> j;
-            return {
-                {"model_name",    j.value("model_name",    std::string("unknown"))},
-                {"model_type",    j.value("model_type",    std::string("unknown"))},
-                {"active_adapter",j.value("active_adapter",std::string("unknown"))},
-                {"max_context_tokens",
-                 j.value("max_context_tokens", static_cast<uint64_t>(8192))},
-                {"max_simultaneous_llm_requests",
-                 j.value("max_simultaneous_llm_requests", 5)},
-                {"enabled",       j.value("enabled", true)}
-            };
-        } catch (...) {}
-    }
-    return {{"error", "config/model.json not found"}};
-}
-
-// Read compacter config.
-static json read_compacter_info() {
-    for (const char* p : {"config/compacter.json", "../config/compacter.json",
-                           "build/config/compacter.json"}) {
-        std::ifstream f(p);
-        if (!f.is_open()) continue;
-        try {
-            json j; f >> j;
-            return j;
-        } catch (...) {}
-    }
-    return {{"auto_compact_threshold", 0.70}};
-}
-
-struct ContextUsage {
-    uint64_t current_tokens = 0;
-    uint64_t max_tokens     = 0;
-    bool     valid          = false;
-};
-
-// Read current context token usage for a session directly from disk.
-static ContextUsage read_context_usage(const std::string& session_id) {
-    ContextUsage out;
-    if (session_id.empty()) return out;
-
-    // Derive super_user from session_id (strip _sN suffix if present).
-    std::string super_user = session_id;
-    const auto pos = session_id.rfind("_s");
-    if (pos != std::string::npos && pos + 2 < session_id.size()) {
-        const std::string suffix = session_id.substr(pos + 2);
-        if (!suffix.empty() &&
-            std::all_of(suffix.begin(), suffix.end(),
-                        [](unsigned char c){ return std::isdigit(c) != 0; })) {
-            super_user = session_id.substr(0, pos);
-        }
-    }
-
-    // Layer overhead tokens from agent files.
-    uint64_t layered = 0;
-    layered += estimate_tokens(read_file(fs::path("memory") / "general_guidelines.md"));
-    layered += estimate_tokens(read_file(fs::path("memory") / "agentfiles" /
-                                         super_user / "soul.md"));
-    layered += estimate_tokens(read_file(fs::path("memory") / "agentfiles" /
-                                         super_user / "user.md"));
-
-    try {
-        const fs::path session_root = fs::path("memory") / "sessions" / "users" /
-                                      super_user / session_id;
-        std::ifstream f(session_root / "active.json");
-        if (!f.is_open()) {
-            // Backward compatibility with older session naming.
-            f.open(session_root / (session_id + ".json"));
-        }
-        if (!f.is_open()) return out;
-        json j; f >> j;
-        out.current_tokens = j.value("current_context_tokens",
-                                      static_cast<uint64_t>(0)) + layered;
-        out.max_tokens     = read_max_context_tokens();
-        out.valid          = true;
-    } catch (...) {}
-    return out;
-}
-
-// List sessions for a super_user directly from the filesystem.
-static std::vector<std::string> list_sessions_from_disk(
-        const std::string& super_user) {
-    std::vector<std::string> sessions;
-    const fs::path root = fs::path("memory") / "sessions" / "users" / super_user;
-    if (!fs::exists(root)) return sessions;
-    try {
-        for (const auto& entry : fs::directory_iterator(root)) {
-            if (entry.is_directory()) {
-                const std::string name = entry.path().filename().string();
-                // Must match super_user_sN pattern.
-                const auto p = name.rfind("_s");
-                if (p == std::string::npos || p + 2 >= name.size()) continue;
-                const std::string suffix = name.substr(p + 2);
-                if (suffix.empty() || !std::all_of(suffix.begin(), suffix.end(),
-                        [](unsigned char c){ return std::isdigit(c) != 0; })) continue;
-                sessions.push_back(name);
-            }
-        }
-    } catch (...) {}
-    std::sort(sessions.begin(), sessions.end());
-    return sessions;
-}
-
-// List known super users from disk.
-static std::vector<std::string> list_super_users_from_disk() {
-    std::vector<std::string> users;
-    const fs::path root = fs::path("memory") / "sessions" / "users";
-    if (!fs::exists(root)) return users;
-    try {
-        for (const auto& entry : fs::directory_iterator(root)) {
-            if (entry.is_directory()) {
-                const std::string name = entry.path().filename().string();
-                if (!name.empty()) users.push_back(name);
-            }
-        }
-    } catch (...) {}
-    std::sort(users.begin(), users.end());
-    return users;
-}
-
-// Read session metadata (title, turn count, tokens) from disk.
-static json read_session_metadata(const std::string& super_user,
-                                  const std::string& session_id) {
-    json meta = {{"session_id", session_id}, {"title", ""}, {"turn_count", 0},
-                 {"current_context_tokens", 0}};
-    try {
-        const fs::path session_root = fs::path("memory") / "sessions" / "users" /
-                                      super_user / session_id;
-        std::ifstream in(session_root / "active.json");
-        if (!in.is_open()) {
-            // Backward compatibility with older session naming.
-            in.open(session_root / (session_id + ".json"));
-        }
-        if (!in.is_open()) return meta;
-        json j; in >> j;
-        meta["title"]         = j.value("title", std::string(""));
-        meta["turn_count"]    = j.value("turn_count", 0);
-        meta["current_context_tokens"] =
-            j.value("current_context_tokens", static_cast<uint64_t>(0));
-    } catch (...) {}
-    return meta;
-}
-
 // Truncate tool output string to max_len if > 0.
 static std::string truncate_output(const std::string& s, int max_len) {
     if (max_len <= 0 || static_cast<int>(s.size()) <= max_len) return s;
@@ -542,18 +364,23 @@ private:
 
                 // ── list_users ───────────────────────────────────────────
                 if (type == "list_users") {
-                    // Read directly from disk — no scheduler round-trip.
-                    const auto super_users = detail::list_super_users_from_disk();
+                    const std::string raw = send_session_query("all_sessions", "", "");
                     json j_users = json::array();
-                    {
+                    try {
+                        const json resp = json::parse(raw);
+                        const json users = resp.value("super_users", json::array());
                         std::lock_guard<std::mutex> lk(sessions_mutex_);
-                        for (const auto& su : super_users) {
+                        for (const auto& u : users) {
+                            if (!u.is_object()) continue;
+                            const std::string su = u.value("super_user", std::string(""));
+                            if (su.empty()) continue;
                             bool active = false;
-                            for (const auto& [sid, s] : sessions_)
+                            for (const auto& [sid, s] : sessions_) {
                                 if (s->super_user == su) { active = true; break; }
+                            }
                             j_users.push_back({{"id", su}, {"active", active}});
                         }
-                    }
+                    } catch (...) {}
                     send_json(client,
                               json{{"type","user_list"},{"users",j_users}}.dump());
                     continue;
@@ -564,19 +391,31 @@ private:
                     const std::string su = req.value("super_user", std::string(""));
                     json j_sessions = json::array();
                     if (!su.empty()) {
-                        const auto sids = detail::list_sessions_from_disk(su);
-                        std::lock_guard<std::mutex> lk(sessions_mutex_);
-                        for (const auto& sid : sids) {
-                            const json meta =
-                                detail::read_session_metadata(su, sid);
-                            const bool active = sessions_.count(sid) > 0;
-                            j_sessions.push_back({
-                                {"id",       sid},
-                                {"title",    meta.value("title", std::string(""))},
-                                {"turns",    meta.value("turn_count", 0)},
-                                {"active",   active}
-                            });
-                        }
+                        const std::string raw = send_session_query("all_sessions", "", "");
+                        try {
+                            const json resp = json::parse(raw);
+                            const json users = resp.value("super_users", json::array());
+                            std::lock_guard<std::mutex> lk(sessions_mutex_);
+                            for (const auto& u : users) {
+                                if (!u.is_object() || u.value("super_user", std::string("")) != su) {
+                                    continue;
+                                }
+                                const json sessions = u.value("sessions", json::array());
+                                for (const auto& s : sessions) {
+                                    if (!s.is_object()) continue;
+                                    const std::string sid = s.value("session_id", std::string(""));
+                                    if (sid.empty()) continue;
+                                    const bool active = sessions_.count(sid) > 0;
+                                    j_sessions.push_back({
+                                        {"id", sid},
+                                        {"title", s.value("title", std::string(""))},
+                                        {"turns", s.value("turn_count", 0)},
+                                        {"active", active}
+                                    });
+                                }
+                                break;
+                            }
+                        } catch (...) {}
                     }
                     send_json(client,
                               json{{"type","session_list"},
@@ -875,14 +714,43 @@ private:
 
     void emit_context_usage(std::shared_ptr<Session> session,
                              const SendFn& send_to_client) {
-        const detail::ContextUsage cu =
-            detail::read_context_usage(session->active_session_id);
-        if (!cu.valid || cu.max_tokens == 0) return;
+        const std::string raw =
+            send_session_query("info", "", session->active_session_id);
+        uint64_t current_tokens = 0;
+        uint64_t max_tokens = 0;
+        uint64_t session_tokens = 0;
+        uint64_t system_prompt_tokens = 0;
+        uint64_t tool_schema_tokens = 0;
+        uint64_t request_tokens = 0;
+        try {
+            const json r = json::parse(raw);
+            current_tokens = r.value("total_context_tokens", static_cast<uint64_t>(0));
+            max_tokens = r.value("max_context_tokens", static_cast<uint64_t>(0));
+            session_tokens = r.value("session_tokens", static_cast<uint64_t>(0));
+            system_prompt_tokens =
+                r.value("system_prompt_tokens", static_cast<uint64_t>(0));
+            tool_schema_tokens =
+                r.value("tool_schema_tokens", static_cast<uint64_t>(0));
+            request_tokens = r.value("request_tokens", static_cast<uint64_t>(0));
+            if (current_tokens == 0 || max_tokens == 0) {
+                const json s = r.value("session", json::object());
+                current_tokens = s.value("current_context_tokens", static_cast<uint64_t>(0));
+                max_tokens = s.value("max_context_tokens", static_cast<uint64_t>(0));
+            }
+        } catch (...) {
+            return;
+        }
+        if (max_tokens == 0) return;
         send_to_client({{"type",           "context_usage"},
-                        {"current_tokens", cu.current_tokens},
-                        {"max_tokens",     cu.max_tokens},
-                        {"pct",  static_cast<double>(cu.current_tokens) /
-                                 static_cast<double>(cu.max_tokens) * 100.0}});
+                        {"current_tokens", current_tokens},
+                        {"max_tokens",     max_tokens},
+                        {"session_tokens", session_tokens},
+                        {"system_prompt_tokens", system_prompt_tokens},
+                        {"tool_schema_tokens", tool_schema_tokens},
+                        {"request_tokens", request_tokens},
+                        {"total_context_tokens", current_tokens},
+                        {"pct",  static_cast<double>(current_tokens) /
+                                 static_cast<double>(max_tokens) * 100.0}});
     }
 
     // ------------------------------------------------------------------
@@ -944,6 +812,13 @@ private:
             send({{"type","token"},{"data","[Compacting…]\n"}});
             const std::string raw =
                 send_session_control(session->active_session_id, "compact", "");
+
+            if (raw.empty()) {
+                send({{"type","token"},
+                      {"data","[Compaction status unavailable: request timed out]\n"}});
+                return true;
+            }
+
             std::string msg = "[Compacted: " + session->active_session_id + "]";
             try {
                 const json r = json::parse(raw);
@@ -984,26 +859,39 @@ private:
         // ── /sessions ─────────────────────────────────────────────────
         command_table_["/sessions"] = [this](auto session, const auto& send,
                                               const std::string& /*args*/) {
-            const auto sids =
-                detail::list_sessions_from_disk(session->super_user);
-            if (sids.empty()) {
+            const std::string raw = send_session_query("all_sessions", "", "");
+            json target_sessions = json::array();
+            try {
+                const json resp = json::parse(raw);
+                const json users = resp.value("super_users", json::array());
+                for (const auto& u : users) {
+                    if (!u.is_object()) continue;
+                    if (u.value("super_user", std::string("")) == session->super_user) {
+                        target_sessions = u.value("sessions", json::array());
+                        break;
+                    }
+                }
+            } catch (...) {}
+
+            if (!target_sessions.is_array() || target_sessions.empty()) {
                 send({{"type","token"},{"data","(no sessions)\n"}});
                 return true;
             }
             std::ostringstream ss;
             ss << "Sessions for " << session->super_user << ":\n";
             std::lock_guard<std::mutex> lk(sessions_mutex_);
-            for (const auto& sid : sids) {
-                const json meta =
-                    detail::read_session_metadata(session->super_user, sid);
+            for (const auto& s : target_sessions) {
+                if (!s.is_object()) continue;
+                const std::string sid = s.value("session_id", std::string(""));
+                if (sid.empty()) continue;
                 const bool active  = sessions_.count(sid) > 0;
                 const bool current = (sid == session->active_session_id);
                 ss << "  " << sid;
-                const std::string title = meta.value("title", std::string(""));
+                const std::string title = s.value("title", std::string(""));
                 if (!title.empty()) ss << "  \"" << title << "\"";
-                ss << "  [turns=" << meta.value("turn_count", 0) << "]";
-                ss << "  [tokens=" << meta.value("current_context_tokens",
-                                                   static_cast<uint64_t>(0)) << "]";
+                ss << "  [turns=" << s.value("turn_count", 0) << "]";
+                ss << "  [tokens=" << s.value("current_context_tokens",
+                                                static_cast<uint64_t>(0)) << "]";
                 if (active)  ss << "  [active]";
                 if (current) ss << "  ← current";
                 ss << "\n";
@@ -1034,26 +922,52 @@ private:
         // ── /session_info ─────────────────────────────────────────────
         command_table_["/session_info"] = [this](auto session, const auto& send,
                                                    const std::string& /*args*/) {
-            const json meta = detail::read_session_metadata(
-                session->super_user, session->active_session_id);
-            const detail::ContextUsage cu =
-                detail::read_context_usage(session->active_session_id);
-            const uint64_t max_ctx = detail::read_max_context_tokens();
-            const double pct = (max_ctx > 0)
-                ? (static_cast<double>(cu.current_tokens) /
-                   static_cast<double>(max_ctx) * 100.0)
-                : 0.0;
+            const std::string raw =
+                send_session_query("info", "", session->active_session_id);
+            json info = json::object();
+            uint64_t session_tokens = 0;
+            uint64_t system_prompt_tokens = 0;
+            uint64_t tool_schema_tokens = 0;
+            uint64_t request_tokens = 0;
+            uint64_t total_context_tokens = 0;
+            uint64_t max_context_tokens = 0;
+            double context_fill_pct = 0.0;
+            try {
+                const json r = json::parse(raw);
+                info = r.value("session", json::object());
+                session_tokens = r.value("session_tokens", static_cast<uint64_t>(0));
+                system_prompt_tokens = r.value("system_prompt_tokens", static_cast<uint64_t>(0));
+                tool_schema_tokens = r.value("tool_schema_tokens", static_cast<uint64_t>(0));
+                request_tokens = r.value("request_tokens", static_cast<uint64_t>(0));
+                total_context_tokens = r.value("total_context_tokens", static_cast<uint64_t>(0));
+                max_context_tokens = r.value("max_context_tokens", static_cast<uint64_t>(0));
+                context_fill_pct = r.value("context_fill_pct", 0.0);
+            } catch (...) {}
+
+            if (total_context_tokens == 0 || max_context_tokens == 0) {
+                total_context_tokens =
+                    info.value("current_context_tokens", static_cast<uint64_t>(0));
+                max_context_tokens =
+                    info.value("max_context_tokens", static_cast<uint64_t>(0));
+                context_fill_pct = (max_context_tokens > 0)
+                    ? (static_cast<double>(total_context_tokens) /
+                       static_cast<double>(max_context_tokens) * 100.0)
+                    : 0.0;
+            }
 
             std::ostringstream ss;
             ss << "── Session Info ────────────────────────\n";
             ss << "  session_id : " << session->active_session_id << "\n";
             ss << "  super_user : " << session->super_user << "\n";
             ss << "  title      : "
-               << meta.value("title", std::string("(untitled)")) << "\n";
-            ss << "  turns      : " << meta.value("turn_count", 0) << "\n";
-            ss << "  tokens     : " << cu.current_tokens
-               << " / " << cu.max_tokens
-               << "  (" << static_cast<int>(pct) << "%)\n";
+               << info.value("title", std::string("(untitled)")) << "\n";
+            ss << "  turns      : " << info.value("turn_count", 0) << "\n";
+            ss << "  tokens     : " << total_context_tokens
+               << " / " << max_context_tokens
+               << "  (" << static_cast<int>(context_fill_pct) << "%)\n";
+            ss << "  breakdown  : session=" << session_tokens
+               << ", system=" << system_prompt_tokens
+                    << ", tools=" << tool_schema_tokens << "\n";
             ss << "────────────────────────────────────────\n";
             send({{"type","token"},{"data", ss.str()}});
             return true;
@@ -1062,44 +976,59 @@ private:
         // ── /context ──────────────────────────────────────────────────
         command_table_["/context"] = [this](auto session, const auto& send,
                                              const std::string& /*args*/) {
-            const detail::ContextUsage cu =
-                detail::read_context_usage(session->active_session_id);
-            if (!cu.valid) {
+            const std::string raw =
+                send_session_query("info", "", session->active_session_id);
+            uint64_t current_tokens = 0;
+            uint64_t max_tokens = 0;
+            try {
+                const json r = json::parse(raw);
+                current_tokens = r.value("total_context_tokens", static_cast<uint64_t>(0));
+                max_tokens = r.value("max_context_tokens", static_cast<uint64_t>(0));
+                if (current_tokens == 0 || max_tokens == 0) {
+                    const json s = r.value("session", json::object());
+                    current_tokens = s.value("current_context_tokens",
+                                             static_cast<uint64_t>(0));
+                    max_tokens = s.value("max_context_tokens",
+                                         static_cast<uint64_t>(0));
+                }
+            } catch (...) {
+                max_tokens = 0;
+            }
+            if (max_tokens == 0) {
                 send({{"type","token"},{"data","[Context info unavailable]\n"}});
                 return true;
             }
-            const double pct = (cu.max_tokens > 0)
-                ? (static_cast<double>(cu.current_tokens) /
-                   static_cast<double>(cu.max_tokens) * 100.0)
-                : 0.0;
+            const double pct = static_cast<double>(current_tokens) /
+                               static_cast<double>(max_tokens) * 100.0;
             std::ostringstream ss;
-            ss << "[Context: " << cu.current_tokens << " / " << cu.max_tokens
+            ss << "[Context: " << current_tokens << " / " << max_tokens
                << " tokens  (" << static_cast<int>(pct) << "%)]\n";
             send({{"type","token"},{"data", ss.str()}});
             return true;
         };
 
         // ── /model_info ───────────────────────────────────────────────
-        command_table_["/model_info"] = [](auto /*s*/, const auto& send,
-                                            const std::string& /*args*/) {
-            const json info = detail::read_model_info();
-            const json comp = detail::read_compacter_info();
+        command_table_["/model_info"] = [this](auto /*s*/, const auto& send,
+                            const std::string& /*args*/) {
+                const std::string raw = send_session_query("model_info", "", "");
+                json info = json::object();
+                try {
+                     info = json::parse(raw);
+                } catch (...) {}
             std::ostringstream ss;
             ss << "── Model Info ──────────────────────────\n";
             ss << "  model_name     : " << info.value("model_name","?") << "\n";
             ss << "  model_type     : " << info.value("model_type","?") << "\n";
             ss << "  active_adapter : " << info.value("active_adapter","?") << "\n";
             ss << "  context_tokens : "
-               << info.value("max_context_tokens",
-                              static_cast<uint64_t>(0)) << "\n";
+                    << info.value("max_context_tokens", static_cast<uint64_t>(0))
+                    << "\n";
             ss << "  max_parallel   : "
-               << info.value("max_simultaneous_llm_requests",0) << "\n";
+                    << info.value("max_simultaneous_llm_requests", 0) << "\n";
             ss << "  enabled        : "
                << (info.value("enabled",true) ? "yes" : "no") << "\n";
             ss << "  compact_thresh : "
-               << static_cast<int>(
-                      comp.value("auto_compact_threshold", 0.70) * 100.0)
-               << "%\n";
+                    << info.value("auto_compact_threshold_pct", 70) << "%\n";
             ss << "────────────────────────────────────────\n";
             send({{"type","token"},{"data", ss.str()}});
             return true;
@@ -1109,7 +1038,7 @@ private:
         // Asks the scheduler for queue_depth (one SESSION_QUERY round-trip).
         command_table_["/scheduler_info"] = [this](auto /*s*/, const auto& send,
                                                      const std::string& /*args*/) {
-            const std::string raw = send_session_query("queue_depth", "");
+            const std::string raw = send_session_query("queue_depth", "", "");
             std::ostringstream ss;
             ss << "── Scheduler Info ──────────────────────\n";
             try {
@@ -1291,7 +1220,35 @@ private:
         constexpr int kPort        = 5171;
         constexpr int kRetries     = 3;
         constexpr int kRetryMs     = 300;
-        constexpr int kTimeoutMs   = 8000;
+        constexpr int kDefaultTimeoutMs = 8000;
+
+        auto load_scheduler_wait_timeout_ms = []() {
+            std::ifstream model_file("config/model.json");
+            if (!model_file.is_open()) {
+                model_file.open("../config/model.json");
+            }
+            if (!model_file.is_open()) {
+                model_file.open("build/config/model.json");
+            }
+            if (!model_file.is_open()) {
+                return 65000;
+            }
+            try {
+                json model;
+                model_file >> model;
+                const int request_timeout_ms =
+                    model.value("request_timeout_ms", 60000);
+                return request_timeout_ms + 5000;
+            } catch (...) {
+                return 65000;
+            }
+        };
+
+        const int kTimeoutMs =
+            (action == "compact")
+                ? std::max(load_scheduler_wait_timeout_ms() + 2000,
+                           kDefaultTimeoutMs)
+                : kDefaultTimeoutMs;
 
         try {
             SocketWrapper sock;
@@ -1338,14 +1295,16 @@ private:
 
         } catch (const std::exception& e) {
             std::cerr << "[Handler] SESSION_CONTROL(" << action << "): "
-                      << e.what() << std::endl;
+                      << e.what() << " (timeout_ms=" << kTimeoutMs << ")"
+                      << std::endl;
             return "";
         }
     }
 
     // SESSION_QUERY: returns raw JSON string from scheduler.
     std::string send_session_query(const std::string& query_type,
-                                   const std::string& queue_key) {
+                                   const std::string& queue_key,
+                                   const std::string& user_id) {
         constexpr int kPort      = 5171;
         constexpr int kTimeoutMs = 5000;
         try {
@@ -1357,6 +1316,7 @@ private:
             json frame = {{"message_type","SESSION_QUERY"},
                           {"query_type",  query_type}};
             if (!queue_key.empty()) frame["queue_key"] = queue_key;
+            if (!user_id.empty()) frame["user_id"] = user_id;
             send_json(sock, frame.dump());
             return recv_json(sock);
         } catch (...) {
@@ -1369,19 +1329,28 @@ private:
     // ------------------------------------------------------------------
 
     void initialize_known_users() {
-        const fs::path root = fs::path("memory") / "sessions" / "users";
+        std::unordered_set<std::string> found;
         try {
-            fs::create_directories(root);
-            std::unordered_set<std::string> found;
-            for (const auto& e : fs::directory_iterator(root))
-                if (e.is_directory())
-                    found.insert(e.path().filename().string());
-            std::lock_guard<std::mutex> lk(known_users_mutex_);
-            known_users_ = std::move(found);
+            const std::string raw = send_session_query("all_sessions", "", "");
+            const json resp = json::parse(raw);
+            const json users = resp.value("super_users", json::array());
+            for (const auto& u : users) {
+                if (!u.is_object()) {
+                    continue;
+                }
+                const std::string super_user =
+                    u.value("super_user", std::string(""));
+                if (!super_user.empty()) {
+                    found.insert(super_user);
+                }
+            }
         } catch (const std::exception& e) {
-            std::cerr << "[Handler] initialize_known_users: "
+            std::cerr << "[Handler] initialize_known_users query: "
                       << e.what() << std::endl;
         }
+
+        std::lock_guard<std::mutex> lk(known_users_mutex_);
+        known_users_ = std::move(found);
     }
 
     void ensure_known_user(const std::string& super_user) {

@@ -11,6 +11,9 @@ using json = nlohmann::json;
 namespace velix::llm {
 
 class SessionIO;
+namespace tools {
+class ToolRegistry;
+}
 
 // ── SessionManager ─────────────────────────────────────────────────────────
 //
@@ -25,10 +28,10 @@ class SessionIO;
 //
 // Storage layout  (storage_root = "memory", configurable):
 //   memory/sessions/users/{super_user}/{session_id}/
-//     active.json              ← live conversation (SessionIO reads/writes)
+//     {session_id}.json        ← live conversation (SessionIO reads/writes)
 //     {session_id}_h{n}.json   ← snapshot after n-th compact (1-indexed)
 //   memory/sessions/procs/{pid}/{session_id}/
-//     active.json
+//     {session_id}.json
 //     {session_id}_h{n}.json
 //   memory/sessions/session_index.json
 //     {
@@ -59,7 +62,7 @@ class SessionManager {
 
   // ── Session / super-user info types ─────────────────────────────────────
 
-  // Live stats read from the active.json file on disk.
+  // Live stats read from the {session_id}.json file on disk.
   // Populated by get_session_info() and get_super_user_info().
   struct SessionLiveStats {
     uint64_t current_context_tokens = 0;  // tokens in the active context window
@@ -72,7 +75,7 @@ class SessionManager {
     std::string      session_id;        // e.g. "terminal_vivek_s2"
     std::string      title;             // user-supplied display name, may be empty
     int              snapshot_count = 0;// number of {session_id}_h{n}.json files present
-    SessionLiveStats live_stats;        // loaded from active.json on construction
+    SessionLiveStats live_stats;        // loaded from {session_id}.json on construction
   };
 
   struct SuperUserInfo {
@@ -104,6 +107,16 @@ class SessionManager {
     std::string skip_reason;
     int tokens_before = 0;
     int tokens_after = 0;
+  };
+
+  struct ContextUsage {
+    uint64_t session_tokens = 0;
+    uint64_t system_prompt_tokens = 0;
+    uint64_t tool_schema_tokens = 0;
+    uint64_t request_tokens = 0;
+    uint64_t total_context_tokens = 0;
+    uint64_t max_context_tokens = 0;
+    double context_fill_pct = 0.0;
   };
 
   // ── Public API ────────────────────────────────────────────────────────────
@@ -138,7 +151,7 @@ class SessionManager {
 
   /**
    * Return full SessionInfo including title, snapshot_count, and live token
-   * stats read from active.json.  Does not throw if the live file is absent;
+  * stats read from {session_id}.json. Does not throw if the live file is absent;
    * live_stats will be zero-initialised in that case.
    */
   SessionInfo get_session_info(const std::string& session_id) const;
@@ -162,10 +175,7 @@ class SessionManager {
    * Steps:
    *   1. Run summary extraction via compacter.
     *   2. Save full history as {session_id}_h{n}.json (for session_search).
-   *   3. Overwrite active.json with the pre-seeded synthetic tool-call history.
-   *
-   * is_auto=true  → append "continue…" turn; scheduler injects original msg.
-   * is_auto=false → manual compact from handler; no extra turn appended.
+  *   3. Overwrite {session_id}.json with the pre-seeded synthetic tool-call history.
    */
   CompactResult compact(const std::string& session_id,
                         const json&        history,
@@ -177,10 +187,15 @@ class SessionManager {
    */
   AutoCompactGuardResult run_auto_compact_guard(
       const std::string& convo_id,
-      std::size_t estimated_request_tokens,
-      std::size_t max_context_tokens,
+      const ContextUsage& usage,
       double auto_compact_threshold,
       SessionIO& session_io);
+
+    ContextUsage compute_context_usage(const std::string& session_id,
+                     const json& request_messages,
+                     const tools::ToolRegistry& tools,
+                     const std::string& mode,
+                     std::size_t max_context_tokens) const;
 
   /**
    * List all super_users known to the index (union of index + filesystem scan).
@@ -235,11 +250,12 @@ class SessionManager {
   void save_snapshot(const std::string& session_id, const json& history);
   void write_seeded_history(const std::string& session_id,
                             const std::string& summary,
-                            bool               add_continue_turn,
                             const json&        retained_recent = json::array());
 
   // ── Validation ────────────────────────────────────────────────────────
   static void validate_super_user_name(const std::string& super_user);
+  static uint64_t estimate_tokens(const std::string& text);
+  static uint64_t estimate_request_tokens(const json& request_messages);
 };
 
 }  // namespace velix::llm
