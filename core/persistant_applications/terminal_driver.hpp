@@ -354,7 +354,7 @@ public:
 
     bool cancel_current_job() override;
     void close() override;
-    bool is_alive() const override { return alive_.load(std::memory_order_acquire); }
+    bool is_alive() const override { return alive_.load(); }
     std::string driver_type() const override { return "local_pty"; }
     const DriverConfig &config() const override { return cfg_; }
 
@@ -464,7 +464,7 @@ public:
                         int timeout_sec, bool use_pty) override;
     bool cancel_current_job() override;
     void close() override;
-    bool is_alive() const override { return alive_.load(std::memory_order_acquire); }
+    bool is_alive() const override { return alive_.load(); }
     std::string driver_type() const override { return "ssh"; }
     const DriverConfig &config() const override { return cfg_; }
 

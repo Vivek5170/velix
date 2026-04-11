@@ -166,7 +166,7 @@ size_t SentinelParser::try_parse_frame() {
 
 std::string LocalPTYDriver::make_job_id() {
     static std::atomic<uint64_t> counter{0};
-    uint64_t n  = counter.fetch_add(1, std::memory_order_relaxed);
+    uint64_t n  = counter.fetch_add(1);
     uint64_t ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
@@ -272,7 +272,7 @@ void LocalPTYDriver::spawn_shell() {
         ::fcntl(master_fd_, F_SETFL, flags | O_NONBLOCK);
     }
 
-    alive_.store(true, std::memory_order_release);
+    alive_.store(true);
 
     timeout_thread_ = std::thread([this] { timeout_loop(); });
     reader_thread_  = std::thread([this] { reader_loop(); });
@@ -280,7 +280,7 @@ void LocalPTYDriver::spawn_shell() {
 
 void LocalPTYDriver::close() {
     // Idempotent.
-    if (!alive_.exchange(false, std::memory_order_acq_rel)) {
+    if (!alive_.exchange(false)) {
         // Was already false — just make sure threads are joined.
         if (reader_thread_.joinable())  reader_thread_.join();
         if (timeout_thread_.joinable()) { timeout_cv_.notify_all(); timeout_thread_.join(); }
@@ -336,7 +336,7 @@ void LocalPTYDriver::close() {
 }
 
 bool LocalPTYDriver::write_to_shell(const char *data, size_t len) {
-    if (master_fd_ < 0 || !alive_.load(std::memory_order_relaxed)) return false;
+    if (master_fd_ < 0 || !alive_.load()) return false;
     while (len > 0) {
         ssize_t n = ::write(master_fd_, data, len);
         if (n <= 0) return false;
@@ -463,7 +463,7 @@ void LocalPTYDriver::reader_loop() {
     );
 
     char buf[8192];
-    while (alive_.load(std::memory_order_acquire)) {
+    while (alive_.load()) {
         // master_fd_ may be -1 if close() raced with us — check each iteration.
         int fd = master_fd_;
         if (fd < 0) break;
@@ -504,7 +504,7 @@ void LocalPTYDriver::reader_loop() {
         }
     }
 
-    alive_.store(false, std::memory_order_release);
+    alive_.store(false);
 
     // Finalize any job that was still running.
     {
@@ -523,7 +523,7 @@ void LocalPTYDriver::reader_loop() {
 
 std::string LocalPTYDriver::exec(const std::string &cmd, int timeout_sec,
                                  std::shared_ptr<JobStore> job_store) {
-    if (!alive_.load(std::memory_order_acquire)) {
+    if (!alive_.load()) {
         throw std::runtime_error("LocalPTYDriver: shell is not alive");
     }
 
@@ -588,15 +588,13 @@ std::string LocalPTYDriver::exec(const std::string &cmd, int timeout_sec,
             current_job_.reset();
             job_cv_.notify_all();
         }
-        alive_.store(false, std::memory_order_release);
+        alive_.store(false);
         throw std::runtime_error("exec: failed to write to shell stdin");
     }
 
     return job_id;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POSIX one-shot helpers (run_cmd, posix_exec, posix_exec_pty)
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace {
@@ -901,13 +899,13 @@ void LocalPTYDriver::spawn_shell() {
     hProc_ = pi.hProcess;
     CloseHandle(pi.hThread);
 
-    alive_.store(true, std::memory_order_release);
+    alive_.store(true);
     timeout_thread_ = std::thread([this] { timeout_loop(); });
     reader_thread_  = std::thread([this] { reader_loop(); });
 }
 
 void LocalPTYDriver::close() {
-    if (!alive_.exchange(false, std::memory_order_acq_rel)) {
+    if (!alive_.exchange(false)) {
         if (reader_thread_.joinable())  reader_thread_.join();
         if (timeout_thread_.joinable()) { timeout_cv_.notify_all(); timeout_thread_.join(); }
         return;
@@ -1032,7 +1030,7 @@ void LocalPTYDriver::reader_loop() {
 
     char buf[8192];
     DWORD n = 0;
-    while (alive_.load(std::memory_order_acquire)) {
+    while (alive_.load()) {
         if (!ReadFile(read_end_, buf, sizeof(buf), &n, nullptr) || n == 0) break;
         parser.feed(buf, static_cast<size_t>(n));
     }
@@ -1044,7 +1042,7 @@ void LocalPTYDriver::reader_loop() {
         read_end_ = INVALID_HANDLE_VALUE;
     }
 
-    alive_.store(false, std::memory_order_release);
+    alive_.store(false);
 
     std::scoped_lock lk(job_mx_);
     if (current_job_) {
@@ -1056,7 +1054,7 @@ void LocalPTYDriver::reader_loop() {
 
 std::string LocalPTYDriver::exec(const std::string &cmd, int timeout_sec,
                                  std::shared_ptr<JobStore> job_store) {
-    if (!alive_.load(std::memory_order_acquire))
+    if (!alive_.load())
         throw std::runtime_error("LocalPTYDriver: shell is not alive");
 
     {
@@ -1107,7 +1105,7 @@ std::string LocalPTYDriver::exec(const std::string &cmd, int timeout_sec,
             current_job_.reset();
             job_cv_.notify_all();
         }
-        alive_.store(false, std::memory_order_release);
+        alive_.store(false);
         throw std::runtime_error("exec: write to shell failed");
     }
 
@@ -1230,7 +1228,7 @@ DockerDriver::DockerDriver(DriverConfig cfg) : cfg_(std::move(cfg)) {
 
     inner_cfg.shell = docker_cmd;
     inner_ = std::make_unique<LocalPTYDriver>(std::move(inner_cfg));
-    alive_.store(true, std::memory_order_release);
+    alive_.store(true);
 }
 
 bool DockerDriver::container_is_running(const DriverConfig &cfg) {
@@ -1288,7 +1286,7 @@ bool DockerDriver::cancel_current_job() {
 }
 
 void DockerDriver::close() {
-    alive_.store(false, std::memory_order_release);
+    alive_.store(false);
     if (inner_) inner_->close();
 }
 
@@ -1298,7 +1296,7 @@ bool DockerDriver::is_alive() const {
     // is_alive() call (which is invoked from exec(), watchdog, and snapshot).
     // The watchdog's detect_dead_sessions() will catch container exits when
     // inner_->is_alive() goes false (docker exec exits when container stops).
-    return alive_.load(std::memory_order_acquire) &&
+    return alive_.load() &&
            inner_ && inner_->is_alive();
 }
 

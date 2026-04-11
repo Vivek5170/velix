@@ -148,10 +148,14 @@ std::string TerminalRegistry::exec(const std::string &user_id,
     {
         std::shared_lock rd(sessions_mx_);
         auto it = sessions_.find(session_id);
-        if (it == sessions_.end())
-            throw std::runtime_error("No session: " + session_id);
-        if (!it->second.driver->is_alive())
-            throw std::runtime_error("Session shell is dead: " + session_id);
+        if (it == sessions_.end()) {
+            const std::string err = "No session: " + session_id;
+            throw std::runtime_error(err);
+        }
+        if (!it->second.driver->is_alive()) {
+            const std::string err = "Session shell is dead: " + session_id;
+            throw std::runtime_error(err);
+        }
         driver = it->second.driver;
         // Update last_used under shared lock — last_used_ms is not protected
         // by its own lock, but uint64_t writes are atomic on all supported

@@ -331,7 +331,13 @@ public:
     register_system_handler_tree();
   }
 
-  ~SupervisorService() { stop(); }
+  ~SupervisorService() noexcept {
+    try {
+      stop();
+    } catch (...) {
+      // Destructor must not allow exceptions to escape.
+    }
+  }
 
   void start(int port) {
     if (running_) {

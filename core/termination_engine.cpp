@@ -147,22 +147,10 @@ void WatchdogEngine::watchdog_loop(const std::function<bool()> &is_running) {
     std::unordered_set<std::string> failed_trees;
 
     for (const auto &entry : snapshot) {
-      // Check heartbeat timeout
-      if (is_heartbeat_timeout(entry, now_ms)) {
-        pids_by_tree[entry.tree_id].push_back(entry.pid);
-        failed_trees.insert(entry.tree_id);
-        continue;
-      }
-
-      // Check tree memory limit
-      if (is_tree_memory_exceeded(entry.tree_id)) {
-        pids_by_tree[entry.tree_id].push_back(entry.pid);
-        failed_trees.insert(entry.tree_id);
-        continue;
-      }
-
-      // Check tree LLM request limit
-      if (is_tree_llm_limit_exceeded(entry.tree_id)) {
+      const bool has_failure = is_heartbeat_timeout(entry, now_ms) ||
+                               is_tree_memory_exceeded(entry.tree_id) ||
+                               is_tree_llm_limit_exceeded(entry.tree_id);
+      if (has_failure) {
         pids_by_tree[entry.tree_id].push_back(entry.pid);
         failed_trees.insert(entry.tree_id);
       }

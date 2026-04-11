@@ -184,7 +184,13 @@ public:
             static_cast<uint64_t>(config_.job_retention_min) * 60 * 1000;
     }
 
-    ~ApplicationManagerService() { stop(); }
+    ~ApplicationManagerService() noexcept {
+        try {
+            stop();
+        } catch (...) {
+            // Destructor must not allow exceptions to escape.
+        }
+    }
 
     void start(int port) {
         if (running_.exchange(true)) return; // already running
