@@ -131,6 +131,7 @@ class TerminalGateway(Gateway):
             "/model_info",
             "/scheduler_info",
             "/context",
+            "/terminals",
         }
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -619,6 +620,7 @@ class TerminalGateway(Gateway):
                 f"  {S.CYAN}/model_info{S.RST}      — model & adapter config",
                 f"  {S.CYAN}/scheduler_info{S.RST}  — scheduler queue depth",
                 f"  {S.CYAN}/context{S.RST}         — context window usage",
+                f"  {S.CYAN}/terminals{S.RST}       — list active persistent terminals",
                 "",
             ]
             for line in lines:

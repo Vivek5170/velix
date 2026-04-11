@@ -23,26 +23,23 @@
  */
 
 #include "supervisor.hpp"
-#include "process_registry.hpp"
-#include "termination_engine.hpp"
 #include "../communication/network_config.hpp"
 #include "../communication/socket_wrapper.hpp"
+#include "../llm/session_io.hpp"
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
 #include "../utils/thread_pool.hpp"
-#include "../llm/session_io.hpp"
 #include "../vendor/nlohmann/json.hpp"
+#include "process_registry.hpp"
+#include "termination_engine.hpp"
 
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <fstream>
 #include <functional>
-#include <filesystem>
-#include <limits>
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -58,7 +55,6 @@
 #endif
 #include <Windows.h>
 #else
-#include <cerrno>
 #include <csignal>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -70,8 +66,6 @@ using json = nlohmann::json;
 namespace velix::core {
 
 namespace {
-
-namespace fs = std::filesystem;
 
 constexpr int kDefaultSupervisorPort = 5173;
 
@@ -222,7 +216,8 @@ SupervisorConfig load_supervisor_config() {
 // Replaces duplicated chrono calls throughout the code
 inline uint64_t get_current_time_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::system_clock::now().time_since_epoch()).count();
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
 }
 
 std::string to_string(ProcessStatus status) {
@@ -285,7 +280,7 @@ struct ConvMetadata {
   std::string convo_id;
   std::string user_id;
   int creator_pid = -1;
-  uint64_t created_at_ms = 0;  // FIX #8: Consistency - use uint64_t
+  uint64_t created_at_ms = 0; // FIX #8: Consistency - use uint64_t
   std::chrono::steady_clock::time_point last_activity_at =
       std::chrono::steady_clock::now();
 };
@@ -400,9 +395,9 @@ public:
 
           if (!submitted) {
             try {
-              json busy = {{"status", "error"},
-                           {"error",
-                            "supervisor busy: max client threads reached"}};
+              json busy = {
+                  {"status", "error"},
+                  {"error", "supervisor busy: max client threads reached"}};
               velix::communication::send_json(*client_ptr, busy.dump());
             } catch (const std::exception &) {
               // Best-effort rejection path.
@@ -443,7 +438,8 @@ public:
 
     join_watchdog();
 
-    // Ensure no child process keeps running/listening after supervisor shutdown.
+    // Ensure no child process keeps running/listening after supervisor
+    // shutdown.
     {
       const auto snapshot = registry_->snapshot_for_watchdog();
       std::vector<TerminationEngine::TerminationTarget> targets;
@@ -460,9 +456,9 @@ public:
       }
 
       if (!targets.empty()) {
-        termination_engine_->kill_processes(
-            targets, "supervisor_shutdown", registry_,
-            config_.terminate_grace_ms);
+        termination_engine_->kill_processes(targets, "supervisor_shutdown",
+                                            registry_,
+                                            config_.terminate_grace_ms);
       }
     }
 
@@ -478,17 +474,19 @@ private:
   // ─────────────────────────────────────────────────────────────────────
 
   // ProcessRegistry: owns all structural state (process/tree tables)
-  std::shared_ptr<ProcessRegistry> registry_{std::make_shared<ProcessRegistry>()};
+  std::shared_ptr<ProcessRegistry> registry_{
+      std::make_shared<ProcessRegistry>()};
 
   // TerminationEngine: performs OS-level termination
-  std::shared_ptr<TerminationEngine> termination_engine_{std::make_shared<TerminationEngine>()};
+  std::shared_ptr<TerminationEngine> termination_engine_{
+      std::make_shared<TerminationEngine>()};
 
   // Conversation tracking (specialized state - not in registry)
   std::mutex conversation_mutex_;
   std::unordered_map<int, std::unordered_set<std::string>>
-      process_convos_;  // pid -> {convo_ids}
+      process_convos_; // pid -> {convo_ids}
   std::unordered_map<std::string, ConvMetadata>
-      convo_metadata_;  // convo_id -> metadata
+      convo_metadata_; // convo_id -> metadata
 
   velix::llm::SessionIO convo_manager_;
 
@@ -595,8 +593,8 @@ private:
     ZeroMemory(&pi, sizeof(pi));
 
     if (!CreateProcessA(nullptr, cmd_buffer.data(), nullptr, nullptr, FALSE,
-              CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS, nullptr,
-              nullptr, &si, &pi)) {
+                        CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS, nullptr,
+                        nullptr, &si, &pi)) {
       LOG_ERROR_CTX("CreateProcessA failed when spawning handler", "supervisor",
                     "TREE_HANDLER", -1, "handler_spawn_error");
       return;
@@ -640,8 +638,7 @@ private:
     }
 
     static const std::unordered_set<std::string> allowed_types = {
-        "REGISTER_PID", "HEARTBEAT", "LLM_REQUEST", "TREE_STATUS",
-        "TREE_KILL"};
+        "REGISTER_PID", "HEARTBEAT", "LLM_REQUEST", "TREE_STATUS", "TREE_KILL"};
 
     const std::string message_type = message["message_type"].get<std::string>();
     if (allowed_types.find(message_type) == allowed_types.end()) {
@@ -807,7 +804,7 @@ private:
       return {{"status", "error"},
               {"error", "handler_role_reserved_for_bootstrap"}};
     } else if (register_intent == "NEW_TREE") {
-      tree_id = "";  // Let registry create it
+      tree_id = ""; // Let registry create it
       is_tree_root = true;
     } else {
       if (source_pid <= 0) {
@@ -921,13 +918,11 @@ private:
 
     if (mode != "simple" && mode != "conversation" &&
         mode != "user_conversation") {
-      return {{"status", "error"},
-              {"error", "unsupported LLM mode"}};
+      return {{"status", "error"}, {"error", "unsupported LLM mode"}};
     }
 
     if (!config_.conversation_enabled && mode != "simple") {
-      return {{"status", "error"},
-              {"error", "conversation mode is disabled"}};
+      return {{"status", "error"}, {"error", "conversation mode is disabled"}};
     }
 
     if (source_pid <= 0) {
@@ -953,8 +948,9 @@ private:
       }
     } else if (mode == "user_conversation") {
       if (source_process->role != "handler") {
-        return {{"status", "error"},
-                {"error", "user_conversation only allowed for handler process"}};
+        return {
+            {"status", "error"},
+            {"error", "user_conversation only allowed for handler process"}};
       }
       if (user_id.empty()) {
         return {{"status", "error"},
@@ -962,8 +958,10 @@ private:
       }
     }
 
-        return {{"status", "ok"},
-          {"is_handler", source_process->role == "handler"}};
+    registry_->increment_llm_request(source_process->tree_id);
+
+    return {{"status", "ok"},
+            {"is_handler", source_process->role == "handler"}};
   }
 
   json handle_tree_status(const json &message) {
@@ -976,8 +974,7 @@ private:
       for (const auto &tid : registry_->get_all_tree_ids()) {
         auto status = registry_->get_tree_status(tid);
         if (status.found) {
-          trees.push_back(
-              build_tree_json(tid, status.status, status.root_pid));
+          trees.push_back(build_tree_json(tid, status.status, status.root_pid));
         }
       }
       return {{"status", "ok"}, {"trees", trees}};
@@ -1053,6 +1050,9 @@ private:
       // FIX #12: Use time helper instead of manual chrono
       uint64_t now_ms = get_current_time_ms();
 
+      // NEW: Cleanup historical processes from registry
+      registry_->cleanup_historical_processes(now_ms);
+
       // Check heartbeat timeouts
       auto snapshot = registry_->snapshot_for_watchdog();
       std::vector<TerminationEngine::TerminationTarget> targets;
@@ -1064,10 +1064,10 @@ private:
           // FIX #3: WatchdogEntry now has all fields instead of second lookup
           TerminationEngine::TerminationTarget target;
           target.velix_pid = entry.pid;
-          target.os_pid = entry.os_pid;  // ← From snapshot, not get_process
+          target.os_pid = entry.os_pid; // ← From snapshot, not get_process
           target.tree_id = entry.tree_id;
-          target.trace_id = entry.trace_id;  // ← From snapshot
-          target.parent_pid = entry.parent_pid;  // ← From snapshot
+          target.trace_id = entry.trace_id;     // ← From snapshot
+          target.parent_pid = entry.parent_pid; // ← From snapshot
           targets.push_back(target);
         }
 
@@ -1087,17 +1087,17 @@ private:
       }
 
       if (!targets.empty()) {
-        termination_engine_->kill_processes(
-            targets, "heartbeat_timeout", registry_,
-            config_.terminate_grace_ms);
+        termination_engine_->kill_processes(targets, "heartbeat_timeout",
+                                            registry_,
+                                            config_.terminate_grace_ms);
       }
 
       // FIX #8: Implement resource limit enforcement
       // Check memory and runtime limits per tree
-      auto tree_ids_with_created = registry_->get_all_tree_ids_with_created_at();
+      auto tree_ids_with_created =
+          registry_->get_all_tree_ids_with_created_at();
       for (const auto &[tree_id, created_at_ms] : tree_ids_with_created) {
-        if (config_.exempt_system_tree_limits &&
-            tree_id == "TREE_HANDLER") {
+        if (config_.exempt_system_tree_limits && tree_id == "TREE_HANDLER") {
           continue;
         }
 
@@ -1125,9 +1125,9 @@ private:
                 targets.push_back(target);
               }
             }
-            termination_engine_->kill_processes(
-                targets, "tree_runtime_limit", registry_,
-                config_.terminate_grace_ms);
+            termination_engine_->kill_processes(targets, "tree_runtime_limit",
+                                                registry_,
+                                                config_.terminate_grace_ms);
           }
         }
 
@@ -1136,12 +1136,11 @@ private:
         if (tree_memory_mb > config_.max_memory_per_tree_mb) {
           auto pids = registry_->kill_tree(tree_id);
           if (!pids.empty()) {
-            LOG_WARN_CTX("Tree exceeded memory limit (" +
-                             std::to_string(tree_memory_mb) + "MB > " +
-                             std::to_string(config_.max_memory_per_tree_mb) +
-                             "MB)",
-                         "supervisor", tree_id, -1,
-                         "tree_memory_limit_exceeded");
+            LOG_WARN_CTX(
+                "Tree exceeded memory limit (" +
+                    std::to_string(tree_memory_mb) + "MB > " +
+                    std::to_string(config_.max_memory_per_tree_mb) + "MB)",
+                "supervisor", tree_id, -1, "tree_memory_limit_exceeded");
             std::vector<TerminationEngine::TerminationTarget> targets;
             for (int pid : pids) {
               auto process = registry_->get_process(pid);
@@ -1155,9 +1154,9 @@ private:
                 targets.push_back(target);
               }
             }
-            termination_engine_->kill_processes(
-                targets, "tree_memory_limit", registry_,
-                config_.terminate_grace_ms);
+            termination_engine_->kill_processes(targets, "tree_memory_limit",
+                                                registry_,
+                                                config_.terminate_grace_ms);
           }
         }
 
@@ -1243,7 +1242,7 @@ SupervisorService &supervisor_service() {
   return service;
 }
 
-}  // namespace
+} // namespace
 
 void start_supervisor(int port) {
   if (port <= 0) {
@@ -1254,4 +1253,4 @@ void start_supervisor(int port) {
 
 void stop_supervisor() { supervisor_service().stop(); }
 
-}  // namespace velix::core
+} // namespace velix::core

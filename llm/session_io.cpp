@@ -8,7 +8,8 @@
 #include <fstream>
 #include <algorithm>
 #include <random>
-#include <sstream>
+#include <regex>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -87,6 +88,100 @@ long load_process_convo_ttl_ms() {
 	} catch (...) {
 		return 86400L * 1000L;
 	}
+}
+
+// ── Prompt Sanity & Safety Helpers ────────────────────────────────────────
+
+const char* DEFAULT_VELIX_IDENTITY =
+    "You are Velix Agent, an intelligent AI assistant. You are helpful, knowledgeable, and direct. "
+    "You assist users with a wide range of tasks including answering questions, writing and editing code, "
+    "analyzing information, and executing actions via your tools. You communicate clearly, "
+    "admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose. "
+    "Be targeted and efficient in your investigations.";
+
+const std::vector<std::pair<std::string, std::string>> THREAT_PATTERNS = {
+    {"ignore\\s+(previous|all|above|prior)\\s+instructions", "prompt_injection"},
+    {"do\\s+not\\s+tell\\s+the\\s+user", "deception_hide"},
+    {"system\\s+prompt\\s+override", "sys_prompt_override"},
+    {"disregard\\s+(your|all|any)\\s+(instructions|rules|guidelines)", "disregard_rules"},
+    {"act\\s+as\\s+(if|though)\\s+you\\s+(have\\s+no|don't\\s+have)\\s+(restrictions|limits|rules)", "bypass_restrictions"},
+    {"<!--[^>]*(?:ignore|override|system|secret|hidden)[^>]*-->", "html_comment_injection"},
+    {"<\\s*div\\s+style\\s*=\\s*[\"'].*display\\s*:\\s*none", "hidden_div"},
+    {"translate\\s+.*\\s+into\\s+.*\\s+and\\s+(execute|run|eval)", "translate_execute"},
+    {"curl\\s+[^\\n]*\\$\\{?\\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)", "exfil_curl"},
+    {"cat\\s+[^\\n]*(\\.env|credentials|\\.netrc|\\.pgpass)", "read_secrets"}
+};
+
+// Zero-width and other "invisible" characters used for injection
+const std::set<std::string> INVISIBLE_CHARS = {
+    "\u200b", "\u200c", "\u200d", "\u2060", "\ufeff",
+    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e"
+};
+
+std::string clean_invisible_chars(std::string content) {
+	for (const auto& ch : INVISIBLE_CHARS) {
+		size_t pos = 0;
+		while ((pos = content.find(ch, pos)) != std::string::npos) {
+			content.erase(pos, ch.length());
+		}
+	}
+	return content;
+}
+
+std::string strip_yaml_frontmatter(const std::string& content) {
+	if (content.substr(0, 3) == "---") {
+		auto end = content.find("\n---", 3);
+		if (end != std::string::npos) {
+			std::string body = content.substr(end + 4);
+			// Trim leading newlines
+			size_t first = body.find_first_not_of("\n\r");
+			if (first != std::string::npos) {
+				return body.substr(first);
+			}
+			return body;
+		}
+	}
+	return content;
+}
+
+std::string scan_content_for_threats(const std::string& content, const std::string& filename) {
+	for (const auto& [pattern, pid] : THREAT_PATTERNS) {
+		try {
+			std::regex re(pattern, std::regex_constants::icase);
+			if (std::regex_search(content, re)) {
+				LOG_WARN_CTX("Threat detected in " + filename + ": " + pid, "prompt_safety", "", -1, "blocked_content");
+				return "[BLOCKED: " + filename + " contained potential prompt injection (" + pid + "). Content not loaded.]";
+			}
+		} catch (...) {}
+	}
+	return content;
+}
+
+std::string truncate_content(const std::string& content, const std::string& filename, size_t max_chars = 20000) {
+	if (content.size() <= max_chars) {
+		return content;
+	}
+	size_t head_chars = static_cast<size_t>(max_chars * 0.7);
+	size_t tail_chars = static_cast<size_t>(max_chars * 0.2);
+	std::string head = content.substr(0, head_chars);
+	std::string tail = content.substr(content.size() - tail_chars);
+	std::string marker = "\n\n[...truncated " + filename + ": kept " + std::to_string(head_chars) + "+" + 
+	                     std::to_string(tail_chars) + " of " + std::to_string(content.size()) + 
+	                     " chars. Use file tools to read the full file.]\n\n";
+	return head + marker + tail;
+}
+
+std::string process_context_file(const std::string& content, const std::string& filename) {
+	if (content.empty()) return "";
+	
+	std::string cleaned = clean_invisible_chars(content);
+	std::string safe = scan_content_for_threats(cleaned, filename);
+	
+	// If it was blocked, don't do further processing
+	if (safe.substr(0, 9) == "[BLOCKED:") return safe;
+	
+	std::string stripped = strip_yaml_frontmatter(safe);
+	return truncate_content(stripped, filename);
 }
 
 }  // namespace
@@ -228,14 +323,15 @@ std::string SessionIO::build_layered_system_prompt(
 	// Centralize session-id parsing so all components honor the same _s{N} rule.
 	const std::string super_user = SessionManager::extract_super_user(user_id);
 
-	const std::string general_guidelines = load_text_with_fallbacks({
+	const std::string general_guidelines_raw = load_text_with_fallbacks({
 	    "memory/general_guidelines.md",
 	    "../memory/general_guidelines.md",
 	    "build/memory/general_guidelines.md"
 	});
+	const std::string general_guidelines = process_context_file(general_guidelines_raw, "general_guidelines.md");
 
 	// Soul (persona) — per-super-user first, global fallback.
-	const std::string soul = (mode == "user_conversation" || mode == "simple")
+	const std::string soul_raw = (mode == "user_conversation" || mode == "simple")
 	    ? load_text_with_fallbacks({
 	          "memory/agentfiles/" + super_user + "/soul.md",
 	          "memory/soul.md",
@@ -243,9 +339,10 @@ std::string SessionIO::build_layered_system_prompt(
 	          "build/memory/soul.md"
 	      })
 	    : std::string("");
+	const std::string soul = process_context_file(soul_raw, "soul.md");
 
 	// user.md — per-super-user facts, only for user_conversation.
-	const std::string user_facts = (mode == "user_conversation")
+	const std::string user_facts_raw = (mode == "user_conversation")
 	    ? load_text_with_fallbacks({
 	          "memory/agentfiles/" + super_user + "/user.md",
 	          "memory/user.md",
@@ -253,6 +350,7 @@ std::string SessionIO::build_layered_system_prompt(
 	          "build/memory/user.md"
 	      })
 	    : std::string("");
+	const std::string user_facts = process_context_file(user_facts_raw, "user.md");
 
 	std::string combined;
 	if (!general_guidelines.empty()) {
@@ -268,10 +366,11 @@ std::string SessionIO::build_layered_system_prompt(
 	}
 	if (!caller_system_msg.empty()) {
 		if (!combined.empty()) combined += "\n\n";
-		combined += caller_system_msg;
+		// Also scan caller system msg for threats, but don't truncate (usually short)
+		combined += scan_content_for_threats(caller_system_msg, "caller_system_message");
 	}
 	if (combined.empty()) {
-		combined = "You are Velix Agent, an intelligent AI assistant.";
+		combined = DEFAULT_VELIX_IDENTITY;
 	}
 	return combined;
 }

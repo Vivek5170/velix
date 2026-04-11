@@ -103,6 +103,7 @@ json execute_prepare(const std::vector<PrepareStep> &steps,
               {"exit_code", res.exit_code},
               {"timed_out", res.timed_out},
               {"stdout", res.stdout_content},
+              {"stderr", res.stderr_content},
               {"error", "prepare_step_failed"}};
     }
 

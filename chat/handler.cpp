@@ -645,8 +645,10 @@ private:
 
             if (type == "tool_message") {
                 const json tm = j.value("tool_message", json::object());
+                const std::string runtime_ctx = 
+                    build_runtime_context(session->active_session_id);
                 const std::string reply =
-                    call_llm_resume("", tm, session->user_id, on_token);
+                    call_llm_resume(runtime_ctx, tm, session->user_id, on_token);
                 flush_reply(reply);
 
             } else if (type == "resume_turn") {
@@ -656,15 +658,19 @@ private:
                 tm["content"] = r.dump();
                 if (r.contains("tool_call_id") && r["tool_call_id"].is_string())
                     tm["tool_call_id"] = r["tool_call_id"];
+                const std::string runtime_ctx = 
+                    build_runtime_context(session->active_session_id);
                 const std::string reply =
-                    call_llm_resume("", tm, session->user_id, on_token);
+                    call_llm_resume(runtime_ctx, tm, session->user_id, on_token);
                 flush_reply(reply);
 
             } else if (type == "independent_msg") {
                 const json p = j.value("payload", json::object());
                 const std::string content = p.value("content", std::string(""));
+                const std::string runtime_ctx = 
+                    build_runtime_context(session->active_session_id);
                 const std::string reply =
-                    call_llm_internal("", content, "", session->user_id,
+                    call_llm_internal("", content, runtime_ctx, session->user_id,
                                       "simple", config_.stream_enabled, on_token);
                 flush_reply(reply);
 
@@ -693,8 +699,10 @@ private:
                 }
 
                 // LLM turn.
+                const std::string runtime_ctx = 
+                    build_runtime_context(session->active_session_id);
                 const std::string reply =
-                    call_llm_internal("", text, "", session->user_id,
+                    call_llm_internal("", text, runtime_ctx, session->user_id,
                                       "user_conversation",
                                       config_.stream_enabled, on_token);
                 flush_reply(reply);
@@ -778,6 +786,7 @@ private:
             ss << "  /compact          — compact current session\n";
             ss << "  /undo             — undo last turn\n";
             ss << "  /sessions         — list sessions for your user\n";
+            ss << "  /terminals        — list active persistent terminals\n";
             ss << "  /title <text>     — set title for current session\n";
             ss << "  /session_info     — current session stats from disk\n";
             ss << "  /model_info       — model & adapter configuration\n";
@@ -1054,6 +1063,20 @@ private:
             return true;
         };
 
+        // ── /terminals ─────────────────────────────────────────────────
+        command_table_["/terminals"] = [this](auto session, const auto& send,
+                                               const std::string& /*args*/) {
+            std::string summary = get_terminals_summary(session->active_session_id);
+            if (summary.empty()) summary = "No terminals.";
+
+            std::ostringstream ss;
+            ss << "── Terminals ─────────────\n"
+               << summary
+               << "──────────────────────────\n";
+            send({{"type","token"},{"data", ss.str()}});
+            return true;
+        };
+
     } // register_commands()
 
     // ------------------------------------------------------------------
@@ -1300,6 +1323,54 @@ private:
                       << std::endl;
             return "";
         }
+    }
+
+    // APPLICATION_MANAGER_QUERY: talks to port 5175.
+    std::string send_application_manager_query(const json& frame) {
+        constexpr int kPort      = 5175;
+        constexpr int kTimeoutMs = 5000;
+        try {
+            SocketWrapper sock;
+            sock.create_tcp_socket();
+            sock.set_timeout_ms(kTimeoutMs);
+            sock.connect("127.0.0.1", kPort);
+            send_json(sock, frame.dump());
+            return recv_json(sock);
+        } catch (...) {
+            return "{}";
+        }
+    }
+
+    std::string get_terminals_summary(const std::string& user_id) {
+        const std::string raw = send_application_manager_query({
+            {"message_type", "LIST_SESSIONS"},
+            {"user_id",      user_id}
+        });
+        try {
+            json r = json::parse(raw);
+            const json sessions = r.value("sessions", json::array());
+            if (sessions.empty()) return "";
+
+            std::ostringstream ss;
+            for (const auto& s : sessions) {
+                if (!s.is_object()) continue;
+                ss << "- " << s.value("session_name", "default")
+                   << " [" << s.value("driver_type", "local_pty") << "] "
+                   << s.value("status", "Active") << "\n";
+            }
+            return ss.str();
+        } catch (...) {
+            return "Terminal status unavailable.";
+        }
+    }
+
+    std::string build_runtime_context(const std::string& user_id) {
+        std::string summary = get_terminals_summary(user_id);
+        if (summary.empty()) return "";
+        
+        std::ostringstream ss;
+        ss << "\nRuntime environment:\n" << summary;
+        return ss.str();
     }
 
     // SESSION_QUERY: returns raw JSON string from scheduler.

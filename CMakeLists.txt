@@ -45,6 +45,9 @@ set(KERNEL_SOURCES
     llm/session_io.cpp
     llm/compacter.cpp
     llm/session_manager.cpp
+    core/persistant_applications/application_manager.cpp
+    core/persistant_applications/terminal_registry.cpp
+    core/persistant_applications/terminal_driver.cpp
     ${COMM_SOURCES}
 )
 
@@ -69,6 +72,21 @@ add_executable(chat_handler
 target_link_libraries(chat_handler PRIVATE Threads::Threads)
 if(WIN32)
     target_link_libraries(chat_handler PRIVATE ws2_32)
+endif()
+
+# -----------------------------------------------------------------------------
+# Terminal Tester (Interactive Diagnostic Tool)
+# -----------------------------------------------------------------------------
+add_executable(terminal_tester
+    tests/terminal_tester.cpp
+    core/persistant_applications/terminal_registry.cpp
+    core/persistant_applications/terminal_driver.cpp
+    communication/send.cpp
+    communication/recv.cpp
+)
+target_link_libraries(terminal_tester PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(terminal_tester PRIVATE ws2_32)
 endif()
 
 # -----------------------------------------------------------------------------

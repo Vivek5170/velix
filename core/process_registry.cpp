@@ -1,41 +1,31 @@
 #include "process_registry.hpp"
-#include "../utils/logger.hpp"
 
 #include <limits>
 #include <sstream>
 
+#include <chrono>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <string_view>
+
 namespace velix::core {
 
-ProcessRegistry::ProcessRegistry()
-  = default;
+ProcessRegistry::ProcessRegistry() = default;
 
 ProcessRegistry::RegisterResult ProcessRegistry::register_process(
-    int os_pid,
-  std::string_view tree_id,
-    int parent_pid,
-  std::string_view role,
-  std::string_view trace_id,
-    ProcessStatus initial_status,
-    double initial_memory_mb,
-    bool is_system_handler) {
+    int os_pid, std::string_view tree_id, int parent_pid, std::string_view role,
+    std::string_view trace_id, ProcessStatus initial_status,
+    double initial_memory_mb, bool is_system_handler) {
   std::unique_lock<std::shared_mutex> lock(registry_mutex_);
 
   // Generate new pid
-  int pid = -1;
-  uint64_t pid_candidate = process_counter_++;
-  while (true) {
-    if (pid_candidate >
-        static_cast<uint64_t>(std::numeric_limits<int>::max())) {
-      return {false, "pid space exhausted", nullptr, ""};
-    }
-
-    pid = static_cast<int>(pid_candidate);
-    if (process_table_.count(pid) == 0) {
-      break;
-    }
-
-    pid_candidate = process_counter_++;
+  uint64_t pid_candidate = process_counter_.fetch_add(1);
+  if (pid_candidate > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    return {false, "pid space exhausted", nullptr, ""};
   }
+  int pid = static_cast<int>(pid_candidate);
 
   // Determine tree_id
   std::string final_tree_id(tree_id);
@@ -70,7 +60,8 @@ ProcessRegistry::RegisterResult ProcessRegistry::register_process(
   process_info->memory_mb.store(initial_memory_mb);
   process_info->last_heartbeat_ms.store(
       std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::system_clock::now().time_since_epoch()).count());
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
   process_info->alive.store(true);
 
   // Insert into registry
@@ -92,17 +83,48 @@ std::shared_ptr<ProcessInfo> ProcessRegistry::get_process(int pid) {
   std::shared_lock<std::shared_mutex> lock(registry_mutex_);
 
   auto it = process_table_.find(pid);
-  if (it == process_table_.end()) {
-    return nullptr;
-  }
-
   return it->second;
 }
 
-void ProcessRegistry::update_heartbeat(int pid,
-                                       ProcessStatus status,
-                                       double memory_mb,
-                                       uint64_t now_ms) {
+std::vector<int> ProcessRegistry::get_process_children(int pid) {
+  std::shared_lock<std::shared_mutex> lock(registry_mutex_);
+
+  std::vector<int> children;
+  auto it = process_children_.find(pid);
+  if (it != process_children_.end()) {
+    children.reserve(it->second.size());
+    for (int child : it->second) {
+      children.push_back(child);
+    }
+  }
+
+  return children;
+}
+
+std::vector<ProcessInfoSnapshot> ProcessRegistry::get_process_snapshot() {
+  std::vector<ProcessInfoSnapshot> out;
+
+  std::shared_lock<std::shared_mutex> lock(registry_mutex_);
+
+  out.reserve(process_table_.size());
+
+  for (const auto &[pid, proc] : process_table_) {
+    ProcessInfoSnapshot s;
+    s.pid = pid;
+    s.os_pid = proc->os_pid;
+    s.tree_id = proc->tree_id;
+    s.parent_pid = proc->parent_pid;
+    s.role = proc->role;
+    s.status = proc->status.load();
+    s.memory_mb = proc->memory_mb.load();
+    out.push_back(std::move(s));
+  }
+
+  return out;
+}
+
+void ProcessRegistry::update_heartbeat(int pid, ProcessStatus status,
+                                       double memory_mb, uint64_t now_ms) {
   // LOCK: NONE - this is intentionally lock-free
   // We get the shared_ptr outside to ensure it stays valid
 
@@ -117,8 +139,8 @@ void ProcessRegistry::update_heartbeat(int pid,
   process->last_heartbeat_ms.store(now_ms);
 }
 
-ProcessRegistry::TreeStatusResult ProcessRegistry::get_tree_status(
-  std::string_view tree_id) {
+ProcessRegistry::TreeStatusResult
+ProcessRegistry::get_tree_status(std::string_view tree_id) {
   std::shared_lock<std::shared_mutex> lock(registry_mutex_);
 
   const std::string tree_key(tree_id);
@@ -130,8 +152,7 @@ ProcessRegistry::TreeStatusResult ProcessRegistry::get_tree_status(
   return {true, it->second.status.load(), it->second.root_pid};
 }
 
-std::vector<int> ProcessRegistry::get_tree_processes(
-  std::string_view tree_id) {
+std::vector<int> ProcessRegistry::get_tree_processes(std::string_view tree_id) {
   std::shared_lock<std::shared_mutex> lock(registry_mutex_);
 
   std::vector<int> pids;
@@ -144,6 +165,17 @@ std::vector<int> ProcessRegistry::get_tree_processes(
     }
   }
   return pids;
+}
+
+size_t ProcessRegistry::get_tree_process_count(std::string_view tree_id) {
+  std::shared_lock<std::shared_mutex> lock(registry_mutex_);
+
+  auto it = tree_process_index_.find(std::string(tree_id));
+  if (it == tree_process_index_.end()) {
+    return 0;
+  }
+
+  return it->second.size();
 }
 
 double ProcessRegistry::compute_tree_memory_mb(std::string_view tree_id) {
@@ -181,10 +213,10 @@ std::vector<WatchdogEntry> ProcessRegistry::snapshot_for_watchdog() {
       // FIX #3: Include ALL fields needed by watchdog to avoid second lookup
       WatchdogEntry entry;
       entry.pid = pid;
-      entry.os_pid = process->os_pid;  // ← NEW: Avoid get_process() in watchdog
+      entry.os_pid = process->os_pid; // ← NEW: Avoid get_process() in watchdog
       entry.tree_id = process->tree_id;
-      entry.parent_pid = process->parent_pid;  // ← NEW: For BUS notifications
-      entry.trace_id = process->trace_id;  // ← NEW: For BUS notifications
+      entry.parent_pid = process->parent_pid; // ← NEW: For BUS notifications
+      entry.trace_id = process->trace_id;     // ← NEW: For BUS notifications
       entry.last_heartbeat_ms = process->last_heartbeat_ms.load();
       entry.memory_mb = process->memory_mb.load();
       entry.status = process->status.load();
@@ -284,12 +316,42 @@ void ProcessRegistry::terminate_process(int pid) {
     process_children_.erase(own_children_it);
   }
 
-  // Remove from registry
-  process_table_.erase(pid);
+  // Retention: Do NOT remove from process_table_ yet.
+  // Instead mark termination time.
+  process_it->second->termination_time_ms.store(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
 }
 
-bool ProcessRegistry::mark_tree_completed_if_done(
-  std::string_view tree_id) {
+void ProcessRegistry::increment_llm_request(std::string_view tree_id) {
+  std::shared_lock<std::shared_mutex> lock(registry_mutex_);
+
+  auto it = tree_table_.find(std::string(tree_id));
+  if (it != tree_table_.end()) {
+    it->second.llm_request_count.fetch_add(1);
+  }
+}
+
+void ProcessRegistry::cleanup_historical_processes(uint64_t now_ms,
+                                                   uint64_t retention_ms) {
+  std::unique_lock<std::shared_mutex> lock(registry_mutex_);
+
+  auto it = process_table_.begin();
+  while (it != process_table_.end()) {
+    auto &proc = it->second;
+    if (!proc->alive.load()) {
+      uint64_t term_time = proc->termination_time_ms.load();
+      if (term_time > 0 && (now_ms - term_time) > retention_ms) {
+        it = process_table_.erase(it);
+        continue;
+      }
+    }
+    ++it;
+  }
+}
+
+bool ProcessRegistry::mark_tree_completed_if_done(std::string_view tree_id) {
   std::unique_lock<std::shared_mutex> lock(registry_mutex_);
   const std::string tree_key(tree_id);
 
@@ -364,7 +426,8 @@ std::string ProcessRegistry::create_tree(std::string_view explicit_id) {
     tree_info.root_pid = -1;
     tree_info.created_at_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
     tree_info.status.store(TreeStatus::ACTIVE);
     tree_info.llm_request_count.store(0);
     tree_table_.try_emplace(tree_id, tree_info);
@@ -373,7 +436,8 @@ std::string ProcessRegistry::create_tree(std::string_view explicit_id) {
     tree_it->second.root_pid = -1;
     tree_it->second.created_at_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
     tree_it->second.status.store(TreeStatus::ACTIVE);
     tree_it->second.llm_request_count.store(0);
   }
@@ -473,4 +537,4 @@ void ProcessRegistry::on_process_terminal_unlocked_(int pid) {
   }
 }
 
-}  // namespace velix::core
+} // namespace velix::core

@@ -2,7 +2,7 @@
   "_comment": "Velix commandline skill configuration — loaded from ../../config/terminal.json",
   "approval": {
     "_comment_mode": "'smart' = pattern-match dangerous cmds and ask; 'off' = always allow; 'manual' = always ask",
-    "mode": "smart",
+    "mode": "manual",
     "_comment_timeout_sec": "Seconds to wait for handler approval reply before auto-denying",
     "timeout_sec": 60
   },

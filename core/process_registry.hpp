@@ -8,7 +8,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <chrono>
 
 namespace velix::core {
 
@@ -50,6 +49,20 @@ struct ProcessInfo {
   std::atomic<double> memory_mb;
   std::atomic<uint64_t> last_heartbeat_ms;
   std::atomic<bool> alive;
+  std::atomic<uint64_t> termination_time_ms{0};
+};
+
+/**
+ * ProcessInfoSnapshot: Flat snapshot of process state for efficient querying.
+ */
+struct ProcessInfoSnapshot {
+  int pid;
+  int os_pid;
+  std::string tree_id;
+  int parent_pid;
+  std::string role;
+  ProcessStatus status;
+  double memory_mb;
 };
 
 /**
@@ -72,10 +85,8 @@ struct TreeInfo {
   TreeInfo() = default;
 
   TreeInfo(const TreeInfo &other)
-      : tree_id(other.tree_id),
-        root_pid(other.root_pid),
-        created_at_ms(other.created_at_ms),
-        status(other.status.load()),
+      : tree_id(other.tree_id), root_pid(other.root_pid),
+        created_at_ms(other.created_at_ms), status(other.status.load()),
         llm_request_count(other.llm_request_count.load()) {}
 
   TreeInfo &operator=(const TreeInfo &other) {
@@ -100,12 +111,12 @@ struct TreeInfo {
  */
 struct WatchdogEntry {
   int pid;
-  int os_pid;  // ← NEW: Avoid get_process() call in watchdog
+  int os_pid; // ← NEW: Avoid get_process() call in watchdog
   std::string tree_id;
-  int parent_pid;  // ← NEW: For termination notifications
-  std::string trace_id;  // ← NEW: For BUS notifications
+  int parent_pid;       // ← NEW: For termination notifications
+  std::string trace_id; // ← NEW: For BUS notifications
   uint64_t last_heartbeat_ms;
-  uint64_t tree_created_at_ms;  // ← NEW: For tree runtime limit checks
+  uint64_t tree_created_at_ms; // ← NEW: For tree runtime limit checks
   double memory_mb;
   ProcessStatus status;
   bool alive;
@@ -152,15 +163,12 @@ public:
     std::string tree_id;
   };
 
-  RegisterResult register_process(
-      int os_pid,
-      std::string_view tree_id,  // empty = create new tree
-      int parent_pid,
-      std::string_view role,
-      std::string_view trace_id,
-      ProcessStatus initial_status,
-      double initial_memory_mb,
-      bool is_system_handler);
+  RegisterResult
+  register_process(int os_pid,
+                   std::string_view tree_id, // empty = create new tree
+                   int parent_pid, std::string_view role,
+                   std::string_view trace_id, ProcessStatus initial_status,
+                   double initial_memory_mb, bool is_system_handler);
 
   // ─── Process Lookup ────────────────────────────────────────────────
   /**
@@ -173,6 +181,20 @@ public:
    */
   std::shared_ptr<ProcessInfo> get_process(int pid);
 
+  /**
+   * Get all children pids for a given process.
+   *
+   * Lock: shared_lock(registry_mutex)
+   */
+  std::vector<int> get_process_children(int pid);
+
+  /**
+   * Get flat snapshot of all processes (live and historical).
+   *
+   * Lock: shared_lock(registry_mutex)
+   */
+  std::vector<ProcessInfoSnapshot> get_process_snapshot();
+
   // ─── Heartbeat Updates (Lock-Free) ─────────────────────────────────
   /**
    * Update process telemetry atomically.
@@ -181,9 +203,7 @@ public:
    *
    * Safe to call from any thread without holding registry_mutex.
    */
-  void update_heartbeat(int pid,
-                        ProcessStatus status,
-                        double memory_mb,
+  void update_heartbeat(int pid, ProcessStatus status, double memory_mb,
                         uint64_t now_ms);
 
   // ─── Tree Lookup ───────────────────────────────────────────────────
@@ -208,6 +228,13 @@ public:
    * Returns vector of pids only (not ProcessInfo).
    */
   std::vector<int> get_tree_processes(std::string_view tree_id);
+
+  /**
+   * Get number of active processes in a tree.
+   *
+   * Lock: shared_lock(registry_mutex)
+   */
+  size_t get_tree_process_count(std::string_view tree_id);
 
   /**
    * Compute total memory usage for a tree (from live processes).
@@ -263,8 +290,25 @@ public:
    *
    * IMPORTANT: Idempotent - safe to call multiple times for same pid.
    * Uses alive flag to detect if already terminated.
+   *
+   * Retention: This no longer erases from process_table_ immediately.
+   * Instead, it marks alive=false and sets termination_time_ms.
+   * Call cleanup_historical_processes() to fully remove.
    */
   void terminate_process(int pid);
+
+  /**
+   * Atomic increment of LLM request counter for a tree.
+   */
+  void increment_llm_request(std::string_view tree_id);
+
+  /**
+   * Remove old terminated processes from the registry.
+   *
+   * Lock: unique_lock(registry_mutex)
+   */
+  void cleanup_historical_processes(uint64_t now_ms,
+                                    uint64_t retention_ms = 60000);
 
   // ─── Tree Status ───────────────────────────────────────────────────
   /**
@@ -349,4 +393,4 @@ private:
   void on_process_terminal_unlocked_(int pid);
 };
 
-}  // namespace velix::core
+} // namespace velix::core

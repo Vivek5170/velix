@@ -1,13 +1,11 @@
 #pragma once
 
 #include "../../vendor/nlohmann/json.hpp"
-#include "../../utils/process_spawner.hpp"
 
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -31,57 +29,6 @@ public:
   ToolRegistry() { load_from_skills_directory(); }
 
   json get_tool_schemas() const { return cached_schemas_; }
-
-  json execute_tool(const std::string &name, const json &args) const {
-    const auto it = manifests_.find(name);
-    if (it == manifests_.end()) {
-      return {{"status", "error"},
-              {"error", "tool_not_found"},
-              {"tool", name},
-              {"available_tools", list_tool_names()}};
-    }
-
-    const ToolManifest &manifest = it->second;
-    if (manifest.command.empty()) {
-      return {{"status", "error"},
-              {"error", "tool_command_missing"},
-              {"tool", name}};
-    }
-
-    // Velix skills are process-runtime components. For scheduler tool-calling,
-    // we execute command-defined tools with JSON args as a positional argument.
-    std::vector<std::string> run_args = manifest.command_args;
-    run_args.push_back(args.dump());
-
-    const std::string run_cwd = resolve_tool_workdir(manifest);
-    velix::utils::ProcessResult result;
-    try {
-      result = velix::utils::ProcessSpawner::run_sync_with_timeout(
-          manifest.command, run_args, {}, 30000, run_cwd);
-    } catch (const std::runtime_error &e) {
-      return {{"status", "error"},
-              {"error", "tool_process_exception"},
-              {"tool", name},
-              {"message", e.what()}};
-    }
-
-    json output = {{"status", result.success ? "success" : "error"},
-                   {"tool", name},
-                   {"exit_code", result.exit_code},
-                   {"timed_out", result.timed_out},
-                   {"stdout", result.stdout_content},
-                   {"stderr", result.stderr_content}};
-
-    // Best-effort parse structured stdout if tool prints JSON.
-    try {
-      const json parsed = json::parse(result.stdout_content);
-      output["parsed"] = parsed;
-    } catch (const nlohmann::json::parse_error &) {
-      // Tool stdout can legitimately be plain text.
-    }
-
-    return output;
-  }
 
 private:
   std::map<std::string, ToolManifest, std::less<>> manifests_;
@@ -110,10 +57,11 @@ private:
     return std::filesystem::current_path();
   }
 
-  static std::vector<std::string> list_directory_names(
-      const std::filesystem::path &root) {
+  static std::vector<std::string>
+  list_directory_names(const std::filesystem::path &root) {
     std::vector<std::string> out;
-    if (!std::filesystem::exists(root) || !std::filesystem::is_directory(root)) {
+    if (!std::filesystem::exists(root) ||
+        !std::filesystem::is_directory(root)) {
       return out;
     }
 
@@ -141,19 +89,20 @@ private:
       try {
         std::ifstream in(manifest_path);
         in >> manifest_json;
-        } catch (const nlohmann::json::exception &) {
+      } catch (const nlohmann::json::exception &) {
         continue;
-        } catch (const std::ios_base::failure &) {
+      } catch (const std::ios_base::failure &) {
         continue;
       }
 
       ToolManifest manifest;
-        manifest.name = get_string_or(manifest_json, "name", dir_name);
-        manifest.type = get_string_or(manifest_json, "type", "skill");
-        manifest.description = get_string_or(manifest_json, "description", "");
-        manifest.runtime = get_string_or(manifest_json, "runtime", "");
-        manifest.workdir = get_string_or(manifest_json, "workdir", "");
-      if (manifest_json.contains("parameters") && manifest_json["parameters"].is_object()) {
+      manifest.name = get_string_or(manifest_json, "name", dir_name);
+      manifest.type = get_string_or(manifest_json, "type", "skill");
+      manifest.description = get_string_or(manifest_json, "description", "");
+      manifest.runtime = get_string_or(manifest_json, "runtime", "");
+      manifest.workdir = get_string_or(manifest_json, "workdir", "");
+      if (manifest_json.contains("parameters") &&
+          manifest_json["parameters"].is_object()) {
         manifest.parameters = manifest_json["parameters"];
       } else {
         manifest.parameters = json::object();
@@ -193,8 +142,9 @@ private:
            {"function",
             {{"name", name},
              {"description", manifest.description},
-             {"parameters", manifest.parameters.is_object() ? manifest.parameters
-                                                              : json::object()}}}});
+             {"parameters", manifest.parameters.is_object()
+                                ? manifest.parameters
+                                : json::object()}}}});
     }
   }
 

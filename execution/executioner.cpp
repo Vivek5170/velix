@@ -940,6 +940,16 @@ private:
 
                     if (prep.value("status","error") != "ok") {
                         fail_reason = prep.value("error","prepare_failed");
+                        if (prep.contains("command")) {
+                            fail_reason += " command=" + prep.value("command", std::string(""));
+                        }
+                        if (prep.contains("exit_code")) {
+                            fail_reason += " exit_code=" +
+                                           std::to_string(prep.value("exit_code", -1));
+                        }
+                        if (prep.value("timed_out", false)) {
+                            fail_reason += " timed_out=true";
+                        }
                         try {
                             FileLockGuard fl(lock_file, config_.cache_lock_wait_ms);
                             std::ofstream out(status_file);

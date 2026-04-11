@@ -1,8 +1,8 @@
 #include "session_manager.hpp"
-#include "session_io.hpp"
-#include "tools/registry.hpp"
 #include "../utils/logger.hpp"
 #include "compacter.hpp"
+#include "session_io.hpp"
+#include "tools/registry.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -57,7 +57,8 @@ uint64_t SessionManager::estimate_request_tokens(const json &request_messages) {
   // turn). Session history is already accounted in session_tokens, so only
   // count the pending tail input that is not yet persisted.
   uint64_t total = 0;
-  for (auto it = request_messages.rbegin(); it != request_messages.rend(); ++it) {
+  for (auto it = request_messages.rbegin(); it != request_messages.rend();
+       ++it) {
     const auto &message = *it;
     if (!message.is_object()) {
       continue;
@@ -66,8 +67,8 @@ uint64_t SessionManager::estimate_request_tokens(const json &request_messages) {
     if (role == "assistant") {
       break;
     }
-    if ((role == "user" || role == "tool") &&
-        message.contains("content") && message["content"].is_string()) {
+    if ((role == "user" || role == "tool") && message.contains("content") &&
+        message["content"].is_string()) {
       total += estimate_tokens(message["content"].get<std::string>());
     }
   }
@@ -82,11 +83,10 @@ std::string SessionManager::extract_super_user(const std::string &session_id) {
   const auto pos = session_id.rfind("_s");
   if (pos != std::string::npos && pos + 2 < session_id.size()) {
     const std::string suffix = session_id.substr(pos + 2);
-    const bool numeric_suffix = !suffix.empty() &&
-                                std::all_of(suffix.begin(), suffix.end(),
-                                            [](unsigned char ch) {
-                                              return std::isdigit(ch) != 0;
-                                            });
+    const bool numeric_suffix =
+        !suffix.empty() &&
+        std::all_of(suffix.begin(), suffix.end(),
+                    [](unsigned char ch) { return std::isdigit(ch) != 0; });
     if (numeric_suffix) {
       return session_id.substr(0, pos);
     }
@@ -439,25 +439,26 @@ SessionManager::list_sessions(const std::string &super_user) const {
   }
 
   std::vector<std::string> out(sessions_set.begin(), sessions_set.end());
-  std::sort(out.begin(), out.end(), [](const std::string &a, const std::string &b) {
-    const auto pa = a.rfind("_s");
-    const auto pb = b.rfind("_s");
-    int na = 0;
-    int nb = 0;
-    try {
-      if (pa != std::string::npos) {
-        na = std::stoi(a.substr(pa + 2));
-      }
-      if (pb != std::string::npos) {
-        nb = std::stoi(b.substr(pb + 2));
-      }
-    } catch (...) {
-    }
-    if (na != nb) {
-      return na < nb;
-    }
-    return a < b;
-  });
+  std::sort(out.begin(), out.end(),
+            [](const std::string &a, const std::string &b) {
+              const auto pa = a.rfind("_s");
+              const auto pb = b.rfind("_s");
+              int na = 0;
+              int nb = 0;
+              try {
+                if (pa != std::string::npos) {
+                  na = std::stoi(a.substr(pa + 2));
+                }
+                if (pb != std::string::npos) {
+                  nb = std::stoi(b.substr(pb + 2));
+                }
+              } catch (...) {
+              }
+              if (na != nb) {
+                return na < nb;
+              }
+              return a < b;
+            });
   return out;
 }
 
@@ -515,20 +516,19 @@ void SessionManager::write_seeded_history(const std::string &session_id,
   json messages = json::array();
 
   messages.push_back(
-      {{"role", "user"},
-       {"content", "retrieve previous continuation session summary"}});
+      {{"role", "user"}, {"content", "retrieve previous session summary"}});
 
   messages.push_back(
       {{"role", "assistant"},
        {"content", ""},
        {"tool_calls",
         json::array({json::object(
-            {{"id", "tc_compact_001"},
+            {{"id", "tc_summary_001"},
              {"type", "function"},
              {"function",
-              {{"name", "session_search"},
+              {{"name", "session_summary_retrieve"},
                {"arguments",
-                "{\"query\": \"continue previous session\"}"}}}})})}});
+                "{\"query\": \"previous session summaryu\"}"}}}})})}});
 
   messages.push_back({{"role", "tool"},
                       {"tool_call_id", "tc_compact_001"},
@@ -552,7 +552,7 @@ void SessionManager::write_seeded_history(const std::string &session_id,
       continue;
     }
     seeded_tokens +=
-      static_cast<uint64_t>(m.value("content", std::string("")).size() / 4);
+        static_cast<uint64_t>(m.value("content", std::string("")).size() / 4);
   }
 
   json convo;
@@ -595,17 +595,15 @@ SessionManager::compact(const std::string &session_id, const json &history,
   std::string summary;
   json retained_recent = json::array();
   if (!history.empty()) {
-    const ::velix::llm::CompactResult cr =
-      compact_history_if_needed(history);
+    const ::velix::llm::CompactResult cr = compact_history_if_needed(history);
 
     if (!cr.compacted) {
       result.compacted = false;
-      result.compact_reason = cr.skip_reason.empty()
-                                  ? "below_compaction_limit"
-                                  : cr.skip_reason;
+      result.compact_reason =
+          cr.skip_reason.empty() ? "below_compaction_limit" : cr.skip_reason;
       result.tokens_after = result.tokens_before;
-      LOG_INFO_CTX("Compact skipped for " + session_id + " reason=" +
-                       result.compact_reason,
+      LOG_INFO_CTX("Compact skipped for " + session_id +
+                       " reason=" + result.compact_reason,
                    "session_mgr", "", -1, "session_compact_skipped");
       return result;
     }
@@ -671,7 +669,8 @@ SessionManager::compact(const std::string &session_id, const json &history,
 
   result.summary = summary;
 
-  // 2. Save snapshot for session_search (only when compaction actually happens).
+  // 2. Save snapshot for session_search (only when compaction actually
+  // happens).
   if (!history.empty()) {
     save_snapshot(session_id, history);
   }
@@ -694,9 +693,8 @@ SessionManager::compact(const std::string &session_id, const json &history,
 }
 
 SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
-  const std::string &convo_id, const ContextUsage &usage,
-  double auto_compact_threshold,
-    SessionIO &session_io) {
+    const std::string &convo_id, const ContextUsage &usage,
+    double auto_compact_threshold, SessionIO &session_io) {
   AutoCompactGuardResult result;
 
   if (convo_id.empty()) {
@@ -711,9 +709,8 @@ SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
     auto_compact_threshold = 0.70;
   }
 
-  const double fill_ratio =
-      static_cast<double>(usage.total_context_tokens) /
-      static_cast<double>(usage.max_context_tokens);
+  const double fill_ratio = static_cast<double>(usage.total_context_tokens) /
+                            static_cast<double>(usage.max_context_tokens);
   if (fill_ratio < auto_compact_threshold) {
     // LOG_INFO_CTX(
     //   "Auto-compact skipped for " + convo_id +
@@ -726,17 +723,16 @@ SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
     return result;
   }
 
-    LOG_INFO_CTX(
-      "Auto-compact trigger for " + convo_id +
-        " ratio=" + std::to_string(fill_ratio) +
-        " threshold=" + std::to_string(auto_compact_threshold) +
-        " parts(session=" + std::to_string(usage.session_tokens) +
-        ",system=" + std::to_string(usage.system_prompt_tokens) +
-        ",tools=" + std::to_string(usage.tool_schema_tokens) +
-        ",request=" + std::to_string(usage.request_tokens) +
-        ",total=" + std::to_string(usage.total_context_tokens) +
-        ",max=" + std::to_string(usage.max_context_tokens) + ")",
-      "session_mgr", "", -1, "session_compact_guard_trigger");
+  LOG_INFO_CTX("Auto-compact trigger for " + convo_id +
+                   " ratio=" + std::to_string(fill_ratio) +
+                   " threshold=" + std::to_string(auto_compact_threshold) +
+                   " parts(session=" + std::to_string(usage.session_tokens) +
+                   ",system=" + std::to_string(usage.system_prompt_tokens) +
+                   ",tools=" + std::to_string(usage.tool_schema_tokens) +
+                   ",request=" + std::to_string(usage.request_tokens) +
+                   ",total=" + std::to_string(usage.total_context_tokens) +
+                   ",max=" + std::to_string(usage.max_context_tokens) + ")",
+               "session_mgr", "", -1, "session_compact_guard_trigger");
 
   result.threshold_exceeded = true;
   result.compact_attempted = true;
@@ -783,18 +779,17 @@ SessionManager::ContextUsage SessionManager::compute_context_usage(
       SessionIO::build_layered_system_prompt(mode, "", prompt_user_id);
   usage.system_prompt_tokens = estimate_tokens(system_prompt);
 
-  usage.tool_schema_tokens =
-      estimate_tokens(tools.get_tool_schemas().dump());
+  usage.tool_schema_tokens = estimate_tokens(tools.get_tool_schemas().dump());
   usage.request_tokens = estimate_request_tokens(request_messages);
 
-  usage.total_context_tokens = usage.session_tokens + usage.system_prompt_tokens +
+  usage.total_context_tokens = usage.session_tokens +
+                               usage.system_prompt_tokens +
                                usage.tool_schema_tokens + usage.request_tokens;
   usage.max_context_tokens = static_cast<uint64_t>(max_context_tokens);
   if (usage.max_context_tokens > 0) {
-    usage.context_fill_pct =
-        static_cast<double>(usage.total_context_tokens) /
-        static_cast<double>(usage.max_context_tokens) *
-        100.0;
+    usage.context_fill_pct = static_cast<double>(usage.total_context_tokens) /
+                             static_cast<double>(usage.max_context_tokens) *
+                             100.0;
   }
 
   return usage;

@@ -1,0 +1,16 @@
+{
+    "_comment": "ApplicationManager configuration — loaded at startup",
+    "max_client_threads": 64,
+    "watchdog_interval_ms": 5000,
+    "sessions": {
+        "max_sessions_total": 64,
+        "idle_timeout_min": 15
+    },
+    "jobs": {
+        "job_retention_min": 60
+    },
+    "auth": {
+        "require_auth_token": false,
+        "auth_token": ""
+    }
+}

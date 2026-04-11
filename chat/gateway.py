@@ -393,6 +393,7 @@ class Gateway(ABC):
                 "  /compact         — compact current session",
                 "  /undo            — undo last turn",
                 "  /sessions        — list your sessions",
+                "  /terminals       — list active persistent terminals",
                 "  /title <text>    — set session title",
                 "  /session_info    — current session stats",
                 "  /model_info      — model & adapter config",

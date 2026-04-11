@@ -16,6 +16,7 @@ add_executable(main
     ${VELIX_SDK_ROOT}/velix_process.cpp
     ${VELIX_COMM_ROOT}/send.cpp
     ${VELIX_COMM_ROOT}/recv.cpp
+    ${CMAKE_SOURCE_DIR}/../../core/persistant_applications/terminal_driver.cpp
 )
 
 target_include_directories(main PRIVATE 

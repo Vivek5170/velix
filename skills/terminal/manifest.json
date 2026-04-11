@@ -1,7 +1,7 @@
 {
   "name": "terminal",
   "type": "skill",
-  "description": "Execute controlled terminal operations. Supports foreground, background (NOTIFY_HANDLER on completion), and PTY mode for interactive tools. Dangerous commands require handler approval.",
+  "description": "Execute commands. Supports building persistent environments (like keeping a real terminal tab open) or running background tasks.",
   "runtime": "cpp",
   "workdir": ".",
   "prepare": [
@@ -36,35 +36,25 @@
       },
       "timeout_sec": {
         "type": "number",
-        "description": "Execution timeout in seconds (1–600, default from config). In background mode only applies to how long the background process is allowed to run."
-      },
-      "cwd_mode": {
-        "type": "string",
-        "enum": [
-          "playground",
-          "tmp",
-          "repo"
-        ],
-        "description": "Sandbox base directory. playground=agent_playground/, tmp=agent_playground/tmp/, repo=agent_playground/repo/"
+        "description": "Execution timeout in seconds. 0 means no timeout. In background mode this caps the running process duration."
       },
       "cwd": {
         "type": "string",
-        "description": "Sub-path appended under cwd_mode root (e.g. 'src/utils'). Path escape via ../ is blocked."
+        "description": "Optional path used as working directory. For PTY mode, this is relative to playground_root; otherwise it is resolved from the current working directory."
+      },
+      "session_name": {
+        "type": "string",
+        "description": "A 'name tag' for a persistent window (e.g. 'work'). When you use the same name, we reuse that specific window so it remembers your previous folder (cd) and variables (export) exactly."
       },
       "background": {
         "type": "boolean",
         "default": false,
-        "description": "Run detached. Returns immediately with status=background. Handler receives NOTIFY_HANDLER with notify_type=TOOL_RESULT when the process exits."
+        "description": "Run in the background. Returns immediately and lets the task finish on its own. Use this for starting long-running processes. And it will notify you when done."
       },
       "pty": {
         "type": "boolean",
         "default": false,
-        "description": "Allocate a pseudo-terminal (PTY). Required for interactive CLI tools (Python REPL, ncurses, etc.). Uses forkpty on Linux/macOS, ConPTY on Windows."
-      },
-      "force": {
-        "type": "boolean",
-        "default": false,
-        "description": "Skip dangerous-command approval check. Only set after explicit user confirmation."
+        "description": "Interactive mode. Creates a 'persistent window' and remembers your context. Use this if you want subsequent calls to continue where the last one left off."
       }
     },
     "required": [
