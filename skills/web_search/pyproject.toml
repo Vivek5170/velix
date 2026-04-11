@@ -3,5 +3,5 @@ name = "velix-web-search"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-  "duckduckgo-search>=5.0.0"
+  "ddgs>=2.0.0"
 ]

@@ -52,6 +52,7 @@ class KawaiiSpinner:
         self._started   = 0.0
         self._frame_idx = 0
         self._thread: Optional[threading.Thread] = None
+        self._current_stop_event: Optional[threading.Event] = None
 
     # ── Public interface ────────────────────────────────────────────────────
 
@@ -64,6 +65,10 @@ class KawaiiSpinner:
         self._started = time.time()
         self._running = True
         self._frame_idx = 0
+        
+        # Unique event for THIS specific thread to avoid resuscitation races
+        stop_event = threading.Event()
+        self._current_stop_event = stop_event
 
         # Immediate "starting" line — context [B]
         emoji = S.get_tool_emoji(tool)
@@ -75,17 +80,28 @@ class KawaiiSpinner:
         )
 
         self._thread = threading.Thread(
-            target=self._bg_loop, daemon=True, name="velix-spinner"
+            target=self._bg_loop, 
+            args=(stop_event,),
+            daemon=True, 
+            name="velix-spinner"
         )
         self._thread.start()
 
     def stop(self, tool: str = "", duration: float = 0.0,
              failed: bool = False) -> None:
         """Context [B]: stop the spinner and print the final summary line."""
+        if not self._running:
+            return  # Prevent duplicate lines if already stopped (e.g. by approval)
+
         self._running = False
+        if self._current_stop_event:
+            self._current_stop_event.set()
+            
         if self._thread:
-            self._thread.join(timeout=self.TICK_SECONDS + 0.5)
+            self._thread.join(timeout=1.0)
             self._thread = None
+        
+        self._current_stop_event = None
 
         tool = tool or self._tool
         emoji = S.get_tool_emoji(tool)
@@ -105,15 +121,15 @@ class KawaiiSpinner:
 
     # ── Background heartbeat ────────────────────────────────────────────────
 
-    def _bg_loop(self) -> None:
+    def _bg_loop(self, stop_event: threading.Event) -> None:
         """
-        Context [C]: background thread.  Every write MUST end with \\n.
-        NO \\r, NO ANSI cursor movement — StdoutProxy won't handle them.
+        Context [C]: background thread.  Every write MUST end with \n.
+        NO \r, NO ANSI cursor movement — StdoutProxy won't handle them.
         """
         tick = 0
-        while self._running:
-            time.sleep(self.TICK_SECONDS)
-            if not self._running:
+        while not stop_event.is_set():
+            # Wait for TICK_SECONDS or until interrupted by stop()
+            if stop_event.wait(self.TICK_SECONDS):
                 break
 
             elapsed = time.time() - self._started

@@ -2,13 +2,13 @@
   "_comment": "Velix commandline skill configuration — loaded from ../../config/terminal.json",
   "approval": {
     "_comment_mode": "'smart' = pattern-match dangerous cmds and ask; 'off' = always allow; 'manual' = always ask",
-    "mode": "manual",
+    "mode": "smart",
     "_comment_timeout_sec": "Seconds to wait for handler approval reply before auto-denying",
-    "timeout_sec": 60
+    "timeout_sec": 600
   },
   "execution": {
     "_comment_default_timeout_sec": "Default command timeout if caller does not supply timeout_sec",
-    "default_timeout_sec": 30,
+    "default_timeout_sec": 60,
     "_comment_max_timeout_sec": "Hard ceiling — caller cannot exceed this",
     "max_timeout_sec": 600,
     "_comment_max_output_chars": "stdout/stderr each truncated to this (head 40% + tail 60%)",

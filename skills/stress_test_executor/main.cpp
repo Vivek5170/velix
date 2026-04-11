@@ -4,6 +4,7 @@
 #include <chrono>
 #include <future>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -46,10 +47,24 @@ public:
         out.start_ms = now_ms();
 
         try {
+          // Split cmd string into binary and args for non-PTY execution
+          std::string binary;
+          std::vector<std::string> args;
+          std::stringstream ss(cmd);
+          std::string word;
+          if (ss >> word) {
+            binary = word;
+            while (ss >> word) {
+              args.push_back(word);
+            }
+          }
+
           json terminal_params = {
-              {"cmd", cmd},
+              {"cmd", binary.empty() ? cmd : binary},
+              {"args", args},
               {"timeout_sec", timeout_sec},
-              {"cwd_mode", "playground"},
+              {"cwd", "."},
+              {"pty", false}
           };
 
           out.terminal_result = execute_tool("terminal", terminal_params);

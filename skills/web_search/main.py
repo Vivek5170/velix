@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import json
+import gzip
+import io
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -16,6 +18,7 @@ class WebSearchSkill(VelixProcess):
         super().__init__("web_search", "skill")
 
     def run(self) -> None:
+        self.warnings: List[str] = []
         query = str(self.params.get("query", "")).strip()
         if not query:
             self._report_error("Missing required parameter: query")
@@ -35,9 +38,9 @@ class WebSearchSkill(VelixProcess):
             timeout_sec = 8
         timeout_sec = max(1, min(timeout_sec, 20))
 
-        mode = str(self.params.get("mode", "sequential")).strip().lower()
+        mode = str(self.params.get("mode", "parallel")).strip().lower()
         if mode not in {"sequential", "parallel"}:
-            mode = "sequential"
+            mode = "parallel"
 
         allow_firecrawl_scrape = bool(self.params.get("allow_firecrawl_scrape", False))
 
@@ -49,36 +52,78 @@ class WebSearchSkill(VelixProcess):
             requested_sources = ["brave", "tavily", "firecrawl", "wikipedia", "arxiv", "duckduckgo"]
         requested_sources = [str(s).strip().lower() for s in requested_sources if str(s).strip()]
 
-        pipeline_order = ["brave", "tavily", "firecrawl", "wikipedia", "arxiv", "duckduckgo"]
-        enabled_order = [s for s in pipeline_order if s in set(requested_sources)]
-        if not enabled_order:
-            enabled_order = pipeline_order
+        from concurrent.futures import ThreadPoolExecutor
 
-        warnings: List[str] = []
+        tier1_all = ["brave", "tavily", "firecrawl"]
+        tier2_all = ["wikipedia", "arxiv", "duckduckgo"]
 
-        if mode == "parallel":
-            provider_results, provider_diag = self._run_parallel_pipeline(
-                query, max_results, timeout_sec, enabled_order, allow_firecrawl_scrape
-            )
-        else:
-            provider_results, provider_diag = self._run_sequential_pipeline(
-                query, max_results, timeout_sec, enabled_order, allow_firecrawl_scrape
-            )
+        # If user provided a specific sources list, restrict tiers to that subset
+        tier1 = [s for s in tier1_all if s in set(requested_sources)]
+        tier2 = [s for s in tier2_all if s in set(requested_sources)]
 
-        merged = self._merge_and_dedup(provider_results, max(6, max_results * 3))
-        final_results = merged[: max_results]
+        provider_diag: List[Dict[str, Any]] = []
+
+        # Use an orchestrator pool to manage speculative parallelism
+        with ThreadPoolExecutor(max_workers=2) as orchestrator:
+            # ---- Phase 0: Speculative Tier 2 Launch ----
+            tier2_future = None
+            if tier2:
+                tier2_future = orchestrator.submit(
+                    self._run_parallel_pipeline, query, max_results, timeout_sec, tier2, allow_firecrawl_scrape
+                )
+
+            # ---- Phase 1: Sequential Premium Providers (Stop on First Success) ----
+            premium_results: Dict[str, List[Dict[str, Any]]] = {}
+            premium_found = False
+            for source in tier1:
+                items: List[Dict[str, Any]] = []
+                failure_reason = ""
+                try:
+                    items = self._search_source(source, query, max_results, timeout_sec, allow_firecrawl_scrape)
+                    if not items:
+                        failure_reason = "no_results"
+                except Exception as exc:
+                    failure_reason = self._classify_failure(str(exc))
+
+                provider_diag.append(
+                    {
+                        "source": source,
+                        "count": len(items),
+                        "status": "ok" if items else "fallback",
+                        "reason": failure_reason,
+                    }
+                )
+
+                if items:
+                    premium_results[source] = items
+                    premium_found = True
+                    break
+
+            # ---- Phase 2: Decision & Fallback Collection ----
+            final_results: List[Dict[str, Any]] = []
+            if premium_found:
+                # Speculative hit! We ignore Tier 2 results for now to minimize latency.
+                # (The background tasks will be allowed to finish or be cleaned up by the executor).
+                final_results = self._merge_and_dedup(premium_results, max_results)
+            elif tier2_future:
+                # Premium failed, collect the results of the already-in-flight Tier 2 scan
+                tier2_results, tier2_diag = tier2_future.result()
+                provider_diag.extend(tier2_diag)
+                final_results = self._merge_and_dedup(tier2_results, max_results)
 
         result = {
             "status": "success",
             "query": query,
             "results": final_results,
             "summary": self._summarize_titles(final_results),
-            "mode": mode,
-            "pipeline_order": enabled_order,
+            "mode": "speculative_hybrid",
+            "tier1_checked": tier1,
+            "tier2_speculated": bool(tier2_future),
+            "tier2_used": not premium_found,
             "providers": provider_diag,
             "sources_used": sorted({str(it.get("source", "")) for it in final_results if it.get("source")}),
-            "warnings": warnings,
-            "note": "Fallback pipeline uses official APIs first and DuckDuckGo as final backup.",
+            "warnings": self.warnings,
+            "note": "Latency optimized: speculative free fallback launched while premium APIs checked.",
         }
 
         self.report_result(self.parent_pid, result, self.entry_trace_id)
@@ -114,8 +159,8 @@ class WebSearchSkill(VelixProcess):
                 }
             )
 
-            # Stop once primary source returns good results.
-            if items:
+            # Continue to next source unless we have enough results.
+            if len(items) >= limit:
                 break
 
         return provider_results, diagnostics
@@ -294,7 +339,7 @@ class WebSearchSkill(VelixProcess):
         for item in payload.get("query", {}).get("search", []):
             title = str(item.get("title", "")).strip()
             page_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
-            snippet = str(item.get("snippet", "")).replace("<span class=\"searchmatch\">", "").replace("</span>", "")
+            snippet = re.sub(r"<.*?>", "", str(item.get("snippet", "")))
             out.append(
                 {
                     "source": "wikipedia",
@@ -317,11 +362,12 @@ class WebSearchSkill(VelixProcess):
         raw = self._get_text(url, timeout_sec)
 
         out: List[Dict[str, Any]] = []
-        entries = re.findall(r"<entry>(.*?)</entry>", raw, flags=re.DOTALL)
+        # Support both namespaced and non-namespaced entry tags
+        entries = re.findall(r"<(?:[a-z]+:)?entry>(.*?)</(?:[a-z]+:)?entry>", raw, flags=re.DOTALL)
         for block in entries[:limit]:
-            title_match = re.search(r"<title>(.*?)</title>", block, flags=re.DOTALL)
-            summary_match = re.search(r"<summary>(.*?)</summary>", block, flags=re.DOTALL)
-            id_match = re.search(r"<id>(.*?)</id>", block, flags=re.DOTALL)
+            title_match = re.search(r"<(?:[a-z]+:)?title>(.*?)</(?:[a-z]+:)?title>", block, flags=re.DOTALL)
+            summary_match = re.search(r"<(?:[a-z]+:)?summary>(.*?)</(?:[a-z]+:)?summary>", block, flags=re.DOTALL)
+            id_match = re.search(r"<(?:[a-z]+:)?id>(.*?)</(?:[a-z]+:)?id>", block, flags=re.DOTALL)
             title = html.unescape((title_match.group(1) if title_match else "").strip()).replace("\n", " ")
             snippet = html.unescape((summary_match.group(1) if summary_match else "").strip()).replace("\n", " ")
             url_entry = (id_match.group(1) if id_match else "").strip()
@@ -331,7 +377,7 @@ class WebSearchSkill(VelixProcess):
     def _search_duckduckgo(self, query: str, limit: int, timeout_sec: int) -> List[Dict[str, Any]]:
         # Prefer ddgs package if present. Fallback to DuckDuckGo public instant-answer API.
         try:
-            from duckduckgo_search import DDGS  # type: ignore
+            from ddgs import DDGS  # type: ignore
 
             out: List[Dict[str, Any]] = []
             with DDGS() as ddgs:
@@ -345,7 +391,8 @@ class WebSearchSkill(VelixProcess):
                         }
                     )
             return self._sanitize_results(out)
-        except Exception:
+        except Exception as e:
+            self.warnings.append(f"Provider 'ddgs' not available, using limited fallback: {e}")
             pass
 
         params = {
@@ -413,12 +460,13 @@ class WebSearchSkill(VelixProcess):
             headers={
                 "User-Agent": "VelixWebSearchSkill/1.0 (+https://example.invalid)",
                 "Accept": "application/json",
+                "Accept-Encoding": "gzip",
                 **headers,
             },
             method="GET",
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+            raw = self._decode_response_content(resp)
             return json.loads(raw)
 
     def _post_json(
@@ -438,12 +486,13 @@ class WebSearchSkill(VelixProcess):
                 "User-Agent": "VelixWebSearchSkill/1.0 (+https://example.invalid)",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
+                "Accept-Encoding": "gzip",
                 **headers,
             },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+            raw = self._decode_response_content(resp)
             return json.loads(raw)
 
     def _get_text(self, url: str, timeout_sec: int) -> str:
@@ -452,11 +501,22 @@ class WebSearchSkill(VelixProcess):
             headers={
                 "User-Agent": "VelixWebSearchSkill/1.0 (+https://example.invalid)",
                 "Accept": "application/atom+xml,text/xml;q=0.9,*/*;q=0.8",
+                "Accept-Encoding": "gzip",
             },
             method="GET",
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+            return self._decode_response_content(resp)
+
+    def _decode_response_content(self, resp: Any) -> str:
+        content = resp.read()
+        if "gzip" in (resp.getheader("Content-Encoding") or ""):
+            try:
+                content = gzip.decompress(content)
+            except Exception as e:
+                # Fallback to raw if decompression fails for some reason
+                pass
+        return content.decode("utf-8", errors="replace")
 
     def _merge_and_dedup(
         self, provider_results: Dict[str, List[Dict[str, Any]]], limit: int

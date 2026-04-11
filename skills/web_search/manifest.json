@@ -1,7 +1,7 @@
 {
   "name": "web_search",
   "type": "skill",
-  "description": "Agent-grade web search with prioritized fallbacks and optional parallel aggregation.",
+  "description": "High-performance agentic search engine with multi-provider fallback, parallel aggregation, and robust Gzip decompression support.",
   "runtime": "python",
   "entry": "main.py",
   "workdir": ".",

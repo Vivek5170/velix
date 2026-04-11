@@ -27,6 +27,7 @@ prompt_toolkit's ANSI printer itself synchronises.
 from __future__ import annotations
 
 import os
+import queue
 import re
 import shutil
 import sys
@@ -114,6 +115,7 @@ class TerminalGateway(Gateway):
         # Gate input so approval prompts don't race with main prompt session.
         self._turn_done         = threading.Event()
         self._turn_done.set()
+        self._approval_queue    = queue.Queue()
         self._approve_mode      = "default"  # all | default (runtime only)
 
         # Register extra commands
@@ -216,8 +218,8 @@ class TerminalGateway(Gateway):
                 f"\n{S.DIM_CYAN}  ✓ Approval acknowledged"
                 f" (trace {trace[:8]}…){S.RST}"
             )
-            # Unblock input if a turn doesn't emit a terminal end frame.
-            self._turn_done.set()
+            # DO NOT set _turn_done here; multiple tool calls may follow.
+            # Only 'end' or 'error' frames should conclude the turn.
 
         elif t == "session_switched":
             sid = event.get("session_id", "")
@@ -264,6 +266,8 @@ class TerminalGateway(Gateway):
         c.print()
 
     def on_disconnected(self) -> None:
+        if self._spinner.is_running():
+            self._spinner.stop(self._current_tool, failed=True)
         _pt_print(f"\n{S.BOLD_RED}Disconnected.{S.RST}")
 
     def on_token(self, text: str) -> None:
@@ -316,13 +320,24 @@ class TerminalGateway(Gateway):
         self._ctx_request     = max(0, request_tokens)
 
     def on_approval_request(self, approval_trace: str, payload: dict) -> None:
-        """Interactive approval prompt in context [B]."""
+        """
+        Non-blocking hook called from bg receiver thread.
+        Enqueues the request for the main thread to handle interactively.
+        """
+        self._approval_queue.put((approval_trace, payload))
+
+    def _handle_approval_interactively(self, approval_trace: str, payload: dict) -> None:
+        """
+        Interactive approval prompt in main thread (Context [B]).
+        Allows for user input while background streams continue (via patch_stdout).
+        """
         self._ensure_newline()
         if self._spinner.is_running():
             dur = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
             self._spinner.stop(self._current_tool, dur, failed=False)
             self._current_tool = ""
             self._tool_start_time = 0.0
+
         cmd  = payload.get("command", payload.get("message", ""))
         desc = payload.get("description", "")
         _pt_print(f"\n{S.YELLOW}{'─' * 52}{S.RST}")
@@ -341,11 +356,12 @@ class TerminalGateway(Gateway):
             self.send_approval_reply(approval_trace, "once")
             return
 
-        _pt_print("  Reply:  allow  /  deny  /  whitelist")
+        _pt_print("  Reply:  allow / deny / whitelist")
         ans = ""
         while ans not in ("allow", "deny", "whitelist"):
             try:
-                ans = input("  > ").strip().lower()
+                # Use project's existing PromptSession for clean TUI state
+                ans = self._prompt_session.prompt(ANSI("  > ")).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 ans = "deny"
                 break
@@ -357,6 +373,25 @@ class TerminalGateway(Gateway):
             "whitelist": "always",
         }.get(ans, "deny")
         self.send_approval_reply(approval_trace, scope)
+
+    def _wait_for_turn_completion(self) -> None:
+        """
+        Main thread polling loop: waits for self._turn_done while
+        processing interactive signals (like approvals) from the receiver.
+        Ensures the queue is drained even if the turn ends abruptly.
+        """
+        while not self._turn_done.is_set() or not self._approval_queue.empty():
+            try:
+                # Use non-blocking polling pattern for cleaner loop
+                req = self._approval_queue.get_nowait()
+                trace, payload = req
+                self._handle_approval_interactively(trace, payload)
+            except queue.Empty:
+                time.sleep(0.05)
+                continue
+            except Exception as exc:
+                _pt_print(f"{S.BOLD_RED}[Internal Error]{S.RST} signal handling failed: {exc}")
+                break
 
     def on_session_switched(self, session_id: str) -> None:
         self._user_id = session_id
@@ -371,13 +406,19 @@ class TerminalGateway(Gateway):
 
         if purpose == "SYSTEM_EVENT" or ntype == "SYSTEM_EVENT":
             _pt_print(f"{S.DIM_CYAN}  ⚙  {sanitize(str(payload))}{S.RST}")
-        elif ntype == "INDEPENDENT":
+        elif ntype == "INDEPENDENT" or purpose == "independent_msg":
             content = sanitize(payload.get("content", str(payload)))
             _pt_print(f"\n{S.BOLD_BLUE}  📩 {content}{S.RST}")
         # Other bus events are silently dropped in the terminal.
 
     def on_error(self, message: str) -> None:
         self._ensure_newline()
+        if self._spinner.is_running():
+            dur = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
+            self._spinner.stop(self._current_tool, dur, failed=True)
+            self._current_tool = ""
+            self._tool_start_time = 0.0
+
         _pt_print(f"\n{S.BOLD_RED}[Error]{S.RST} {sanitize(message)}")
         self._turn_done.set()
 
@@ -398,6 +439,13 @@ class TerminalGateway(Gateway):
                         break
                     if not text:
                         continue
+                    
+                    # Prevent stale approvals from previous turns from surfacing
+                    while not self._approval_queue.empty():
+                        try:
+                            self._approval_queue.get_nowait()
+                        except queue.Empty:
+                            break
 
                     # Client-side slash commands first
                     if text.startswith("/"):
@@ -414,7 +462,7 @@ class TerminalGateway(Gateway):
                         if cmd in self._forwarded_commands:
                             self._turn_done.clear()
                             self.send_message(text)
-                            self._turn_done.wait()
+                            self._wait_for_turn_completion()
                             continue
                         _pt_print(
                             f"{S.BOLD_RED}[Invalid command]{S.RST} "
@@ -425,7 +473,7 @@ class TerminalGateway(Gateway):
 
                     self._turn_done.clear()
                     self.send_message(text)
-                    self._turn_done.wait()
+                    self._wait_for_turn_completion()
 
                 except (KeyboardInterrupt, EOFError):
                     break
@@ -459,6 +507,13 @@ class TerminalGateway(Gateway):
                 _pt_print("")  # newline after stream
                 self._streaming    = False
                 self._streamed_buf = ""
+
+        # Ensure any orphan spinner is joined before turn concludes
+        if self._spinner.is_running():
+            dur = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
+            self._spinner.stop(self._current_tool, dur, failed=False)
+            self._current_tool = ""
+            self._tool_start_time = 0.0
 
         # Context bar
         if self._ctx_max > 0:
