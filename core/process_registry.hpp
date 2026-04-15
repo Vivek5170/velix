@@ -216,9 +216,17 @@ public:
     bool found;
     TreeStatus status;
     int root_pid;
+    int llm_request_count;
   };
 
   TreeStatusResult get_tree_status(std::string_view tree_id);
+
+  /**
+   * Get current LLM request count for a tree.
+   *
+   * Lock: shared_lock(registry_mutex)
+   */
+  int get_tree_llm_request_count(std::string_view tree_id);
 
   /**
    * Get all processes in a tree.

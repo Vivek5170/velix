@@ -1,6 +1,7 @@
 #include "scheduler.hpp"
 #include "session_io.hpp"
 #include "session_manager.hpp"
+#include "storage/provider_factory.hpp"
 #include "tools/registry.hpp"
 
 #include "../communication/network_config.hpp"
@@ -103,8 +104,10 @@ std::priority_queue<TreeCandidate, std::vector<TreeCandidate>,
                     TreeCandidateCompare>
     ready_tree_queue;
 std::atomic<bool> shutting_down{false};
-SessionIO session_io;
-SessionManager      session_manager;   // default storage_root = "memory"
+std::shared_ptr<storage::IStorageProvider> storage_provider =
+    storage::make_storage_provider_from_config();
+SessionIO session_io{storage_provider, "memory/sessions"};
+SessionManager session_manager{"memory", storage_provider};
 tools::ToolRegistry tool_registry;
 
 // Active request tracking keyed by trace_id.
@@ -371,6 +374,32 @@ void handle_session_control(const json &envelope,
       sm.set_session_title(session_id, title);
       reply["session"] = sm.get_session_object(session_id, mc.context_length);
       attach_session_alias_fields(reply);
+    } else if (action == "delete") {
+      if (session_id.empty()) {
+        throw std::runtime_error(
+            "'delete' requires a full session_id (e.g. vivek_s2)");
+      }
+
+      const bool deleted = sm.delete_session(session_id);
+      session_io_ref.delete_conversation(session_id, -1);
+      session_io_ref.invalidate_conversation_cache(session_id);
+
+      reply["deleted"] = deleted;
+      reply["session_id"] = session_id;
+      reply["super_user"] = super_user;
+    } else if (action == "destroy_user") {
+      if (super_user.empty()) {
+        throw std::runtime_error("'destroy_user' requires user_id");
+      }
+
+      const auto sessions = sm.list_sessions(super_user);
+      for (const auto &sid : sessions) {
+        session_io_ref.invalidate_conversation_cache(sid);
+      }
+
+      const bool deleted = sm.delete_super_user(super_user);
+      reply["destroyed"] = deleted;
+      reply["super_user"] = super_user;
     } else if (action == "compact") {
       const std::string target =
           !session_id.empty() ? session_id

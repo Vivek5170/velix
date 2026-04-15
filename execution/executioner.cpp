@@ -1010,8 +1010,9 @@ private:
             response = handle_exec_request(req);
         } catch (const std::exception &e) {
             LOG_WARN("handle_client exception: " + std::string(e.what()));
-            response = {"status","error",
-                        {"error", std::string("executioner_client_exception: ") + e.what()}};
+            response = {{"status", "error"},
+                        {"error", std::string("executioner_client_exception: ") +
+                                      e.what()}};
         }
         try {
             if (sock.is_open()) { // Ensure socket is valid before sending

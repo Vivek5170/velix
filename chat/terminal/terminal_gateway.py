@@ -43,8 +43,11 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from gateway import Gateway  # type: ignore
 from .display import (
-    _pt_print, _cprint, sanitize,
-    format_context_bar, print_separator,
+    _pt_print,
+    _cprint,
+    sanitize,
+    format_context_bar,
+    print_separator,
 )
 from . import style as S
 from .spinner import KawaiiSpinner
@@ -65,6 +68,7 @@ def _fmt_tokens(n: int) -> str:
 # TerminalGateway
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TerminalGateway(Gateway):
     """
     Full-featured interactive terminal for Velix.
@@ -74,49 +78,47 @@ class TerminalGateway(Gateway):
 
     def __init__(
         self,
-        handler_host: str           = "127.0.0.1",
-        handler_port: int           = 6060,
-        user_id: Optional[str]      = None,
-        tool_output_mode: str       = "full",   # full | summary | silent
-        stream_enabled: bool        = True,
-        user_store: Path            = Path.home() / ".velix_user",
+        handler_host: str = "127.0.0.1",
+        handler_port: int = 6060,
+        user_id: Optional[str] = None,
+        tool_output_mode: str = "full",  # full | summary | silent
+        stream_enabled: bool = True,
+        user_store: Path = Path.home() / ".velix_user",
     ) -> None:
         super().__init__(
             handler_host=handler_host,
             handler_port=handler_port,
             user_id=user_id,
         )
-        self._tool_output_mode  = tool_output_mode
-        self._stream_enabled    = stream_enabled
-        self._user_store        = user_store
+        self._tool_output_mode = tool_output_mode
+        self._stream_enabled = stream_enabled
+        self._user_store = user_store
 
         # Print state (protected by _print_lock)
-        self._print_lock        = threading.Lock()
-        self._streaming         = False          # True while tokens arriving
-        self._streamed_buf      = ""             # accumulated streamed text
+        self._print_lock = threading.Lock()
+        self._streaming = False  # True while tokens arriving
+        self._streamed_buf = ""  # accumulated streamed text
 
         # Context window usage (updated by on_context_usage)
-        self._ctx_current       = 0
-        self._ctx_max           = 0
-        self._ctx_session       = 0
-        self._ctx_system        = 0
-        self._ctx_tool_schema   = 0
-        self._ctx_request       = 0
+        self._ctx_current = 0
+        self._ctx_max = 0
+        self._ctx_session = 0
+        self._ctx_system = 0
+        self._ctx_tool_schema = 0
+        self._ctx_request = 0
 
         # Spinner for tool calls
-        self._spinner           = KawaiiSpinner()
-        self._tool_start_time   = 0.0
-        self._current_tool      = ""
+        self._spinner = KawaiiSpinner()
+        self._tool_start_time = 0.0
+        self._current_tool = ""
 
         # Session state
-        self._prompt_session    = PromptSession(
-            history=FileHistory(str(_HISTORY_FILE))
-        )
+        self._prompt_session = PromptSession(history=FileHistory(str(_HISTORY_FILE)))
         # Gate input so approval prompts don't race with main prompt session.
-        self._turn_done         = threading.Event()
+        self._turn_done = threading.Event()
         self._turn_done.set()
-        self._approval_queue    = queue.Queue()
-        self._approve_mode      = "default"  # all | default (runtime only)
+        self._approval_queue = queue.Queue()
+        self._approve_mode = "default"  # all | default (runtime only)
 
         # Register extra commands
         self._register_terminal_commands()
@@ -128,6 +130,8 @@ class TerminalGateway(Gateway):
             "/compact",
             "/undo",
             "/sessions",
+            "/delete",
+            "/destroy_user",
             "/title",
             "/session_info",
             "/model_info",
@@ -144,9 +148,7 @@ class TerminalGateway(Gateway):
         """Block until the user presses Enter.  Returns None on EOF/Ctrl-D."""
         ctx = self._fmt_ctx_meter()
         sid = self.user_id or "?"
-        prompt_str = (
-            f"{S.BOLD_CYAN}[{sid}{ctx}]{S.RST} {S.GOLD}❯{S.RST} "
-        )
+        prompt_str = f"{S.BOLD_CYAN}[{sid}{ctx}]{S.RST} {S.GOLD}❯{S.RST} "
         try:
             line = self._prompt_session.prompt(ANSI(prompt_str)).strip()
         except (EOFError, KeyboardInterrupt):
@@ -215,8 +217,7 @@ class TerminalGateway(Gateway):
         elif t == "approval_ack":
             trace = event.get("approval_trace", "")
             _pt_print(
-                f"\n{S.DIM_CYAN}  ✓ Approval acknowledged"
-                f" (trace {trace[:8]}…){S.RST}"
+                f"\n{S.DIM_CYAN}  ✓ Approval acknowledged (trace {trace[:8]}…){S.RST}"
             )
             # DO NOT set _turn_done here; multiple tool calls may follow.
             # Only 'end' or 'error' frames should conclude the turn.
@@ -229,7 +230,9 @@ class TerminalGateway(Gateway):
 
         elif t == "error":
             self._ensure_newline()
-            _pt_print(f"\n{S.BOLD_RED}[Error]{S.RST} {sanitize(event.get('message', ''))}")
+            _pt_print(
+                f"\n{S.BOLD_RED}[Error]{S.RST} {sanitize(event.get('message', ''))}"
+            )
 
         elif t in ("notify", "independent_msg"):
             self.on_notify(event)
@@ -248,16 +251,24 @@ class TerminalGateway(Gateway):
         from rich.panel import Panel
         from rich.table import Table
         from datetime import datetime
+
         c = Console()
         tbl = Table.grid(padding=(0, 2))
         tbl.add_column("k", style="bold cyan")
         tbl.add_column("v", style="white")
-        tbl.add_row("Session",    self.user_id or "?")
-        tbl.add_row("User",       self.super_user or "?")
-        tbl.add_row("Handler",    f"{self._handler_host}:{self._handler_port}")
-        tbl.add_row("Time",       datetime.now().strftime("%H:%M:%S"))
-        c.print(Panel(tbl, title="[bold white]Connected[/]",
-                      border_style="cyan", expand=False, padding=(1, 2)))
+        tbl.add_row("Session", self.user_id or "?")
+        tbl.add_row("User", self.super_user or "?")
+        tbl.add_row("Handler", f"{self._handler_host}:{self._handler_port}")
+        tbl.add_row("Time", datetime.now().strftime("%H:%M:%S"))
+        c.print(
+            Panel(
+                tbl,
+                title="[bold white]Connected[/]",
+                border_style="cyan",
+                expand=False,
+                padding=(1, 2),
+            )
+        )
         c.print()
         c.print(
             f"[dim cyan]Type a message and press Enter.  "
@@ -279,7 +290,7 @@ class TerminalGateway(Gateway):
     def on_tool_start(self, tool: str, args) -> None:
         if self._tool_output_mode == "silent":
             return
-        self._current_tool   = tool
+        self._current_tool = tool
         self._tool_start_time = time.time()
         preview = self._tool_preview(tool, args if isinstance(args, dict) else {})
         self._spinner.start(tool, preview)
@@ -287,16 +298,18 @@ class TerminalGateway(Gateway):
     def on_tool_finish(self, tool: str, result) -> None:
         if self._tool_output_mode == "silent":
             return
-        dur    = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
+        dur = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
         failed = False
-        if isinstance(result, dict) and (result.get("error") or result.get("status") == "error"):
+        if isinstance(result, dict) and (
+            result.get("error") or result.get("status") == "error"
+        ):
             failed = True
         self._spinner.stop(tool, dur, failed=failed)
         if isinstance(result, dict):
             note = result.get("approval_note", "")
             if isinstance(note, str) and note.strip():
                 _pt_print(f"  {S.DIM_CYAN}↳ approval: {sanitize(note)}{S.RST}")
-        self._current_tool    = ""
+        self._current_tool = ""
         self._tool_start_time = 0.0
 
     def on_context_usage(
@@ -312,12 +325,14 @@ class TerminalGateway(Gateway):
         total_context_tokens: int = 0,
     ) -> None:
         _ = pct  # kept for signature parity with base gateway hook
-        self._ctx_current     = max(0, total_context_tokens if total_context_tokens > 0 else current)
-        self._ctx_max         = max(0, maximum)
-        self._ctx_session     = max(0, session_tokens)
-        self._ctx_system      = max(0, system_prompt_tokens)
+        self._ctx_current = max(
+            0, total_context_tokens if total_context_tokens > 0 else current
+        )
+        self._ctx_max = max(0, maximum)
+        self._ctx_session = max(0, session_tokens)
+        self._ctx_system = max(0, system_prompt_tokens)
         self._ctx_tool_schema = max(0, tool_schema_tokens)
-        self._ctx_request     = max(0, request_tokens)
+        self._ctx_request = max(0, request_tokens)
 
     def on_approval_request(self, approval_trace: str, payload: dict) -> None:
         """
@@ -326,19 +341,25 @@ class TerminalGateway(Gateway):
         """
         self._approval_queue.put((approval_trace, payload))
 
-    def _handle_approval_interactively(self, approval_trace: str, payload: dict) -> None:
+    def _handle_approval_interactively(
+        self, approval_trace: str, payload: dict
+    ) -> None:
         """
         Interactive approval prompt in main thread (Context [B]).
         Allows for user input while background streams continue (via patch_stdout).
         """
         self._ensure_newline()
         if self._spinner.is_running():
-            dur = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
+            dur = (
+                time.time() - self._tool_start_time
+                if self._tool_start_time > 0
+                else 0.0
+            )
             self._spinner.stop(self._current_tool, dur, failed=False)
             self._current_tool = ""
             self._tool_start_time = 0.0
 
-        cmd  = payload.get("command", payload.get("message", ""))
+        cmd = payload.get("command", payload.get("message", ""))
         desc = payload.get("description", "")
         _pt_print(f"\n{S.YELLOW}{'─' * 52}{S.RST}")
         _pt_print(f"  {S.BOLD_YELLOW}⚠  Action Required{S.RST}")
@@ -390,7 +411,9 @@ class TerminalGateway(Gateway):
                 time.sleep(0.05)
                 continue
             except Exception as exc:
-                _pt_print(f"{S.BOLD_RED}[Internal Error]{S.RST} signal handling failed: {exc}")
+                _pt_print(
+                    f"{S.BOLD_RED}[Internal Error]{S.RST} signal handling failed: {exc}"
+                )
                 break
 
     def on_session_switched(self, session_id: str) -> None:
@@ -400,9 +423,21 @@ class TerminalGateway(Gateway):
 
     def on_notify(self, event: dict) -> None:
         """Generic bus notification — show a dim status line."""
-        purpose  = event.get("purpose", event.get("type", "notify"))
-        ntype    = event.get("notify_type", "")
-        payload  = event.get("payload", {})
+        purpose = event.get("purpose", event.get("type", "notify"))
+        ntype = event.get("notify_type", "")
+        payload = event.get("payload", {})
+
+        if ntype == "USER_DESTROYED":
+            try:
+                if self._user_store.exists():
+                    self._user_store.unlink()
+            except OSError:
+                pass
+            su = sanitize(str(payload.get("super_user", self._current_super_user())))
+            _pt_print(
+                f"\n{S.BOLD_YELLOW}[Session Ended]{S.RST} user '{su}' was destroyed; local saved user cleared."
+            )
+            return
 
         if purpose == "SYSTEM_EVENT" or ntype == "SYSTEM_EVENT":
             _pt_print(f"{S.DIM_CYAN}  ⚙  {sanitize(str(payload))}{S.RST}")
@@ -414,7 +449,11 @@ class TerminalGateway(Gateway):
     def on_error(self, message: str) -> None:
         self._ensure_newline()
         if self._spinner.is_running():
-            dur = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
+            dur = (
+                time.time() - self._tool_start_time
+                if self._tool_start_time > 0
+                else 0.0
+            )
             self._spinner.stop(self._current_tool, dur, failed=True)
             self._current_tool = ""
             self._tool_start_time = 0.0
@@ -439,7 +478,7 @@ class TerminalGateway(Gateway):
                         break
                     if not text:
                         continue
-                    
+
                     # Prevent stale approvals from previous turns from surfacing
                     while not self._approval_queue.empty():
                         try:
@@ -455,9 +494,7 @@ class TerminalGateway(Gateway):
                             try:
                                 fn(args.strip())
                             except Exception as exc:
-                                _pt_print(
-                                    f"{S.BOLD_RED}[Command error]{S.RST} {exc}"
-                                )
+                                _pt_print(f"{S.BOLD_RED}[Command error]{S.RST} {exc}")
                             continue
                         if cmd in self._forwarded_commands:
                             self._turn_done.clear()
@@ -494,7 +531,7 @@ class TerminalGateway(Gateway):
             self._spinner.stop(self._current_tool, 0.0, failed=False)
         if not self._streaming:
             _pt_print(f"\n{S.BOLD_CYAN}Assistant:{S.RST} ", end="")
-            self._streaming    = True
+            self._streaming = True
             self._streamed_buf = ""
         clean = sanitize(text)
         self._streamed_buf += clean
@@ -505,12 +542,16 @@ class TerminalGateway(Gateway):
         with self._print_lock:
             if self._streaming:
                 _pt_print("")  # newline after stream
-                self._streaming    = False
+                self._streaming = False
                 self._streamed_buf = ""
 
         # Ensure any orphan spinner is joined before turn concludes
         if self._spinner.is_running():
-            dur = time.time() - self._tool_start_time if self._tool_start_time > 0 else 0.0
+            dur = (
+                time.time() - self._tool_start_time
+                if self._tool_start_time > 0
+                else 0.0
+            )
             self._spinner.stop(self._current_tool, dur, failed=False)
             self._current_tool = ""
             self._tool_start_time = 0.0
@@ -546,7 +587,7 @@ class TerminalGateway(Gateway):
             return
         # Partial stream — print the tail
         if self._streamed_buf and reply.startswith(self._streamed_buf):
-            tail = sanitize(reply[len(self._streamed_buf):])
+            tail = sanitize(reply[len(self._streamed_buf) :])
             _pt_print(tail, end="")
             return
         # Mismatch — print on new line
@@ -558,9 +599,12 @@ class TerminalGateway(Gateway):
 
     def _tool_preview(self, tool: str, args: dict, max_len: int = 60) -> str:
         PRIMARY = {
-            "terminal": "command", "web_search": "query",
-            "read_file": "path",   "write_file": "path",
-            "patch": "path",       "browser_navigate": "url",
+            "terminal": "command",
+            "web_search": "query",
+            "read_file": "path",
+            "write_file": "path",
+            "patch": "path",
+            "browser_navigate": "url",
             "vision_analyze": "question",
         }
         key = PRIMARY.get(tool)
@@ -572,9 +616,9 @@ class TerminalGateway(Gateway):
         if not key or key not in args:
             return ""
         val = str(args[key])
-        val = " ".join(val.split())        # collapse whitespace
+        val = " ".join(val.split())  # collapse whitespace
         if len(val) > max_len:
-            val = val[:max_len - 3] + "…"
+            val = val[: max_len - 3] + "…"
         return val
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -670,6 +714,8 @@ class TerminalGateway(Gateway):
                 f"  {S.CYAN}/compact{S.RST}         — compact current session",
                 f"  {S.CYAN}/undo{S.RST}            — undo last turn",
                 f"  {S.CYAN}/sessions{S.RST}        — list your sessions (with stats)",
+                f"  {S.CYAN}/delete <sid>{S.RST}    — delete a session by id",
+                f"  {S.CYAN}/destroy_user{S.RST}    — delete all sessions and user identity",
                 f"  {S.CYAN}/title <text>{S.RST}    — set session title",
                 f"  {S.CYAN}/session_info{S.RST}    — current session stats",
                 f"  {S.CYAN}/model_info{S.RST}      — model & adapter config",
@@ -695,9 +741,9 @@ class TerminalGateway(Gateway):
             self._approve_mode = wanted
             _pt_print(f"  approvemode set to {S.CYAN}{wanted}{S.RST} (memory only)")
 
-        self.register_command("/help",           _help)
-        self.register_command("/users",          _users)
-        self.register_command("/list_sessions",  _list_sessions)
-        self.register_command("/switch",         _switch)
-        self.register_command("/approvemode",    _approvemode)
+        self.register_command("/help", _help)
+        self.register_command("/users", _users)
+        self.register_command("/list_sessions", _list_sessions)
+        self.register_command("/switch", _switch)
+        self.register_command("/approvemode", _approvemode)
         # /exit and /quit handled by get_next_input()

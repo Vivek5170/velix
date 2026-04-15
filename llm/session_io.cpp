@@ -1,5 +1,6 @@
 #include "session_io.hpp"
 #include "session_manager.hpp"
+#include "storage/json_storage_provider.hpp"
 #include "../utils/logger.hpp"
 
 #include <chrono>
@@ -189,7 +190,12 @@ std::string process_context_file(const std::string& content, const std::string& 
 // ── Constructor / Destructor ───────────────────────────────────────────────
 
 SessionIO::SessionIO(const std::string& storage_path)
-	: storage_path_(storage_path), stop_cleanup_(false) {
+	: SessionIO(std::make_shared<storage::JsonStorageProvider>(storage_path),
+	            storage_path) {}
+
+SessionIO::SessionIO(std::shared_ptr<storage::IStorageProvider> storage,
+	                 const std::string& storage_path)
+	: storage_path_(storage_path), storage_(std::move(storage)), stop_cleanup_(false) {
 	try {
 		fs::create_directories(storage_path_ + "/users");
 		fs::create_directories(storage_path_ + "/procs");
@@ -331,7 +337,7 @@ std::string SessionIO::build_layered_system_prompt(
 	const std::string general_guidelines = process_context_file(general_guidelines_raw, "general_guidelines.md");
 
 	// Soul (persona) — per-super-user first, global fallback.
-	const std::string soul_raw = (mode == "user_conversation" || mode == "simple")
+	const std::string soul_raw = (mode == "user_conversation")
 	    ? load_text_with_fallbacks({
 	          "memory/agentfiles/" + super_user + "/soul.md",
 	          "memory/soul.md",
@@ -442,7 +448,36 @@ Conversation SessionIO::load_convo_from_path(const std::string& path) {
 }
 
 Conversation SessionIO::load_conversation_from_disk_unlocked(const std::string& convo_id) {
-	return load_convo_from_path(infer_convo_path(convo_id));
+	if (!storage_) {
+		return load_convo_from_path(infer_convo_path(convo_id));
+	}
+	const auto row = storage_->get_conversation(convo_id);
+	if (!row.has_value() || !row->is_object()) {
+		Conversation nf;
+		nf.creator_pid = -1;
+		return nf;
+	}
+	const json& j = *row;
+	Conversation convo;
+	convo.convo_id = j.value("convo_id", "");
+	convo.user_id = j.value("user_id", "");
+	convo.creator_pid = j.value("creator_pid", -1);
+	convo.state = j.value("state", "ACTIVE");
+	convo.created_at_ms = j.value("created_at_ms", 0L);
+	convo.last_activity_ms = j.value("last_activity_ms", 0L);
+	convo.turn_count = j.value("turn_count", 0);
+	convo.current_context_tokens = j.value("current_context_tokens", static_cast<uint64_t>(0));
+	convo.total_tokens_used = j.value("total_tokens_used", static_cast<uint64_t>(0));
+	convo.metadata = j.value("metadata", json::object());
+	const json msgs = j.value("messages", json::array());
+	if (msgs.is_array()) {
+		for (const auto& msg : msgs) {
+			if (msg.is_object()) {
+				convo.messages.push_back(msg);
+			}
+		}
+	}
+	return convo;
 }
 
 bool SessionIO::persist_conversation(const Conversation& convo) {
@@ -460,6 +495,9 @@ bool SessionIO::persist_conversation(const Conversation& convo) {
 	j["metadata"]          = convo.metadata;
 
 	try {
+		if (storage_) {
+			return storage_->upsert_conversation(j);
+		}
 		const std::string path = convo_path_from_struct(convo);
 		fs::create_directories(fs::path(path).parent_path());
 		std::ofstream out(path);
@@ -636,11 +674,17 @@ bool SessionIO::append_message(const std::string& convo_id,
 bool SessionIO::delete_conversation(const std::string& convo_id, int creator_pid) {
 	std::lock_guard<std::mutex> lock(convo_mutex_);
 	try {
-		const std::string path = (creator_pid > 0)
-		                         ? process_convo_path(creator_pid, convo_id)
-		                         : infer_convo_path(convo_id);
-		if (!path.empty() && fs::exists(path)) {
-			fs::remove(path);
+		if (storage_) {
+			if (!storage_->delete_conversation(convo_id, creator_pid)) {
+				return false;
+			}
+		} else {
+			const std::string path = (creator_pid > 0)
+			                         ? process_convo_path(creator_pid, convo_id)
+			                         : infer_convo_path(convo_id);
+			if (!path.empty() && fs::exists(path)) {
+				fs::remove(path);
+			}
 		}
 		convo_cache_.erase(convo_id);
 		return true;
@@ -662,6 +706,10 @@ void SessionIO::delete_process_convos_for_pid(int creator_pid) {
 			}
 		}
 	}
+	if (storage_) {
+		storage_->delete_all_proc_convos(creator_pid);
+		return;
+	}
 	const std::string pid_dir = storage_path_ + "/procs/" + std::to_string(creator_pid);
 	try {
 		if (fs::exists(pid_dir)) {
@@ -677,6 +725,9 @@ void SessionIO::delete_process_convos_for_pid(int creator_pid) {
 
 std::vector<std::string> SessionIO::get_process_convos_for_pid(int creator_pid) {
 	std::lock_guard<std::mutex> lock(convo_mutex_);
+	if (storage_) {
+		return storage_->list_proc_convo_ids(creator_pid);
+	}
 	std::vector<std::string> result;
 	const std::string pid_dir = storage_path_ + "/procs/" + std::to_string(creator_pid);
 	try {
@@ -1182,6 +1233,31 @@ void SessionIO::cleanup_loop() {
 		    std::chrono::system_clock::now().time_since_epoch()).count();
 
 		std::vector<int> stale_pids;
+		if (storage_) {
+			stale_pids = storage_->list_proc_creator_pids();
+			for (int pid : stale_pids) {
+				const auto convos = storage_->list_proc_convo_ids(pid);
+				long most_recent = 0;
+				for (const auto &convo_id : convos) {
+					auto convo_row = storage_->get_conversation(convo_id);
+					if (!convo_row.has_value() || !convo_row->is_object()) {
+						continue;
+					}
+					const long act = convo_row->value("last_activity_ms", 0L);
+					if (act > most_recent) {
+						most_recent = act;
+					}
+				}
+				if (most_recent > 0 && (now_ms - most_recent) >= ttl_ms) {
+					LOG_INFO_CTX("Cleanup: removing stale process convos for pid " +
+					             std::to_string(pid),
+					             "convo_mgr", "", pid, "cleanup_stale");
+					delete_process_convos_for_pid(pid);
+				}
+			}
+			continue;
+		}
+
 		const std::string proc_dir = storage_path_ + "/procs";
 
 		try {

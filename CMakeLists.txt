@@ -11,6 +11,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
 
 # Find Threads
 find_package(Threads REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 # Common include directories
 include_directories(
@@ -43,6 +44,9 @@ set(KERNEL_SOURCES
     execution/runtime_adapters/runtime_adapters.cpp
     llm/scheduler.cpp
     llm/session_io.cpp
+    llm/storage/json_storage_provider.cpp
+    llm/storage/provider_factory.cpp
+    llm/storage/sqlite_storage_provider.cpp
     llm/compacter.cpp
     llm/session_manager.cpp
     core/persistant_applications/application_manager.cpp
@@ -54,6 +58,7 @@ set(KERNEL_SOURCES
 # Target: integration_kernel
 add_executable(integration_kernel integration_kernel.cpp ${KERNEL_SOURCES})
 target_link_libraries(integration_kernel PRIVATE Threads::Threads)
+target_link_libraries(integration_kernel PRIVATE SQLite::SQLite3)
 if(WIN32)
     target_link_libraries(integration_kernel PRIVATE ws2_32)
 endif()
@@ -65,36 +70,15 @@ add_executable(chat_handler
     chat/handler.cpp 
     runtime/sdk/cpp/velix_process.cpp
     llm/session_io.cpp
+    llm/storage/json_storage_provider.cpp
+    llm/storage/provider_factory.cpp
+    llm/storage/sqlite_storage_provider.cpp
     llm/compacter.cpp
     llm/session_manager.cpp
     ${COMM_SOURCES}
 )
 target_link_libraries(chat_handler PRIVATE Threads::Threads)
+target_link_libraries(chat_handler PRIVATE SQLite::SQLite3)
 if(WIN32)
     target_link_libraries(chat_handler PRIVATE ws2_32)
 endif()
-
-# -----------------------------------------------------------------------------
-# Terminal Tester (Interactive Diagnostic Tool)
-# -----------------------------------------------------------------------------
-add_executable(terminal_tester
-    tests/terminal_tester.cpp
-    core/persistant_applications/terminal_registry.cpp
-    core/persistant_applications/terminal_driver.cpp
-    communication/send.cpp
-    communication/recv.cpp
-)
-target_link_libraries(terminal_tester PRIVATE Threads::Threads)
-if(WIN32)
-    target_link_libraries(terminal_tester PRIVATE ws2_32)
-endif()
-
-# -----------------------------------------------------------------------------
-# Final summary notes for user
-# -----------------------------------------------------------------------------
-# This CMakeLists works on Windows (MSVC/MinGW), Linux (GCC/Clang), and macOS.
-# To build:
-#   mkdir -p build && cd build && cmake .. && make
-# OR (multi-platform way):
-#   cmake -B build -S .
-#   cmake --build build

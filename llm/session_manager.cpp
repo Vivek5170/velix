@@ -17,8 +17,10 @@ namespace velix::llm {
 
 // ── Construction ──────────────────────────────────────────────────────────
 
-SessionManager::SessionManager(const std::string &storage_root)
-    : storage_root_(storage_root) {
+SessionManager::SessionManager(
+    const std::string &storage_root,
+    std::shared_ptr<storage::IStorageProvider> storage_provider)
+    : storage_root_(storage_root), storage_provider_(std::move(storage_provider)) {
   try {
     fs::create_directories(storage_root_ + "/sessions/users");
     fs::create_directories(storage_root_ + "/sessions/procs");
@@ -147,6 +149,18 @@ std::string SessionManager::index_path() const {
 // ── Session index ─────────────────────────────────────────────────────────
 
 json SessionManager::load_index() const {
+  if (storage_provider_) {
+    json out = json{{"users", json::object()}};
+    for (const auto &super_user : storage_provider_->list_super_users()) {
+      json entries = json::array();
+      for (const auto &entry : storage_provider_->list_session_index_entries(super_user)) {
+        entries.push_back(entry);
+      }
+      out["users"][super_user] = entries;
+    }
+    return out;
+  }
+
   std::lock_guard<std::mutex> lk(index_mutex_);
   if (!fs::exists(index_path()))
     return json{{"users", json::object()}};
@@ -161,6 +175,27 @@ json SessionManager::load_index() const {
 }
 
 void SessionManager::save_index(const json &idx) {
+  if (storage_provider_) {
+    if (!idx.contains("users") || !idx["users"].is_object()) {
+      return;
+    }
+    for (auto it = idx["users"].begin(); it != idx["users"].end(); ++it) {
+      const std::string super_user = it.key();
+      storage_provider_->upsert_super_user(super_user);
+      if (!it.value().is_array()) {
+        continue;
+      }
+      for (const auto &entry : it.value()) {
+        if (!entry.is_object()) {
+          continue;
+        }
+        storage_provider_->upsert_session_index_entry(
+            super_user, entry.value("session_id", ""), entry.value("title", ""));
+      }
+    }
+    return;
+  }
+
   fs::create_directories(fs::path(index_path()).parent_path());
   std::ofstream f(index_path());
   if (f.is_open())
@@ -170,6 +205,12 @@ void SessionManager::save_index(const json &idx) {
 void SessionManager::index_upsert_session(const std::string &super_user,
                                           const std::string &session_id,
                                           const std::string &title) {
+  if (storage_provider_) {
+    storage_provider_->upsert_super_user(super_user);
+    storage_provider_->upsert_session_index_entry(super_user, session_id, title);
+    return;
+  }
+
   std::lock_guard<std::mutex> lk(index_mutex_);
   json idx = [&]() {
     if (!fs::exists(index_path()))
@@ -262,6 +303,12 @@ std::string SessionManager::new_session(const std::string &super_user,
 
 std::string SessionManager::create_super_user(const std::string &super_user) {
   validate_super_user_name(super_user);
+
+  if (storage_provider_) {
+    storage_provider_->upsert_super_user(super_user);
+    return super_user;
+  }
+
   fs::create_directories(storage_root_ + "/sessions/users/" + super_user);
   fs::create_directories(storage_root_ + "/agentfiles/" + super_user);
 
@@ -296,6 +343,109 @@ void SessionManager::set_session_title(const std::string &session_id,
   index_upsert_session(extract_super_user(session_id), session_id, new_title);
 }
 
+bool SessionManager::delete_session(const std::string &session_id) {
+  if (!is_session_id(session_id)) {
+    throw std::runtime_error("delete_session requires session_id");
+  }
+
+  const std::string super_user = extract_super_user(session_id);
+  bool existed = false;
+
+  if (storage_provider_) {
+    const bool existed_idx =
+        storage_provider_->delete_session_index_entry(super_user, session_id);
+    storage_provider_->delete_snapshots(session_id);
+    const bool deleted_convo = storage_provider_->delete_conversation(session_id, -1);
+    return existed_idx || deleted_convo;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(index_mutex_);
+    json idx = json{{"users", json::object()}};
+    if (fs::exists(index_path())) {
+      try {
+        std::ifstream f(index_path());
+        f >> idx;
+      } catch (...) {
+        idx = json{{"users", json::object()}};
+      }
+    }
+
+    if (!idx.contains("users") || !idx["users"].is_object()) {
+      idx["users"] = json::object();
+    }
+
+    if (idx["users"].contains(super_user) && idx["users"][super_user].is_array()) {
+      json filtered = json::array();
+      for (const auto &entry : idx["users"][super_user]) {
+        if (entry.is_string()) {
+          const std::string sid = entry.get<std::string>();
+          if (sid == session_id) {
+            existed = true;
+            continue;
+          }
+        }
+        if (entry.is_object()) {
+          const std::string sid = entry.value("session_id", "");
+          if (sid == session_id) {
+            existed = true;
+            continue;
+          }
+        }
+        filtered.push_back(entry);
+      }
+      idx["users"][super_user] = filtered;
+    }
+
+    save_index(idx);
+  }
+
+  const fs::path dir = fs::path(session_dir(session_id));
+  std::error_code ec;
+  if (fs::exists(dir, ec)) {
+    fs::remove_all(dir, ec);
+    existed = existed || !ec;
+  }
+
+  return existed;
+}
+
+bool SessionManager::delete_super_user(const std::string &super_user) {
+  validate_super_user_name(super_user);
+
+  if (storage_provider_) {
+    return storage_provider_->delete_super_user(super_user);
+  }
+
+  bool removed = false;
+
+  {
+    std::lock_guard<std::mutex> lk(index_mutex_);
+    json idx = load_index();
+    if (idx.contains("users") && idx["users"].is_object() &&
+        idx["users"].contains(super_user)) {
+      idx["users"].erase(super_user);
+      save_index(idx);
+      removed = true;
+    }
+  }
+
+  std::error_code ec;
+  const fs::path user_root = fs::path(storage_root_) / "sessions" / "users" / super_user;
+  if (fs::exists(user_root, ec)) {
+    fs::remove_all(user_root, ec);
+    removed = true;
+  }
+
+  const fs::path af_root = fs::path(storage_root_) / "agentfiles" / super_user;
+  if (fs::exists(af_root, ec)) {
+    fs::remove_all(af_root, ec);
+    removed = true;
+  }
+
+  return removed;
+}
+
 SessionManager::SessionInfo
 SessionManager::get_session_info(const std::string &session_id) const {
   SessionInfo info;
@@ -314,19 +464,31 @@ SessionManager::get_session_info(const std::string &session_id) const {
     }
   }
 
-  const std::string live = live_convo_path(session_id);
-  if (fs::exists(live)) {
-    try {
-      std::ifstream f(live);
-      json convo;
-      f >> convo;
+  if (storage_provider_) {
+    if (auto convo = storage_provider_->get_conversation(session_id);
+        convo.has_value() && convo->is_object()) {
       info.live_stats.current_context_tokens =
-          convo.value("current_context_tokens", static_cast<uint64_t>(0));
+          convo->value("current_context_tokens", static_cast<uint64_t>(0));
       info.live_stats.total_tokens_used =
-          convo.value("total_tokens_used", static_cast<uint64_t>(0));
-      info.live_stats.turn_count = convo.value("turn_count", 0);
-      info.live_stats.compacted = convo.value("compacted", false);
-    } catch (...) {
+          convo->value("total_tokens_used", static_cast<uint64_t>(0));
+      info.live_stats.turn_count = convo->value("turn_count", 0);
+      info.live_stats.compacted = convo->value("compacted", false);
+    }
+  } else {
+    const std::string live = live_convo_path(session_id);
+    if (fs::exists(live)) {
+      try {
+        std::ifstream f(live);
+        json convo;
+        f >> convo;
+        info.live_stats.current_context_tokens =
+            convo.value("current_context_tokens", static_cast<uint64_t>(0));
+        info.live_stats.total_tokens_used =
+            convo.value("total_tokens_used", static_cast<uint64_t>(0));
+        info.live_stats.turn_count = convo.value("turn_count", 0);
+        info.live_stats.compacted = convo.value("compacted", false);
+      } catch (...) {
+      }
     }
   }
 
@@ -375,6 +537,10 @@ json SessionManager::get_session_object(const std::string &session_id,
 // ── list_sessions & list_super_users ──────────────────────────────────────
 
 std::vector<std::string> SessionManager::list_super_users() const {
+  if (storage_provider_) {
+    return storage_provider_->list_super_users();
+  }
+
   std::unordered_set<std::string> users;
 
   const json idx = load_index();
@@ -404,6 +570,40 @@ std::vector<std::string> SessionManager::list_super_users() const {
 
 std::vector<std::string>
 SessionManager::list_sessions(const std::string &super_user) const {
+  if (storage_provider_) {
+    std::vector<std::string> out;
+    for (const auto &entry : storage_provider_->list_session_index_entries(super_user)) {
+      if (!entry.is_object()) {
+        continue;
+      }
+      const std::string sid = entry.value("session_id", "");
+      if (!sid.empty()) {
+        out.push_back(sid);
+      }
+    }
+    std::sort(out.begin(), out.end(),
+              [](const std::string &a, const std::string &b) {
+                const auto pa = a.rfind("_s");
+                const auto pb = b.rfind("_s");
+                int na = 0;
+                int nb = 0;
+                try {
+                  if (pa != std::string::npos) {
+                    na = std::stoi(a.substr(pa + 2));
+                  }
+                  if (pb != std::string::npos) {
+                    nb = std::stoi(b.substr(pb + 2));
+                  }
+                } catch (...) {
+                }
+                if (na != nb) {
+                  return na < nb;
+                }
+                return a < b;
+              });
+    return out;
+  }
+
   std::unordered_set<std::string> sessions_set;
 
   const json idx = load_index();
@@ -465,6 +665,9 @@ SessionManager::list_sessions(const std::string &super_user) const {
 // ── History snapshot ──────────────────────────────────────────────────────
 
 int SessionManager::next_snapshot_index(const std::string &session_id) const {
+  if (storage_provider_) {
+    return storage_provider_->snapshot_count(session_id) + 1;
+  }
   int n = 1;
   while (fs::exists(history_snapshot_path(session_id, n)))
     ++n;
@@ -472,6 +675,9 @@ int SessionManager::next_snapshot_index(const std::string &session_id) const {
 }
 
 int SessionManager::snapshot_count(const std::string &session_id) const {
+  if (storage_provider_) {
+    return storage_provider_->snapshot_count(session_id);
+  }
   int n = 0;
   while (fs::exists(history_snapshot_path(session_id, n + 1)))
     ++n;
@@ -481,8 +687,6 @@ int SessionManager::snapshot_count(const std::string &session_id) const {
 void SessionManager::save_snapshot(const std::string &session_id,
                                    const json &history) {
   const int n = next_snapshot_index(session_id);
-  const std::string path = history_snapshot_path(session_id, n);
-
   // Capture wall-clock time as snapshot metadata.
   const long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
@@ -494,9 +698,16 @@ void SessionManager::save_snapshot(const std::string &session_id,
   snap["snapshot_ms"] = now_ms;
   snap["messages"] = history;
 
+  if (storage_provider_) {
+    storage_provider_->append_snapshot(session_id, snap);
+    return;
+  }
+
+  const std::string path = history_snapshot_path(session_id, n);
   std::ofstream f(path);
-  if (f.is_open())
+  if (f.is_open()) {
     f << snap.dump(2);
+  }
   LOG_INFO_CTX("Saved snapshot " + path, "session_mgr", "", -1,
                "session_snapshot");
 }
@@ -528,10 +739,10 @@ void SessionManager::write_seeded_history(const std::string &session_id,
              {"function",
               {{"name", "session_summary_retrieve"},
                {"arguments",
-                "{\"query\": \"previous session summaryu\"}"}}}})})}});
+                "{\"query\": \"previous session summary\"}"}}}})})}});
 
   messages.push_back({{"role", "tool"},
-                      {"tool_call_id", "tc_compact_001"},
+                      {"tool_call_id", "tc_summary_001"},
                       {"content", "[PREVIOUS SESSION SUMMARY]\n" + summary}});
 
   // Preserve the most recent real turns so runtime/tool configuration context

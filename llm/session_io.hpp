@@ -1,8 +1,10 @@
 #pragma once
 
 #include "../vendor/nlohmann/json.hpp"
+#include "storage/istorage_provider.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -44,6 +46,8 @@ struct Conversation {
 class SessionIO {
 public:
 	explicit SessionIO(const std::string& storage_path = "memory/sessions");
+	explicit SessionIO(std::shared_ptr<storage::IStorageProvider> storage,
+	                   const std::string& storage_path = "memory/sessions");
 	~SessionIO();
 
 	// ── Request normalisation ─────────────────────────────────────────────
@@ -150,6 +154,7 @@ public:
 
 private:
 	std::string storage_path_;
+	std::shared_ptr<storage::IStorageProvider> storage_;
 	std::mutex convo_mutex_;
 
 	std::unordered_map<std::string, Conversation> convo_cache_;

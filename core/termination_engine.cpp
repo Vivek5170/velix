@@ -269,7 +269,8 @@ bool WatchdogEngine::is_tree_llm_limit_exceeded(const std::string &tree_id) {
 }
 
 bool WatchdogEngine::should_exempt_tree(const std::string &tree_id) const {
-  return config_.exempt_system_tree_limits && tree_id == "TREE_HANDLER";
+  (void)config_;
+  return tree_id == "TREE_HANDLER";
 }
 
 } // namespace velix::core

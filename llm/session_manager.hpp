@@ -1,7 +1,9 @@
 #pragma once
 
 #include "../vendor/nlohmann/json.hpp"
+#include "storage/istorage_provider.hpp"
 
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -54,7 +56,9 @@ class ToolRegistry;
 //
 class SessionManager {
  public:
-  explicit SessionManager(const std::string& storage_root = "memory");
+  explicit SessionManager(
+      const std::string& storage_root = "memory",
+      std::shared_ptr<storage::IStorageProvider> storage_provider = nullptr);
 
   ~SessionManager()                               = default;
   SessionManager(const SessionManager&)           = delete;
@@ -150,6 +154,18 @@ class SessionManager {
                          const std::string& new_title);
 
   /**
+   * Delete a specific session id from index and local session directory.
+   * Returns true when the session existed in index or on disk.
+   */
+  bool delete_session(const std::string& session_id);
+
+  /**
+   * Destroy a super-user identity and all sessions.
+   * Returns true if anything was removed.
+   */
+  bool delete_super_user(const std::string& super_user);
+
+  /**
    * Return full SessionInfo including title, snapshot_count, and live token
   * stats read from {session_id}.json. Does not throw if the live file is absent;
    * live_stats will be zero-initialised in that case.
@@ -228,6 +244,7 @@ class SessionManager {
 
  private:
   std::string storage_root_;
+  std::shared_ptr<storage::IStorageProvider> storage_provider_;
 
   mutable std::mutex index_mutex_;
 

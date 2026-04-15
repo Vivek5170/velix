@@ -72,6 +72,7 @@ def _is_valid_user_id(uid: str) -> bool:
 # Banner (context [A])
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def print_banner(host: str, port: int) -> None:
     """Print the Velix welcome banner in context [A]."""
     CONSOLE.print()
@@ -98,8 +99,9 @@ def print_banner(host: str, port: int) -> None:
 # Super-user picker
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _pick_super_user(
-    users: list[dict],          # [{"id": str, "active": bool}]
+    users: list[dict],  # [{"id": str, "active": bool}]
     saved: Optional[str],
 ) -> str:
     """
@@ -112,9 +114,9 @@ def _pick_super_user(
         CONSOLE.print("  [dim]No existing users found.[/]")
     else:
         for i, u in enumerate(users, 1):
-            uid    = u.get("id", "")
+            uid = u.get("id", "")
             active = bool(u.get("active"))
-            tag    = "  [bold yellow][active][/]" if active else ""
+            tag = "  [bold yellow][active][/]" if active else ""
             CONSOLE.print(f"  [bold]{i}.[/]  [cyan]{uid}[/]{tag}")
 
     if saved:
@@ -153,9 +155,10 @@ def _pick_super_user(
 # Session picker
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _pick_session(
     super_user: str,
-    sessions: list[dict],   # [{"id", "title", "turns", "active"}]
+    sessions: list[dict],  # [{"id", "title", "turns", "active"}]
 ) -> tuple[str, bool]:
     """
     Interactive session selection for a known super-user.
@@ -171,9 +174,9 @@ def _pick_session(
         return super_user, False
 
     for i, s in enumerate(sessions, 1):
-        sid    = s.get("id", "")
-        title  = s.get("title", "")
-        turns  = s.get("turns", 0)
+        sid = s.get("id", "")
+        title = s.get("title", "")
+        turns = s.get("turns", 0)
         active = bool(s.get("active"))
 
         title_str = f'  [dim]"{title}"[/]' if title else ""
@@ -193,12 +196,16 @@ def _pick_session(
 
     while True:
         try:
-            raw = input("Select session (number / n / Enter for latest): ").strip().lower()
+            raw = (
+                input("Select session (number / n / Enter for latest): ")
+                .strip()
+                .lower()
+            )
         except (EOFError, KeyboardInterrupt):
             sys.exit(0)
 
         if raw == "n":
-            return super_user, True       # force_new
+            return super_user, True  # force_new
 
         if raw == "" or raw == "l":
             # Resume the last (highest-numbered) session
@@ -217,6 +224,7 @@ def _pick_session(
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry-point called by TerminalGateway before connect()
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def pick_identity(
     handler_host: str = "127.0.0.1",
@@ -246,18 +254,25 @@ def pick_identity(
         return requested_user_id, False
 
     # Load saved user
-    saved_raw  = _load_saved_user(user_store)
-    saved_su   = _extract_super_user(saved_raw) if saved_raw else None
+    saved_raw = _load_saved_user(user_store)
+    saved_su = _extract_super_user(saved_raw) if saved_raw else None
 
     # Fetch super-users from handler
+    users_fetch_ok = False
     try:
         users = Gateway.list_users(handler_host, handler_port)
+        users_fetch_ok = True
     except Exception as exc:
         CONSOLE.print(f"[dim red]Note: could not list users ({exc})[/]")
         users = []
 
-    # If saved user isn't in the list, add it as a local hint
-    if saved_su and not any(str(u.get("id", "")) == saved_su for u in users):
+    # If user listing failed, keep saved user as local hint.
+    # If listing succeeded, trust server truth and avoid resurrecting deleted users.
+    if (
+        (not users_fetch_ok)
+        and saved_su
+        and not any(str(u.get("id", "")) == saved_su for u in users)
+    ):
         users = users + [{"id": saved_su, "active": False}]
 
     # Super-user selection

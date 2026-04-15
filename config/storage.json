@@ -1,0 +1,5 @@
+{
+  "backend": "sqlite",
+  "json_root": "memory/sessions",
+  "sqlite_path": ".velix/velix.db"
+}

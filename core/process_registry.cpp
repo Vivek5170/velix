@@ -83,6 +83,9 @@ std::shared_ptr<ProcessInfo> ProcessRegistry::get_process(int pid) {
   std::shared_lock<std::shared_mutex> lock(registry_mutex_);
 
   auto it = process_table_.find(pid);
+  if (it == process_table_.end()) {
+    return nullptr;
+  }
   return it->second;
 }
 
@@ -146,10 +149,20 @@ ProcessRegistry::get_tree_status(std::string_view tree_id) {
   const std::string tree_key(tree_id);
   auto it = tree_table_.find(tree_key);
   if (it == tree_table_.end()) {
-    return {false, TreeStatus::FAILED, -1};
+    return {false, TreeStatus::FAILED, -1, 0};
   }
 
-  return {true, it->second.status.load(), it->second.root_pid};
+  return {true, it->second.status.load(), it->second.root_pid,
+          it->second.llm_request_count.load()};
+}
+
+int ProcessRegistry::get_tree_llm_request_count(std::string_view tree_id) {
+  std::shared_lock<std::shared_mutex> lock(registry_mutex_);
+  auto it = tree_table_.find(std::string(tree_id));
+  if (it == tree_table_.end()) {
+    return 0;
+  }
+  return it->second.llm_request_count.load();
 }
 
 std::vector<int> ProcessRegistry::get_tree_processes(std::string_view tree_id) {

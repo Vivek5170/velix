@@ -15,13 +15,41 @@ _SNIPPET_MAX_TOKENS = 64  # approximate word count for snippet
 _SNIPPET_HIGHLIGHT_START = ">>>"
 _SNIPPET_HIGHLIGHT_END = "<<<"
 
+
 class SessionSearchSkill(VelixProcess):
     def __init__(self) -> None:
         super().__init__("session_search", "skill")
         self.root = self._find_velix_root()
-        self.sessions_root = self.root / "memory" / "sessions"
+        self.storage_cfg = self._load_storage_config()
+        self.storage_backend = self.storage_cfg.get("backend", "json")
+        json_root = self.storage_cfg.get("json_root", "memory/sessions")
+        self.sessions_root = self.root / json_root
+        self.velix_sqlite_db = self.root / self.storage_cfg.get(
+            "sqlite_path", ".velix/velix.db"
+        )
         self.index_db = self.root / "memory" / ".session_search_index.db"
         self.manifest_json = self.root / "memory" / ".session_search_manifest.json"
+
+    def _load_storage_config(self) -> dict:
+        for rel in (
+            "config/storage.json",
+            "../config/storage.json",
+            "build/config/storage.json",
+        ):
+            p = self.root / rel
+            if p.exists():
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
+                    if isinstance(raw, dict):
+                        return raw
+                except Exception:
+                    pass
+        return {
+            "backend": "json",
+            "json_root": "memory/sessions",
+            "sqlite_path": ".velix/velix.db",
+        }
 
     @staticmethod
     def _extract_super_user(session_id: str) -> str:
@@ -67,7 +95,7 @@ class SessionSearchSkill(VelixProcess):
         conn = sqlite3.connect(str(self.index_db))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
+
         ddl = """
         CREATE TABLE IF NOT EXISTS turns (
             convo_id   TEXT NOT NULL,
@@ -86,6 +114,10 @@ class SessionSearchSkill(VelixProcess):
         CREATE TABLE IF NOT EXISTS indexed_files (
             path      TEXT PRIMARY KEY,
             mtime_ns  INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS indexed_sources (
+            source_key TEXT PRIMARY KEY,
+            source_version TEXT NOT NULL
         );
         """
         trigger_ddl = """
@@ -161,18 +193,9 @@ class SessionSearchSkill(VelixProcess):
                         files.extend(session_dir.glob("*.json"))
         return files
 
-    def _index_file(self, conn: sqlite3.Connection, path: Path) -> int:
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            return 0
-
-        convo_id = data.get("convo_id", path.stem)
-        messages = data.get("messages", [])
-        if not isinstance(messages, list):
-            return 0
-
+    def _index_messages(
+        self, conn: sqlite3.Connection, convo_id: str, messages: list
+    ) -> int:
         conn.execute("DELETE FROM turns WHERE convo_id = ?", (convo_id,))
         count = 0
         for idx, msg in enumerate(messages):
@@ -189,32 +212,149 @@ class SessionSearchSkill(VelixProcess):
                 (convo_id, idx, role, content, ts_ms),
             )
             count += 1
+        return count
+
+    def _index_file(self, conn: sqlite3.Connection, path: Path) -> int:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            return 0
+
+        convo_id = data.get("convo_id", path.stem)
+        messages = data.get("messages", [])
+        if not isinstance(messages, list):
+            return 0
+
+        count = self._index_messages(conn, convo_id, messages)
 
         st = path.stat()
+        source_key = "file:" + str(path)
         conn.execute(
-            "INSERT OR REPLACE INTO indexed_files (path, mtime_ns) VALUES (?, ?)",
-            (str(path), st.st_mtime_ns),
+            "INSERT OR REPLACE INTO indexed_sources (source_key, source_version) VALUES (?, ?)",
+            (source_key, str(st.st_mtime_ns)),
         )
         return count
 
+    def _list_sqlite_conversations(
+        self, user_id: str, mode: str
+    ) -> list[tuple[str, str, int, int]]:
+        if not self.velix_sqlite_db.exists():
+            return []
+        rows: list[tuple[str, str, int, int]] = []
+        try:
+            src = sqlite3.connect(str(self.velix_sqlite_db))
+            cur = src.execute(
+                "SELECT convo_id, messages_json, last_activity_ms, creator_pid, user_id FROM conversations"
+            )
+            for (
+                convo_id,
+                messages_json,
+                last_activity_ms,
+                creator_pid,
+                convo_user_id,
+            ) in cur.fetchall():
+                if mode == "user" and int(creator_pid or -1) > 0:
+                    continue
+                if mode == "proc" and int(creator_pid or -1) <= 0:
+                    continue
+
+                if user_id:
+                    proc_parts = self._parse_proc_session(user_id)
+                    if proc_parts is not None:
+                        if convo_id != user_id:
+                            continue
+                    elif self._is_session_id(user_id):
+                        if convo_id != user_id:
+                            continue
+                    else:
+                        if str(
+                            convo_user_id or ""
+                        ) != user_id and not convo_id.startswith(user_id + "_s"):
+                            continue
+
+                rows.append(
+                    (
+                        str(convo_id),
+                        str(messages_json or "[]"),
+                        int(last_activity_ms or 0),
+                        int(creator_pid or -1),
+                    )
+                )
+            src.close()
+        except Exception:
+            return []
+        return rows
+
     def _update_index(self, conn: sqlite3.Connection, user_id: str, mode: str) -> None:
+        current_keys: set[str] = set()
+
+        if self.storage_backend == "sqlite":
+            convos = self._list_sqlite_conversations(user_id, mode)
+            for convo_id, messages_json, last_activity_ms, _creator_pid in convos:
+                try:
+                    messages = json.loads(messages_json)
+                    if not isinstance(messages, list):
+                        messages = []
+                except Exception:
+                    messages = []
+
+                source_key = "convo:" + convo_id
+                source_version = f"{last_activity_ms}:{len(messages)}"
+                current_keys.add(source_key)
+
+                row = conn.execute(
+                    "SELECT source_version FROM indexed_sources WHERE source_key = ?",
+                    (source_key,),
+                ).fetchone()
+                if row is None or str(row[0]) != source_version:
+                    self._index_messages(conn, convo_id, messages)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO indexed_sources (source_key, source_version) VALUES (?, ?)",
+                        (source_key, source_version),
+                    )
+
+            existing = conn.execute(
+                "SELECT source_key FROM indexed_sources WHERE source_key LIKE 'convo:%'"
+            ).fetchall()
+            for (source_key,) in existing:
+                if source_key not in current_keys:
+                    convo_id = source_key[len("convo:") :]
+                    conn.execute("DELETE FROM turns WHERE convo_id = ?", (convo_id,))
+                    conn.execute(
+                        "DELETE FROM indexed_sources WHERE source_key = ?",
+                        (source_key,),
+                    )
+            conn.commit()
+            return
+
         files = self._scan_convo_files(user_id, mode)
-        stale = []
         for f in files:
+            source_key = "file:" + str(f)
             try:
-                mtime_ns = f.stat().st_mtime_ns
+                source_version = str(f.stat().st_mtime_ns)
             except OSError:
                 continue
+            current_keys.add(source_key)
+
             row = conn.execute(
-                "SELECT mtime_ns FROM indexed_files WHERE path = ?", (str(f),)
+                "SELECT source_version FROM indexed_sources WHERE source_key = ?",
+                (source_key,),
             ).fetchone()
-            if row is None or row[0] != mtime_ns:
-                stale.append(f)
-        
-        if not stale:
-            return
-        for f in stale:
-            self._index_file(conn, f)
+            if row is None or str(row[0]) != source_version:
+                self._index_file(conn, f)
+
+        existing = conn.execute(
+            "SELECT source_key FROM indexed_sources WHERE source_key LIKE 'file:%'"
+        ).fetchall()
+        for (source_key,) in existing:
+            if source_key not in current_keys:
+                path = source_key[len("file:") :]
+                convo_id = Path(path).stem
+                conn.execute("DELETE FROM turns WHERE convo_id = ?", (convo_id,))
+                conn.execute(
+                    "DELETE FROM indexed_sources WHERE source_key = ?", (source_key,)
+                )
         conn.commit()
 
     def run(self) -> None:
@@ -232,7 +372,7 @@ class SessionSearchSkill(VelixProcess):
         try:
             conn = self._open_db()
             self._update_index(conn, user_id, mode)
-            
+
             since_ms = 0
             if since_hours > 0:
                 since_ms = int((time.time() - since_hours * 3600) * 1000)
@@ -275,34 +415,42 @@ class SessionSearchSkill(VelixProcess):
             results = []
             for row in rows:
                 convo_id, role, ts_ms, snippet_text, score = row
-                results.append({
-                    "convo_id": convo_id,
-                    "role": role,
-                    "ts_ms": ts_ms,
-                    "snippet": snippet_text,
-                    "score": round(score, 4),
-                })
-            
+                results.append(
+                    {
+                        "convo_id": convo_id,
+                        "role": role,
+                        "ts_ms": ts_ms,
+                        "snippet": snippet_text,
+                        "score": round(score, 4),
+                    }
+                )
+
             conn.close()
-            
-            self.report_result(self.parent_pid, {
-                "status": "ok",
-                "query": query,
-                "mode": mode,
-                "result_count": len(results),
-                "results": results,
-            }, self.entry_trace_id)
+
+            self.report_result(
+                self.parent_pid,
+                {
+                    "status": "ok",
+                    "query": query,
+                    "mode": mode,
+                    "result_count": len(results),
+                    "results": results,
+                },
+                self.entry_trace_id,
+            )
 
         except sqlite3.OperationalError as exc:
-            self._report_error(f"FTS5 query error: {exc}. Hint: Wrap phrases in quotes.")
+            self._report_error(
+                f"FTS5 query error: {exc}. Hint: Wrap phrases in quotes."
+            )
         except Exception as exc:
             self._report_error(f"Failed to search: {exc}")
 
     def _report_error(self, message: str) -> None:
-        self.report_result(self.parent_pid, {
-            "status": "error",
-            "error": message
-        }, self.entry_trace_id)
+        self.report_result(
+            self.parent_pid, {"status": "error", "error": message}, self.entry_trace_id
+        )
+
 
 if __name__ == "__main__":
     SessionSearchSkill().start()

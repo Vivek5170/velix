@@ -263,3 +263,70 @@ Recommended pattern for non-default providers:
 1. Put the secret in `.env` as `YOUR_PROVIDER_KEY=...`
 2. Set `api_key_env` for that adapter to `YOUR_PROVIDER_KEY`
 3. Keep `api_key` empty in `config/model.json`
+
+### 7) Conversation storage backends (JSON / SQLite)
+
+Velix now uses a modular storage-provider architecture for conversations.
+
+- Interface: `llm/storage/istorage_provider.hpp`
+- Providers:
+  - JSON provider: `llm/storage/json_storage_provider.cpp`
+  - SQLite provider: `llm/storage/sqlite_storage_provider.cpp`
+- Factory + DI wiring:
+  - `llm/storage/provider_factory.cpp`
+  - Injected into Scheduler and Supervisor `SessionIO` instances.
+
+#### Current backend support
+
+1. `json` backend (default)
+   - Stores conversations under `memory/sessions/...` as JSON files.
+   - Good for easy inspection and manual editing.
+
+2. `sqlite` backend
+   - Stores conversations in a SQLite DB file.
+   - Default DB path in config: `.velix/velix.db`
+   - Enabled with WAL and busy timeout for concurrent read/write behavior.
+
+#### How to switch backend
+
+Edit `config/storage.json`:
+
+```json
+{
+  "backend": "json",
+  "json_root": "memory/sessions",
+  "sqlite_path": ".velix/velix.db"
+}
+```
+
+Set `"backend": "sqlite"` to use SQLite.
+
+#### Important modularity notes
+
+- Business logic is now decoupled from storage writes/reads via
+  `IStorageProvider` (repository-style boundary).
+- `SessionIO` orchestrates behavior and delegates persistence to provider.
+- Supervisor process-conversation cleanup path remains safe and now delegates
+  to the same provider abstraction.
+- `memory/agentfiles/*` (`soul.md`, `user.md`) intentionally remain file-based.
+
+### 8) Session deletion command (`/delete`)
+
+The chat handler now supports deleting a session by ID:
+
+```text
+/delete <session_id>
+```
+
+Example:
+
+```text
+/delete user1_s3
+```
+
+Behavior:
+
+- Deletes the target session from session index and storage.
+- If deleting the current active session, the handler automatically switches to
+  a newly created fallback session for the same super-user.
+- Refuses deletion when the target session is active on another socket.

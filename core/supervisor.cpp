@@ -26,6 +26,7 @@
 #include "../communication/network_config.hpp"
 #include "../communication/socket_wrapper.hpp"
 #include "../llm/session_io.hpp"
+#include "../llm/storage/provider_factory.hpp"
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
 #include "../utils/thread_pool.hpp"
@@ -494,7 +495,9 @@ private:
   std::unordered_map<std::string, ConvMetadata>
       convo_metadata_; // convo_id -> metadata
 
-  velix::llm::SessionIO convo_manager_;
+  velix::llm::SessionIO convo_manager_{
+      velix::llm::storage::make_storage_provider_from_config(),
+      "memory/sessions"};
 
   // Network layer
   std::mutex server_mutex_;
@@ -1103,7 +1106,7 @@ private:
       auto tree_ids_with_created =
           registry_->get_all_tree_ids_with_created_at();
       for (const auto &[tree_id, created_at_ms] : tree_ids_with_created) {
-        if (config_.exempt_system_tree_limits && tree_id == "TREE_HANDLER") {
+        if (tree_id == "TREE_HANDLER") {
           continue;
         }
 
@@ -1168,10 +1171,33 @@ private:
 
         // Check LLM request limit
         auto tree_status = registry_->get_tree_status(tree_id);
-        if (tree_status.found) {
-          // Note: LLM request count is tracked atomically in TreeInfo
-          // This is a placeholder - full LLM tracking would require
-          // enhancements to TreeInfo
+        if (tree_status.found &&
+            is_limit_enabled(config_.max_llm_requests_per_tree) &&
+            tree_status.llm_request_count > config_.max_llm_requests_per_tree) {
+          auto pids = registry_->kill_tree(tree_id);
+          if (!pids.empty()) {
+            LOG_WARN_CTX(
+                "Tree exceeded LLM request limit (" +
+                    std::to_string(tree_status.llm_request_count) + " > " +
+                    std::to_string(config_.max_llm_requests_per_tree) + ")",
+                "supervisor", tree_id, -1, "tree_llm_limit_exceeded");
+            std::vector<TerminationEngine::TerminationTarget> targets;
+            for (int pid : pids) {
+              auto process = registry_->get_process(pid);
+              if (process && process->alive.load()) {
+                TerminationEngine::TerminationTarget target;
+                target.velix_pid = pid;
+                target.os_pid = process->os_pid;
+                target.tree_id = tree_id;
+                target.trace_id = process->trace_id;
+                target.parent_pid = process->parent_pid;
+                targets.push_back(target);
+              }
+            }
+            termination_engine_->kill_processes(targets, "tree_llm_limit",
+                                                registry_,
+                                                config_.terminate_grace_ms);
+          }
         }
       }
 

@@ -506,7 +506,7 @@ private:
             send_json(session->socket,
                       json{{"type","registered"},
                            {"user_id",    resolved_sid},
-                           {"super_user", user_id}}.dump());
+                           {"super_user", actual_super_user}}.dump());
         } catch (...) { return; }
 
         {
@@ -514,7 +514,7 @@ private:
             sessions_[resolved_sid] = session;
         }
         std::cout << "[Handler] Session registered: " << resolved_sid
-                  << " (super_user=" << user_id << ")" << std::endl;
+                  << " (super_user=" << actual_super_user << ")" << std::endl;
 
         std::thread(&Handler::session_reader, this, session).detach();
         std::thread(&Handler::session_worker, this, session).detach();
@@ -786,6 +786,8 @@ private:
             ss << "  /compact          — compact current session\n";
             ss << "  /undo             — undo last turn\n";
             ss << "  /sessions         — list sessions for your user\n";
+            ss << "  /delete <sid>     — delete a session by id\n";
+            ss << "  /destroy_user     — delete all sessions + user identity\n";
             ss << "  /terminals        — list active persistent terminals\n";
             ss << "  /title <text>     — set title for current session\n";
             ss << "  /session_info     — current session stats from disk\n";
@@ -868,7 +870,7 @@ private:
 
         // ── /sessions ─────────────────────────────────────────────────
         command_table_["/sessions"] = [this](auto session, const auto& send,
-                                              const std::string& /*args*/) {
+                                               const std::string& /*args*/) {
             const std::string raw = send_session_query("all_sessions", "", "");
             json target_sessions = json::array();
             try {
@@ -907,6 +909,164 @@ private:
                 ss << "\n";
             }
             send({{"type","token"},{"data", ss.str()}});
+            return true;
+        };
+
+        // ── /delete ───────────────────────────────────────────────────
+        command_table_["/delete"] = [this](auto session, const auto& send,
+                                             const std::string& args) {
+            if (args.empty()) {
+                send({{"type","token"},
+                      {"data","Usage: /delete <session_id>\n"}});
+                return true;
+            }
+
+            const std::string target_sid = args;
+            if (!is_session_id_format(target_sid)) {
+                send({{"type","token"},
+                      {"data","[Error: invalid session_id format]\n"}});
+                return true;
+            }
+
+            if (extract_super_user(target_sid) != session->super_user) {
+                send({{"type","token"},
+                      {"data","[Error: session does not belong to current super_user]\n"}});
+                return true;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(sessions_mutex_);
+                auto it = sessions_.find(target_sid);
+                if (it != sessions_.end() && it->second.get() != session.get()) {
+                    send({{"type","token"},
+                          {"data","[Error: session is active on another socket]\n"}});
+                    return true;
+                }
+            }
+
+            const std::string raw = send_session_control(target_sid, "delete", "");
+            if (raw.empty()) {
+                send({{"type","token"},
+                      {"data","[Delete failed: no response from scheduler]\n"}});
+                return true;
+            }
+
+            std::string msg = "[Delete failed]";
+            try {
+                const json r = json::parse(raw);
+                if (r.contains("error") && !r.value("error", std::string("")).empty()) {
+                    msg = "[Delete failed: " + r.value("error", std::string("unknown")) + "]";
+                } else if (!r.value("deleted", false)) {
+                    msg = "[Delete: session not found " + target_sid + "]";
+                } else {
+                    msg = "[Deleted: " + target_sid + "]";
+                    if (target_sid == session->active_session_id) {
+                        const std::string fallback_raw =
+                            send_session_control(session->super_user,
+                                                 "get_or_create", "");
+                        std::string fallback;
+                        try {
+                            const json fr = json::parse(fallback_raw);
+                            fallback = fr.value("session_id", std::string(""));
+                            if (fallback.empty() && fr.contains("session") &&
+                                fr["session"].is_object()) {
+                                fallback = fr["session"].value(
+                                    "session_id", std::string(""));
+                            }
+                        } catch (...) {
+                        }
+
+                        if (!fallback.empty()) {
+                            std::lock_guard<std::mutex> lk(sessions_mutex_);
+                            sessions_.erase(session->user_id);
+                            session->user_id = fallback;
+                            session->active_session_id = fallback;
+                            sessions_[fallback] = session;
+                            msg += " [Switched to: " + fallback + "]";
+                        } else {
+                            msg += " [Warning: deleted current session, fallback unavailable]";
+                        }
+                    }
+                }
+            } catch (...) {
+                msg = "[Delete failed: invalid response]";
+            }
+
+            send({{"type","token"},{"data", msg + "\n"}});
+            return true;
+        };
+
+        // ── /destroy_user ─────────────────────────────────────────────
+        command_table_["/destroy_user"] = [this](auto session, const auto& send,
+                                                   const std::string& args) {
+            const std::string target_user = args.empty() ? session->super_user : args;
+            if (target_user != session->super_user) {
+                send({{"type","token"},
+                      {"data","[Error: can only destroy your own super_user]\n"}});
+                return true;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(sessions_mutex_);
+                int active_for_user = 0;
+                for (const auto& [sid, s] : sessions_) {
+                    (void)sid;
+                    if (!s) {
+                        continue;
+                    }
+                    if (s->super_user == target_user) {
+                        ++active_for_user;
+                    }
+                }
+                if (active_for_user > 1) {
+                    send({{"type","token"},
+                          {"data","[Error: cannot destroy user while multiple active sockets exist for this super_user]\n"}});
+                    return true;
+                }
+            }
+
+            const std::string raw = send_session_control(target_user, "destroy_user", "");
+            if (raw.empty()) {
+                send({{"type","token"},
+                      {"data","[Destroy failed: no response from scheduler]\n"}});
+                return true;
+            }
+
+            std::string msg = "[Destroy user failed]";
+            bool disconnect_current_socket = false;
+            try {
+                const json r = json::parse(raw);
+                if (r.contains("error") && !r.value("error", std::string("")).empty()) {
+                    msg = "[Destroy user failed: " +
+                          r.value("error", std::string("unknown")) + "]";
+                } else if (r.value("destroyed", false)) {
+                    msg = "[Destroyed user: " + target_user + "]";
+                    disconnect_current_socket = true;
+                } else {
+                    msg = "[Destroy user: nothing to remove for " + target_user + "]";
+                }
+            } catch (...) {
+                msg = "[Destroy user failed: invalid response]";
+            }
+
+            send({{"type","token"},{"data", msg + "\n"}});
+
+            if (disconnect_current_socket) {
+                send({{"type", "notify"},
+                      {"notify_type", "USER_DESTROYED"},
+                      {"payload", {{"super_user", target_user}}}});
+                {
+                    std::lock_guard<std::mutex> lk(sessions_mutex_);
+                    sessions_.erase(session->user_id);
+                }
+                session->active.store(false);
+                session->queue_cv.notify_all();
+                std::lock_guard<std::mutex> slk(session->socket_mutex);
+                if (session->socket.is_open()) {
+                    try { session->socket.close(); } catch (...) {}
+                }
+            }
+
             return true;
         };
 
@@ -1304,6 +1464,8 @@ private:
             // Actions that need full JSON back.
             if (action == "list" || action == "compact" ||
                 action == "undo"  || action == "set_title" ||
+                action == "delete" ||
+                action == "destroy_user" ||
                 action == "list_super_users") {
                 return raw;
             }

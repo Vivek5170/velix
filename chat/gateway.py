@@ -70,6 +70,7 @@ from typing import Callable, Dict, List, Optional
 # Wire helpers (module-level so they can be reused by static methods)
 # ---------------------------------------------------------------------------
 
+
 def _encode_frame(payload: dict) -> bytes:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     return struct.pack(">I", len(body)) + body
@@ -87,14 +88,15 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 def _recv_one(sock: socket.socket) -> dict:
     header = _recv_exact(sock, 4)
-    size   = struct.unpack(">I", header)[0]
-    body   = _recv_exact(sock, size)
+    size = struct.unpack(">I", header)[0]
+    body = _recv_exact(sock, size)
     return json.loads(body.decode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
 # Gateway base class
 # ---------------------------------------------------------------------------
+
 
 class Gateway(ABC):
     """
@@ -108,19 +110,19 @@ class Gateway(ABC):
 
     def __init__(
         self,
-        handler_host: str          = "127.0.0.1",
-        handler_port: int          = 6060,
-        user_id: Optional[str]     = None,
-        connect_timeout_s: float   = 5.0,
-        recv_timeout_s: float      = 0.05,
+        handler_host: str = "127.0.0.1",
+        handler_port: int = 6060,
+        user_id: Optional[str] = None,
+        connect_timeout_s: float = 5.0,
+        recv_timeout_s: float = 0.05,
     ) -> None:
-        self._handler_host       = handler_host
-        self._handler_port       = handler_port
-        self._requested_user_id  = user_id
+        self._handler_host = handler_host
+        self._handler_port = handler_port
+        self._requested_user_id = user_id
         self._user_id: Optional[str] = None
         self._super_user: Optional[str] = None
-        self._connect_timeout_s  = connect_timeout_s
-        self._recv_timeout_s     = recv_timeout_s
+        self._connect_timeout_s = connect_timeout_s
+        self._recv_timeout_s = recv_timeout_s
 
         self._sock: Optional[socket.socket] = None
         self._sock_lock = threading.Lock()
@@ -171,9 +173,9 @@ class Gateway(ABC):
             self._sock = None
             raise RuntimeError(f"Unexpected registration response: {ack}")
 
-        self._user_id   = ack["user_id"]
+        self._user_id = ack["user_id"]
         self._super_user = ack.get("super_user", self._user_id)
-        self._running   = True
+        self._running = True
 
         self._recv_thread = threading.Thread(
             target=self._recv_loop,
@@ -221,8 +223,9 @@ class Gateway(ABC):
                         try:
                             handler_fn(args.strip())
                         except Exception as exc:
-                            self.deliver({"type": "token",
-                                          "data": f"[Command error: {exc}]\n"})
+                            self.deliver(
+                                {"type": "token", "data": f"[Command error: {exc}]\n"}
+                            )
                         continue
                     # Unknown /command → forward to LLM so the user can ask
                     # about it by name (e.g. "what does /compact do?").
@@ -243,11 +246,13 @@ class Gateway(ABC):
 
     def send_message(self, text: str) -> None:
         """Send a user text message to the Handler for LLM processing."""
-        self._send_raw({
-            "type":    "message",
-            "message": text,
-            "user_id": self._user_id or "",
-        })
+        self._send_raw(
+            {
+                "type": "message",
+                "message": text,
+                "user_id": self._user_id or "",
+            }
+        )
 
     def send_tool_message(self, tool_message: dict) -> None:
         """Resume an LLM turn with an external tool result."""
@@ -259,11 +264,13 @@ class Gateway(ABC):
 
     def send_approval_reply(self, approval_trace: str, scope: str) -> None:
         """Answer an approval request from the Handler."""
-        self._send_raw({
-            "type":           "approval_reply",
-            "approval_trace": approval_trace,
-            "scope":          scope,
-        })
+        self._send_raw(
+            {
+                "type": "approval_reply",
+                "approval_trace": approval_trace,
+                "scope": scope,
+            }
+        )
 
     def switch_session(self, session_id: str) -> None:
         """Request the Handler to switch this connection to a different session."""
@@ -281,15 +288,13 @@ class Gateway(ABC):
     def list_users(
         handler_host: str = "127.0.0.1",
         handler_port: int = 6060,
-        timeout_s: float  = 5.0,
+        timeout_s: float = 5.0,
     ) -> List[dict]:
         """
         Return all known super-users.
         Each entry: {"id": str, "active": bool}
         """
-        sock = socket.create_connection(
-            (handler_host, handler_port), timeout=timeout_s
-        )
+        sock = socket.create_connection((handler_host, handler_port), timeout=timeout_s)
         sock.settimeout(timeout_s)
         try:
             sock.sendall(_encode_frame({"type": "list_users"}))
@@ -316,21 +321,23 @@ class Gateway(ABC):
         super_user: str,
         handler_host: str = "127.0.0.1",
         handler_port: int = 6060,
-        timeout_s: float  = 5.0,
+        timeout_s: float = 5.0,
     ) -> List[dict]:
         """
         Return all sessions for a super-user.
         Each entry: {"id": str, "title": str, "turns": int, "active": bool}
         """
-        sock = socket.create_connection(
-            (handler_host, handler_port), timeout=timeout_s
-        )
+        sock = socket.create_connection((handler_host, handler_port), timeout=timeout_s)
         sock.settimeout(timeout_s)
         try:
-            sock.sendall(_encode_frame({
-                "type":       "list_sessions",
-                "super_user": super_user,
-            }))
+            sock.sendall(
+                _encode_frame(
+                    {
+                        "type": "list_sessions",
+                        "super_user": super_user,
+                    }
+                )
+            )
             reply = _recv_one(sock)
         finally:
             try:
@@ -344,12 +351,14 @@ class Gateway(ABC):
         out: List[dict] = []
         for s in reply.get("sessions", []):
             if isinstance(s, dict):
-                out.append({
-                    "id":     s.get("id", ""),
-                    "title":  s.get("title", ""),
-                    "turns":  s.get("turns", 0),
-                    "active": bool(s.get("active")),
-                })
+                out.append(
+                    {
+                        "id": s.get("id", ""),
+                        "title": s.get("title", ""),
+                        "turns": s.get("turns", 0),
+                        "active": bool(s.get("active")),
+                    }
+                )
             elif isinstance(s, str):
                 out.append({"id": s, "title": "", "turns": 0, "active": False})
         return out
@@ -377,12 +386,13 @@ class Gateway(ABC):
         """
         Built-in client-side commands.
 
-        Note: /new, /compact, /undo, /sessions, /title, /session_info,
-        /model_info, /scheduler_info, /context are implemented on the C++
+        Note: /new, /compact, /undo, /sessions, /delete, /title,
+        /session_info, /model_info, /scheduler_info, /context are implemented on the C++
         handler side — we forward them as plain messages so the handler can
         update session state and reply.  Only /help is intercepted here to
         avoid a network round-trip.
         """
+
         def _help(_args: str) -> None:
             lines = [
                 "Client-side commands (handled locally):",
@@ -393,6 +403,8 @@ class Gateway(ABC):
                 "  /compact         — compact current session",
                 "  /undo            — undo last turn",
                 "  /sessions        — list your sessions",
+                "  /delete <sid>    — delete a session by id",
+                "  /destroy_user    — delete all sessions + user identity",
                 "  /terminals       — list active persistent terminals",
                 "  /title <text>    — set session title",
                 "  /session_info    — current session stats",
@@ -469,28 +481,32 @@ class Gateway(ABC):
         total_context_tokens: int = 0,
     ) -> None:
         """Called whenever the handler reports context window usage."""
-        self.deliver({
-            "type":           "context_usage",
-            "current_tokens": current,
-            "max_tokens":     maximum,
-            "pct":            pct,
-            "session_tokens": session_tokens,
-            "system_prompt_tokens": system_prompt_tokens,
-            "tool_schema_tokens": tool_schema_tokens,
-            "request_tokens": request_tokens,
-            "total_context_tokens": total_context_tokens,
-        })
+        self.deliver(
+            {
+                "type": "context_usage",
+                "current_tokens": current,
+                "max_tokens": maximum,
+                "pct": pct,
+                "session_tokens": session_tokens,
+                "system_prompt_tokens": system_prompt_tokens,
+                "tool_schema_tokens": tool_schema_tokens,
+                "request_tokens": request_tokens,
+                "total_context_tokens": total_context_tokens,
+            }
+        )
 
     def on_approval_request(self, approval_trace: str, payload: dict) -> None:
         """
         Called when an agent needs human approval.
         Default: delivers the event.  Override to show interactive UI.
         """
-        self.deliver({
-            "type":           "approval_request",
-            "approval_trace": approval_trace,
-            "payload":        payload,
-        })
+        self.deliver(
+            {
+                "type": "approval_request",
+                "approval_trace": approval_trace,
+                "payload": payload,
+            }
+        )
 
     def on_session_switched(self, session_id: str) -> None:
         """Called when the handler confirms a session switch."""
