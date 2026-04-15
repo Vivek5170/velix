@@ -11,7 +11,34 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
 
 # Find Threads
 find_package(Threads REQUIRED)
-find_package(SQLite3 REQUIRED)
+
+# -----------------------------------------------------------------------------
+# SQLite dependency (embedded preferred)
+# -----------------------------------------------------------------------------
+set(VELIX_SQLITE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/vendor/sqlite/sqlite3.c")
+set(VELIX_SQLITE_HDR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/sqlite/sqlite3.h")
+
+if(EXISTS "${VELIX_SQLITE_SRC}" AND EXISTS "${VELIX_SQLITE_HDR}")
+    message(STATUS "Using embedded SQLite amalgamation from vendor/sqlite")
+
+    add_library(sqlite3 STATIC ${VELIX_SQLITE_SRC})
+    target_include_directories(sqlite3 PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/vendor/sqlite
+    )
+    target_compile_definitions(sqlite3 PRIVATE
+        SQLITE_THREADSAFE=1
+        SQLITE_ENABLE_FTS5
+        SQLITE_ENABLE_JSON1
+        SQLITE_DEFAULT_MEMSTATUS=0
+        SQLITE_OMIT_DEPRECATED
+    )
+
+    set(VELIX_SQLITE_TARGET sqlite3)
+else()
+    message(WARNING "Embedded SQLite amalgamation not found at vendor/sqlite; falling back to system SQLite3")
+    find_package(SQLite3 REQUIRED)
+    set(VELIX_SQLITE_TARGET SQLite::SQLite3)
+endif()
 
 # Common include directories
 include_directories(
@@ -58,7 +85,7 @@ set(KERNEL_SOURCES
 # Target: integration_kernel
 add_executable(integration_kernel integration_kernel.cpp ${KERNEL_SOURCES})
 target_link_libraries(integration_kernel PRIVATE Threads::Threads)
-target_link_libraries(integration_kernel PRIVATE SQLite::SQLite3)
+target_link_libraries(integration_kernel PRIVATE ${VELIX_SQLITE_TARGET})
 if(WIN32)
     target_link_libraries(integration_kernel PRIVATE ws2_32)
 endif()
@@ -78,7 +105,7 @@ add_executable(chat_handler
     ${COMM_SOURCES}
 )
 target_link_libraries(chat_handler PRIVATE Threads::Threads)
-target_link_libraries(chat_handler PRIVATE SQLite::SQLite3)
+target_link_libraries(chat_handler PRIVATE ${VELIX_SQLITE_TARGET})
 if(WIN32)
     target_link_libraries(chat_handler PRIVATE ws2_32)
 endif()
