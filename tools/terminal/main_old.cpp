@@ -1,5 +1,5 @@
 /**
- * commandline — Velix Skill
+ * commandline — Velix Tool
  *
  * Features:
  *   • Foreground execution  — blocks, returns full output via report_result
@@ -26,16 +26,16 @@
  *  }
  *
  * ─── Approval protocol ───────────────────────────────────────────────────────
- *  Skill → Handler  purpose="APPROVAL_REQUEST"
+ *  Tool → Handler  purpose="APPROVAL_REQUEST"
  *    { "approval_trace":"<uuid>", "command":"...",
  *      "description":"...", "pattern_key":"..." }
  *
- *  Handler → Skill  purpose="APPROVAL_REPLY"
+ *  Handler → Tool  purpose="APPROVAL_REPLY"
  *    { "approval_trace":"<uuid>",
  *      "scope": "once"|"session"|"always"|"deny" }
  *
  * ─── Background completion notification ──────────────────────────────────────
- *  Skill → Handler  purpose="NOTIFY_HANDLER"
+ *  Tool → Handler  purpose="NOTIFY_HANDLER"
  *    { "notify_type":"TOOL_RESULT", "tool":"terminal",
  *      "result":{
  *        "status":"ok"|"error"|"timeout", "exit_code":0,
@@ -124,7 +124,7 @@ struct TerminalConfig {
   std::vector<std::string> entries;
 };
 
-class TerminalSkillException : public std::runtime_error {
+class TerminalToolException : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;
 };
@@ -439,7 +439,7 @@ static fs::path resolve_cwd(const std::string &mode, const std::string &sub) {
   if (!skill_config().allow_path_escape) {
     auto rs = fs::relative(abs, root).native();
     if (rs.size() >= 2 && rs[0] == '.' && rs[1] == '.')
-      throw TerminalSkillException("cwd escapes sandbox: " + abs.string());
+      throw TerminalToolException("cwd escapes sandbox: " + abs.string());
   }
   fs::create_directories(abs);
   return abs;
@@ -485,11 +485,11 @@ static ExecResult posix_exec(const std::string &cmd,
 
   int so[2], se[2];
   if (::pipe(so) || ::pipe(se))
-    throw TerminalSkillException("pipe: " + std::string(strerror(errno)));
+    throw TerminalToolException("pipe: " + std::string(strerror(errno)));
 
   pid_t pid = ::fork();
   if (pid < 0)
-    throw TerminalSkillException("fork: " + std::string(strerror(errno)));
+    throw TerminalToolException("fork: " + std::string(strerror(errno)));
 
   if (pid == 0) {
     ::close(so[0]);
@@ -578,7 +578,7 @@ static ExecResult posix_exec_pty(const std::string &cmd,
   int master_fd = -1;
   pid_t pid = ::forkpty(&master_fd, nullptr, nullptr, &ws);
   if (pid < 0)
-    throw TerminalSkillException("forkpty: " + std::string(strerror(errno)));
+    throw TerminalToolException("forkpty: " + std::string(strerror(errno)));
 
   if (pid == 0) {
     // Child — we already have a controlling terminal from forkpty
@@ -664,7 +664,7 @@ static ExecResult win_exec(const std::string &cmd,
   HANDLE hStdoutR, hStdoutW, hStderrR, hStderrW;
   if (!CreatePipe(&hStdoutR, &hStdoutW, &sa, 0) ||
       !CreatePipe(&hStderrR, &hStderrW, &sa, 0))
-    throw TerminalSkillException("CreatePipe failed");
+    throw TerminalToolException("CreatePipe failed");
   SetHandleInformation(hStdoutR, HANDLE_FLAG_INHERIT, 0);
   SetHandleInformation(hStderrR, HANDLE_FLAG_INHERIT, 0);
 
@@ -683,7 +683,7 @@ static ExecResult win_exec(const std::string &cmd,
     CloseHandle(hStdoutW);
     CloseHandle(hStderrR);
     CloseHandle(hStderrW);
-    throw TerminalSkillException("CreateProcess failed: " +
+    throw TerminalToolException("CreateProcess failed: " +
                    std::to_string(GetLastError()));
   }
   CloseHandle(hStdoutW);
@@ -800,7 +800,7 @@ static ExecResult win_exec_pty(const std::string &cmd,
   if (!ok) {
     fnClose(hPC);
     CloseHandle(hPipeOutR);
-    throw TerminalSkillException("CreateProcessW (ConPTY) failed: " +
+    throw TerminalToolException("CreateProcessW (ConPTY) failed: " +
                                  std::to_string(GetLastError()));
   }
 
@@ -889,12 +889,12 @@ struct ApprovalResult {
 };
 
 // ============================================================================
-//  TerminalSkill
+//  TerminalTool
 // ============================================================================
 
-class TerminalSkill : public VelixProcess {
+class TerminalTool : public VelixProcess {
 public:
-  TerminalSkill() : VelixProcess("terminal", "skill") {}
+  TerminalTool() : VelixProcess("terminal", "tool") {}
 
   void run() override {
     // ── 0. Config ───────────────────────────────────────────────────────
@@ -1210,9 +1210,9 @@ private:
 };
 
 int main() {
-  TerminalSkill skill;
+  TerminalTool tool;
   try {
-    skill.start();
+    tool.start();
   } catch (const std::exception &) {
     return 1;
   }

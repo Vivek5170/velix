@@ -1,0 +1,34 @@
+{
+  "name": "skill_view",
+  "type": "tool",
+  "description": "Load and view the full content of a skill (SKILL.md file). Returns parsed JSON with metadata and body.",
+  "runtime": "cpp",
+  "workdir": ".",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "skill_name": {
+        "type": "string",
+        "description": "Name of the skill to load (alphanumeric, dash, underscore, dot only)"
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["summary", "manifest", "body"],
+        "default": "summary",
+        "description": "What to return: 'summary' (metadata+body), 'manifest' (metadata only), or 'body' (body only)"
+      },
+      "max_chars": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 100000,
+        "default": 8000,
+        "description": "Maximum characters to return in body (for 'summary' and 'body' modes)"
+      }
+    },
+    "required": ["skill_name"]
+  },
+  "run": {
+    "command": "./build/main",
+    "args": []
+  }
+}

@@ -5,7 +5,7 @@ Unnecessary internal details are removed and only **SDK rules, functions, usage,
 
 # Velix SDK – Developer Guide
 
-This document describes how developers implement **skills, tools, agents, and handlers** using the Velix SDK.
+This document describes how developers implement **tools, agents, and handlers** using the Velix SDK.
 
 > [!NOTE]
 > This guide predominantly uses **C++** syntax for examples. If you are developing with **Python**, please refer to the [Python SDK Guide](runtime/sdk/python/README.md) for equivalent syntax and patterns.
@@ -19,7 +19,7 @@ Developers interact with the runtime through the **`VelixProcess` SDK class**.
 
 ---
 
-# 1. Creating a Velix Skill / Process
+# 1. Creating a Velix Tool / Process
 
 Every Velix component must inherit from:
 
@@ -36,7 +36,7 @@ using namespace velix::core;
 
 class MyProcess : public VelixProcess {
 public:
-    MyProcess() : VelixProcess("my_process", "skill") {}
+    MyProcess() : VelixProcess("my_process", "tool") {}
 
     void run() override {
 
@@ -142,7 +142,7 @@ Velix SDK exposes the following functions.
 | run             | process entry point        |
 | call_llm        | request LLM response       |
 | call_llm_stream | stream LLM tokens          |
-| execute_tool    | execute another skill/tool |
+| execute_tool    | execute another tool       |
 | report_result   | return result to caller    |
 | send_message    | send event message         |
 | on_tool_start   | hook before tool execution |
@@ -422,7 +422,7 @@ void report_result(
 
 ### Purpose
 
-Return execution result to the caller. Used by **tools/skills**.
+Return execution result to the caller. Used by **tools**.
 
 ### Parameters
 

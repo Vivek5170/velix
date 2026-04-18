@@ -11,7 +11,7 @@
   ],
   "properties": {
     "name": { "type": "string", "minLength": 1 },
-    "type": { "type": "string", "enum": ["skill", "agent"] },
+    "type": { "type": "string", "enum": ["tool", "agent"] },
     "description": { "type": "string", "minLength": 1 },
     "runtime": {
       "type": "string",

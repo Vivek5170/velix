@@ -102,6 +102,9 @@ class SessionManager {
     std::string compact_reason;
     int         tokens_before = 0;
     int         tokens_after  = 0;
+    // The new seeded conversation ready to persist via SessionIO
+    // Only populated if compacted=true
+    json compacted_conversation = json::object();
   };
 
   struct AutoCompactGuardResult {
@@ -265,9 +268,11 @@ class SessionManager {
   int  next_snapshot_index(const std::string& session_id) const;
   int  snapshot_count(const std::string& session_id) const;
   void save_snapshot(const std::string& session_id, const json& history);
-  void write_seeded_history(const std::string& session_id,
-                            const std::string& summary,
-                            const json&        retained_recent = json::array());
+  
+  // Build a seeded conversation JSON object (does NOT persist; caller must use SessionIO)
+  json build_seeded_conversation(const std::string& session_id,
+                                 const std::string& summary,
+                                 const json&        retained_recent = json::array());
 
   // ── Validation ────────────────────────────────────────────────────────
   static void validate_super_user_name(const std::string& super_user);

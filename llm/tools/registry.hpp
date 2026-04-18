@@ -26,7 +26,7 @@ struct ToolManifest {
 
 class ToolRegistry {
 public:
-  ToolRegistry() { load_from_skills_directory(); }
+  ToolRegistry() { load_from_tools_directory(); }
 
   json get_tool_schemas() const { return cached_schemas_; }
 
@@ -45,7 +45,7 @@ private:
   static std::filesystem::path repo_root_from_cwd() {
     std::filesystem::path cur = std::filesystem::current_path();
     for (int i = 0; i < 8; ++i) {
-      if (std::filesystem::exists(cur / "skills") &&
+      if (std::filesystem::exists(cur / "tools") &&
           std::filesystem::exists(cur / "config")) {
         return cur;
       }
@@ -73,14 +73,14 @@ private:
     return out;
   }
 
-  void load_from_skills_directory() {
+  void load_from_tools_directory() {
     manifests_.clear();
     const std::filesystem::path repo_root = repo_root_from_cwd();
-    const std::filesystem::path skills_root = repo_root / "skills";
+    const std::filesystem::path tools_root = repo_root / "tools";
 
-    for (const auto &dir_name : list_directory_names(skills_root)) {
+    for (const auto &dir_name : list_directory_names(tools_root)) {
       const std::filesystem::path manifest_path =
-          skills_root / dir_name / "manifest.json";
+          tools_root / dir_name / "manifest.json";
       if (!std::filesystem::exists(manifest_path)) {
         continue;
       }
@@ -97,7 +97,7 @@ private:
 
       ToolManifest manifest;
       manifest.name = get_string_or(manifest_json, "name", dir_name);
-      manifest.type = get_string_or(manifest_json, "type", "skill");
+      manifest.type = get_string_or(manifest_json, "type", "tool");
       manifest.description = get_string_or(manifest_json, "description", "");
       manifest.runtime = get_string_or(manifest_json, "runtime", "");
       manifest.workdir = get_string_or(manifest_json, "workdir", "");

@@ -7,9 +7,9 @@ from pathlib import Path
 from runtime.sdk.python.velix_process import VelixProcess
 
 
-class UpdateMemorySkill(VelixProcess):
+class UpdateMemoryTool(VelixProcess):
     def __init__(self) -> None:
-        super().__init__("update_memory", "skill")
+        super().__init__("update_memory", "tool")
 
     def _find_velix_root(self) -> Path:
         """Walk up from CWD looking for the memory directory."""
@@ -92,4 +92,4 @@ class UpdateMemorySkill(VelixProcess):
 
 
 if __name__ == "__main__":
-    UpdateMemorySkill().start()
+    UpdateMemoryTool().start()

@@ -1,7 +1,7 @@
 {
   "name": "stress_test_executor",
-  "type": "skill",
-  "description": "Launches concurrent terminal skill calls and reports per-call latency and failures.",
+  "type": "tool",
+  "description": "Launches concurrent terminal tool calls and reports per-call latency and failures.",
   "runtime": "cpp",
   "workdir": ".",
   "parameters": {

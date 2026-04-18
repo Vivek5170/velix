@@ -413,10 +413,14 @@ void handle_session_control(const json &envelope,
         }
       }
 
-      const auto compact_result = sm.compact(target, history, false);
-      if (compact_result.compacted) {
-        session_io_ref.invalidate_conversation_cache(target);
-      }
+       const auto compact_result = sm.compact(target, history, false);
+       if (compact_result.compacted) {
+         // Persist the seeded conversation via storage provider
+         if (!compact_result.compacted_conversation.empty()) {
+           storage_provider->upsert_conversation(compact_result.compacted_conversation);
+         }
+         session_io_ref.invalidate_conversation_cache(target);
+       }
 
       reply["session"] = sm.get_session_object(target, mc.context_length);
       reply["summary"] = compact_result.summary;

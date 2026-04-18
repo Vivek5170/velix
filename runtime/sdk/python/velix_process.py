@@ -671,7 +671,7 @@ class VelixProcess:
                     raise RuntimeError(last_exec_error)
                 raise RuntimeError("Velix Executioner Link Failed: " + last_exec_error)
 
-            # Phase 2: Reactive wait on the Velix Bus for the actual skill output
+            # Phase 2: Reactive wait on the Velix Bus for the actual tool output
             bus_wait_min = _get_config("SDK_BUS_WAIT_MIN", 60)
             with self._response_cv:
                 success = self._response_cv.wait_for(

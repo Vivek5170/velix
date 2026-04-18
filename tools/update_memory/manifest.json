@@ -1,6 +1,6 @@
 {
   "name": "update_memory",
-  "type": "skill",
+  "type": "tool",
   "description": "Updates persistent user persona memory files (soul.md or user.md) based on conversation state. Uses runtime-injected session context (VELIX_USER_ID via SDK), not explicit tool args.",
   "runtime": "python",
   "workdir": ".",

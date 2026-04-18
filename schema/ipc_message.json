@@ -16,10 +16,10 @@
       "source_pid": 1000,
       "payload": {
         "register_intent": "JOIN_PARENT_TREE",
-        "role": "skill",
+        "role": "tool",
         "status": "STARTING",
         "os_pid": 43210,
-        "process_name": "web_search_skill"
+        "process_name": "web_search_tool"
       }
     }
   },

@@ -1,6 +1,6 @@
 # Velix Python SDK – Developer Guide
 
-This document describes how to build Velix **skills, tools, and agents** using the Python SDK. The Python SDK mirrors the logic of the C++ implementation but follows Pythonic conventions.
+This document describes how to build Velix **tools, agents** using the Python SDK. The Python SDK mirrors the logic of the C++ implementation but follows Pythonic conventions.
 
 > [!IMPORTANT]
 > Valid LLM modes are strictly: `simple`, `conversation`, and `user_conversation`. 
@@ -19,7 +19,7 @@ from runtime.sdk.python.velix_process import VelixProcess
 
 class MyProcess(VelixProcess):
     def __init__(self):
-        super().__init__(name="my_python_process", role="skill")
+        super().__init__(name="my_python_process", role="tool")
 
     def run(self):
         # Request reasoning from the LLM
@@ -54,7 +54,7 @@ The Python SDK exposes the same primitives as the C++ version:
 | `call_llm()` | Blocks until the LLM returns a full response. |
 | `call_llm_stream()` | Executes a streaming LLM turn with a token callback. |
 | `call_llm_resume()` | Resumes reasoning after a background task completes. |
-| `execute_tool()` | Synchronously executes another tool/skill. |
+| `execute_tool()` | Synchronously executes another tool. |
 | `report_result()` | Reports the tool's output back to the caller. |
 | `send_message()` | Sends an event (IPM) to another process (or the Handler). |
 

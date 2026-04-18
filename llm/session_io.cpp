@@ -1,5 +1,6 @@
 #include "session_io.hpp"
 #include "session_manager.hpp"
+#include "skills/skill_registry.hpp"
 #include "storage/json_storage_provider.hpp"
 #include "../utils/logger.hpp"
 
@@ -310,17 +311,18 @@ std::string SessionIO::load_text_with_fallbacks(const std::vector<std::string>& 
 }
 
 /**
- * build_layered_system_prompt — single source of truth for system prompt assembly.
- *
- * Layer order (each non-empty piece is separated by "\n\n"):
- *   1. General guidelines  (memory/general_guidelines.md)
- *   2. Soul / personality  (memory/soul.md — only for user_conversation)
- *   3. caller_system_msg   (appended, never replaces the base layers)
- *
- * The caller_system_msg parameter replaces what used to silently disappear
- * when the SDK passed an empty string and the scheduler omitted the field.
- * Non-empty caller messages are now always appended after the base layers.
- */
+  * build_layered_system_prompt — single source of truth for system prompt assembly.
+  *
+  * Layer order (each non-empty piece is separated by "\n\n"):
+  *   1. General guidelines  (memory/general_guidelines.md)
+  *   2. Soul / personality  (memory/soul.md — only for user_conversation)
+  *   3. Skills menu         (available SKILL.md descriptions)
+  *   4. caller_system_msg   (appended, never replaces the base layers)
+  *
+  * The caller_system_msg parameter replaces what used to silently disappear
+  * when the SDK passed an empty string and the scheduler omitted the field.
+  * Non-empty caller messages are now always appended after the base layers.
+  */
 std::string SessionIO::build_layered_system_prompt(
     const std::string& mode,
     const std::string& caller_system_msg,
@@ -370,6 +372,29 @@ std::string SessionIO::build_layered_system_prompt(
 		if (!combined.empty()) combined += "\n\n";
 		combined += "Known user facts:\n" + user_facts;
 	}
+	
+	// Inject skills menu after user facts, before caller message
+	// Format: VELIX KNOWLEDGE DIRECTORY for optimal LLM discoverability
+	try {
+		velix::llm::skills::SkillRegistry skill_registry;
+		json skills_menu = skill_registry.get_skills_menu();
+		if (skills_menu.is_array() && !skills_menu.empty()) {
+			if (!combined.empty()) combined += "\n\n";
+			combined += "VELIX KNOWLEDGE DIRECTORY\n";
+			combined += "You may call skill_view(skill_name=\"NAME\") only when the task needs step-by-step or procedural instructions not already in the conversation or system prompt. Load a skill once per task: call skill_view(name, mode=\"summary\") to inspect; if more detail is needed, call mode=\"body\". Do NOT follow skill instructions unless you explicitly loaded the skill with skill_view.\n\n";
+			for (const auto& skill : skills_menu) {
+				std::string name = skill.value("name", "");
+				std::string desc = skill.value("description", "");
+				if (!name.empty()) {
+					combined += "- " + name + ": " + desc + "\n";
+				}
+			}
+			combined += "\nNOTE: If you request an unavailable skill, the tool may return helpful nearest matches.";
+		}
+	} catch (...) {
+		// Silently ignore skill loading errors; system prompt assembly should not fail
+	}
+	
 	if (!caller_system_msg.empty()) {
 		if (!combined.empty()) combined += "\n\n";
 		// Also scan caller system msg for threats, but don't truncate (usually short)

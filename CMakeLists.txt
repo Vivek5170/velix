@@ -71,6 +71,7 @@ set(KERNEL_SOURCES
     execution/runtime_adapters/runtime_adapters.cpp
     llm/scheduler.cpp
     llm/session_io.cpp
+    llm/skills/skill_registry.cpp
     llm/storage/json_storage_provider.cpp
     llm/storage/provider_factory.cpp
     llm/storage/sqlite_storage_provider.cpp
@@ -97,6 +98,7 @@ add_executable(chat_handler
     chat/handler.cpp 
     runtime/sdk/cpp/velix_process.cpp
     llm/session_io.cpp
+    llm/skills/skill_registry.cpp
     llm/storage/json_storage_provider.cpp
     llm/storage/provider_factory.cpp
     llm/storage/sqlite_storage_provider.cpp
@@ -109,3 +111,5 @@ target_link_libraries(chat_handler PRIVATE ${VELIX_SQLITE_TARGET})
 if(WIN32)
     target_link_libraries(chat_handler PRIVATE ws2_32)
 endif()
+
+

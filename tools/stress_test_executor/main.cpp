@@ -10,9 +10,9 @@
 
 using namespace velix::core;
 
-class StressTestExecutorSkill : public VelixProcess {
+class StressTestExecutorTool : public VelixProcess {
 public:
-  StressTestExecutorSkill() : VelixProcess("stress_test_executor", "skill") {}
+  StressTestExecutorTool() : VelixProcess("stress_test_executor", "tool") {}
 
   void run() override {
     int calls = params.value("calls", 10);
@@ -133,9 +133,9 @@ public:
 };
 
 int main() {
-  StressTestExecutorSkill skill;
+  StressTestExecutorTool tool;
   try {
-    skill.start();
+    tool.start();
   } catch (...) {
     return 1;
   }

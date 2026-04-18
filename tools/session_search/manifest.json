@@ -1,6 +1,6 @@
 {
   "name": "session_search",
-  "type": "skill",
+  "type": "tool",
   "description": "Full-text search across past Velix conversation history using SQLite FTS5. Returns ranked snippets of matching turns from all persisted conversations.",
   "runtime": "python",
   "workdir": ".",

@@ -13,9 +13,9 @@ from typing import Any, Dict, List, Tuple
 from runtime.sdk.python.velix_process import VelixProcess
 
 
-class WebSearchSkill(VelixProcess):
+class WebSearchTool(VelixProcess):
     def __init__(self) -> None:
-        super().__init__("web_search", "skill")
+        super().__init__("web_search", "tool")
 
     def run(self) -> None:
         self.warnings: List[str] = []
@@ -49,8 +49,17 @@ class WebSearchSkill(VelixProcess):
             ["brave", "tavily", "firecrawl", "wikipedia", "arxiv", "duckduckgo"],
         )
         if not isinstance(requested_sources, list):
-            requested_sources = ["brave", "tavily", "firecrawl", "wikipedia", "arxiv", "duckduckgo"]
-        requested_sources = [str(s).strip().lower() for s in requested_sources if str(s).strip()]
+            requested_sources = [
+                "brave",
+                "tavily",
+                "firecrawl",
+                "wikipedia",
+                "arxiv",
+                "duckduckgo",
+            ]
+        requested_sources = [
+            str(s).strip().lower() for s in requested_sources if str(s).strip()
+        ]
 
         from concurrent.futures import ThreadPoolExecutor
 
@@ -69,7 +78,12 @@ class WebSearchSkill(VelixProcess):
             tier2_future = None
             if tier2:
                 tier2_future = orchestrator.submit(
-                    self._run_parallel_pipeline, query, max_results, timeout_sec, tier2, allow_firecrawl_scrape
+                    self._run_parallel_pipeline,
+                    query,
+                    max_results,
+                    timeout_sec,
+                    tier2,
+                    allow_firecrawl_scrape,
                 )
 
             # ---- Phase 1: Sequential Premium Providers (Stop on First Success) ----
@@ -79,7 +93,9 @@ class WebSearchSkill(VelixProcess):
                 items: List[Dict[str, Any]] = []
                 failure_reason = ""
                 try:
-                    items = self._search_source(source, query, max_results, timeout_sec, allow_firecrawl_scrape)
+                    items = self._search_source(
+                        source, query, max_results, timeout_sec, allow_firecrawl_scrape
+                    )
                     if not items:
                         failure_reason = "no_results"
                 except Exception as exc:
@@ -121,7 +137,9 @@ class WebSearchSkill(VelixProcess):
             "tier2_speculated": bool(tier2_future),
             "tier2_used": not premium_found,
             "providers": provider_diag,
-            "sources_used": sorted({str(it.get("source", "")) for it in final_results if it.get("source")}),
+            "sources_used": sorted(
+                {str(it.get("source", "")) for it in final_results if it.get("source")}
+            ),
             "warnings": self.warnings,
             "note": "Latency optimized: speculative free fallback launched while premium APIs checked.",
         }
@@ -143,7 +161,9 @@ class WebSearchSkill(VelixProcess):
             items: List[Dict[str, Any]] = []
             failure_reason = ""
             try:
-                items = self._search_source(source, query, limit, timeout_sec, allow_firecrawl_scrape)
+                items = self._search_source(
+                    source, query, limit, timeout_sec, allow_firecrawl_scrape
+                )
                 if not items:
                     failure_reason = "no_results"
             except Exception as exc:
@@ -175,12 +195,21 @@ class WebSearchSkill(VelixProcess):
     ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        provider_results: Dict[str, List[Dict[str, Any]]] = {s: [] for s in ordered_sources}
+        provider_results: Dict[str, List[Dict[str, Any]]] = {
+            s: [] for s in ordered_sources
+        }
         diagnostics: List[Dict[str, Any]] = []
 
         with ThreadPoolExecutor(max_workers=min(6, len(ordered_sources))) as pool:
             futures = {
-                pool.submit(self._search_source, s, query, limit, timeout_sec, allow_firecrawl_scrape): s
+                pool.submit(
+                    self._search_source,
+                    s,
+                    query,
+                    limit,
+                    timeout_sec,
+                    allow_firecrawl_scrape,
+                ): s
                 for s in ordered_sources
             }
             for future in as_completed(futures):
@@ -221,7 +250,9 @@ class WebSearchSkill(VelixProcess):
         if source == "tavily":
             return self._search_tavily(query, limit, timeout_sec)
         if source == "firecrawl":
-            return self._search_firecrawl(query, limit, timeout_sec, allow_firecrawl_scrape)
+            return self._search_firecrawl(
+                query, limit, timeout_sec, allow_firecrawl_scrape
+            )
         if source == "wikipedia":
             return self._search_wikipedia(query, limit, timeout_sec)
         if source == "arxiv":
@@ -230,7 +261,9 @@ class WebSearchSkill(VelixProcess):
             return self._search_duckduckgo(query, limit, timeout_sec)
         return []
 
-    def _search_brave(self, query: str, limit: int, timeout_sec: int) -> List[Dict[str, Any]]:
+    def _search_brave(
+        self, query: str, limit: int, timeout_sec: int
+    ) -> List[Dict[str, Any]]:
         api_key = os.getenv("BRAVE_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("api_error:missing_brave_api_key")
@@ -242,8 +275,13 @@ class WebSearchSkill(VelixProcess):
             "country": "us",
             "safesearch": "moderate",
         }
-        url = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(params)
-        payload = self._get_json(url, timeout_sec, headers={"X-Subscription-Token": api_key})
+        url = (
+            "https://api.search.brave.com/res/v1/web/search?"
+            + urllib.parse.urlencode(params)
+        )
+        payload = self._get_json(
+            url, timeout_sec, headers={"X-Subscription-Token": api_key}
+        )
 
         out: List[Dict[str, Any]] = []
         for item in payload.get("web", {}).get("results", []):
@@ -257,7 +295,9 @@ class WebSearchSkill(VelixProcess):
             )
         return self._sanitize_results(out)
 
-    def _search_tavily(self, query: str, limit: int, timeout_sec: int) -> List[Dict[str, Any]]:
+    def _search_tavily(
+        self, query: str, limit: int, timeout_sec: int
+    ) -> List[Dict[str, Any]]:
         api_key = os.getenv("TAVILY_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("api_error:missing_tavily_api_key")
@@ -304,7 +344,10 @@ class WebSearchSkill(VelixProcess):
 
         # Firecrawl API variants differ across deployments; try both known paths.
         last_error = "api_error"
-        for endpoint in ("https://api.firecrawl.dev/v1/search", "https://api.firecrawl.dev/v0/search"):
+        for endpoint in (
+            "https://api.firecrawl.dev/v1/search",
+            "https://api.firecrawl.dev/v0/search",
+        ):
             try:
                 data = self._post_json(endpoint, payload, timeout_sec, headers=headers)
                 out: List[Dict[str, Any]] = []
@@ -312,7 +355,8 @@ class WebSearchSkill(VelixProcess):
                     out.append(
                         {
                             "source": "firecrawl",
-                            "title": str(item.get("title", "")).strip() or str(item.get("url", "")).strip(),
+                            "title": str(item.get("title", "")).strip()
+                            or str(item.get("url", "")).strip(),
                             "url": str(item.get("url", "")).strip(),
                             "snippet": str(item.get("markdown", "")).strip()[:600]
                             if item.get("markdown")
@@ -324,7 +368,9 @@ class WebSearchSkill(VelixProcess):
                 last_error = self._classify_failure(str(exc))
         raise RuntimeError(last_error)
 
-    def _search_wikipedia(self, query: str, limit: int, timeout_sec: int) -> List[Dict[str, Any]]:
+    def _search_wikipedia(
+        self, query: str, limit: int, timeout_sec: int
+    ) -> List[Dict[str, Any]]:
         params = {
             "action": "query",
             "list": "search",
@@ -338,7 +384,9 @@ class WebSearchSkill(VelixProcess):
         out: List[Dict[str, Any]] = []
         for item in payload.get("query", {}).get("search", []):
             title = str(item.get("title", "")).strip()
-            page_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+            page_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(
+                title.replace(" ", "_")
+            )
             snippet = re.sub(r"<.*?>", "", str(item.get("snippet", "")))
             out.append(
                 {
@@ -350,7 +398,9 @@ class WebSearchSkill(VelixProcess):
             )
         return self._sanitize_results(out)
 
-    def _search_arxiv(self, query: str, limit: int, timeout_sec: int) -> List[Dict[str, Any]]:
+    def _search_arxiv(
+        self, query: str, limit: int, timeout_sec: int
+    ) -> List[Dict[str, Any]]:
         params = {
             "search_query": f"all:{query}",
             "start": "0",
@@ -363,18 +413,41 @@ class WebSearchSkill(VelixProcess):
 
         out: List[Dict[str, Any]] = []
         # Support both namespaced and non-namespaced entry tags
-        entries = re.findall(r"<(?:[a-z]+:)?entry>(.*?)</(?:[a-z]+:)?entry>", raw, flags=re.DOTALL)
+        entries = re.findall(
+            r"<(?:[a-z]+:)?entry>(.*?)</(?:[a-z]+:)?entry>", raw, flags=re.DOTALL
+        )
         for block in entries[:limit]:
-            title_match = re.search(r"<(?:[a-z]+:)?title>(.*?)</(?:[a-z]+:)?title>", block, flags=re.DOTALL)
-            summary_match = re.search(r"<(?:[a-z]+:)?summary>(.*?)</(?:[a-z]+:)?summary>", block, flags=re.DOTALL)
-            id_match = re.search(r"<(?:[a-z]+:)?id>(.*?)</(?:[a-z]+:)?id>", block, flags=re.DOTALL)
-            title = html.unescape((title_match.group(1) if title_match else "").strip()).replace("\n", " ")
-            snippet = html.unescape((summary_match.group(1) if summary_match else "").strip()).replace("\n", " ")
+            title_match = re.search(
+                r"<(?:[a-z]+:)?title>(.*?)</(?:[a-z]+:)?title>", block, flags=re.DOTALL
+            )
+            summary_match = re.search(
+                r"<(?:[a-z]+:)?summary>(.*?)</(?:[a-z]+:)?summary>",
+                block,
+                flags=re.DOTALL,
+            )
+            id_match = re.search(
+                r"<(?:[a-z]+:)?id>(.*?)</(?:[a-z]+:)?id>", block, flags=re.DOTALL
+            )
+            title = html.unescape(
+                (title_match.group(1) if title_match else "").strip()
+            ).replace("\n", " ")
+            snippet = html.unescape(
+                (summary_match.group(1) if summary_match else "").strip()
+            ).replace("\n", " ")
             url_entry = (id_match.group(1) if id_match else "").strip()
-            out.append({"source": "arxiv", "title": title, "url": url_entry, "snippet": snippet})
+            out.append(
+                {
+                    "source": "arxiv",
+                    "title": title,
+                    "url": url_entry,
+                    "snippet": snippet,
+                }
+            )
         return self._sanitize_results(out)
 
-    def _search_duckduckgo(self, query: str, limit: int, timeout_sec: int) -> List[Dict[str, Any]]:
+    def _search_duckduckgo(
+        self, query: str, limit: int, timeout_sec: int
+    ) -> List[Dict[str, Any]]:
         # Prefer ddgs package if present. Fallback to DuckDuckGo public instant-answer API.
         try:
             from ddgs import DDGS  # type: ignore
@@ -392,7 +465,9 @@ class WebSearchSkill(VelixProcess):
                     )
             return self._sanitize_results(out)
         except Exception as e:
-            self.warnings.append(f"Provider 'ddgs' not available, using limited fallback: {e}")
+            self.warnings.append(
+                f"Provider 'ddgs' not available, using limited fallback: {e}"
+            )
             pass
 
         params = {
@@ -422,7 +497,11 @@ class WebSearchSkill(VelixProcess):
         for topic in payload.get("RelatedTopics", []):
             if len(out) >= limit:
                 break
-            if isinstance(topic, dict) and "Topics" in topic and isinstance(topic["Topics"], list):
+            if (
+                isinstance(topic, dict)
+                and "Topics" in topic
+                and isinstance(topic["Topics"], list)
+            ):
                 for sub in topic["Topics"]:
                     if len(out) >= limit:
                         break
@@ -452,7 +531,9 @@ class WebSearchSkill(VelixProcess):
 
         return self._sanitize_results(out[:limit])
 
-    def _get_json(self, url: str, timeout_sec: int, headers: Dict[str, str] = None) -> Dict[str, Any]:
+    def _get_json(
+        self, url: str, timeout_sec: int, headers: Dict[str, str] = None
+    ) -> Dict[str, Any]:
         if headers is None:
             headers = {}
         req = urllib.request.Request(
@@ -524,9 +605,19 @@ class WebSearchSkill(VelixProcess):
         merged: List[Dict[str, Any]] = []
         seen = set()
 
-        for source in ["brave", "tavily", "firecrawl", "wikipedia", "arxiv", "duckduckgo"]:
+        for source in [
+            "brave",
+            "tavily",
+            "firecrawl",
+            "wikipedia",
+            "arxiv",
+            "duckduckgo",
+        ]:
             for item in provider_results.get(source, []):
-                key = (str(item.get("url", "")).strip().lower(), str(item.get("title", "")).strip().lower())
+                key = (
+                    str(item.get("url", "")).strip().lower(),
+                    str(item.get("title", "")).strip().lower(),
+                )
                 if key in seen:
                     continue
                 seen.add(key)
@@ -568,14 +659,20 @@ class WebSearchSkill(VelixProcess):
         return "api_error"
 
     def _summarize_titles(self, items: List[Dict[str, Any]]) -> str:
-        titles = [str(it.get("title", "")).strip() for it in items if str(it.get("title", "")).strip()]
+        titles = [
+            str(it.get("title", "")).strip()
+            for it in items
+            if str(it.get("title", "")).strip()
+        ]
         if not titles:
             return "No results found."
         return "Top findings: " + "; ".join(titles[:5])
 
     def _report_error(self, message: str) -> None:
-        self.report_result(self.parent_pid, {"status": "error", "error": message}, self.entry_trace_id)
+        self.report_result(
+            self.parent_pid, {"status": "error", "error": message}, self.entry_trace_id
+        )
 
 
 if __name__ == "__main__":
-    WebSearchSkill().start()
+    WebSearchTool().start()

@@ -650,8 +650,8 @@ private:
         }
 
         // Disk scan (no lock held)
-        std::string pkg_path;
-        for (const char *prefix : {"skills/", "agents/"}) {
+         std::string pkg_path;
+         for (const char *prefix : {"tools/", "agents/"}) {
             const std::string candidate = std::string(prefix) + name;
             if (std::ifstream(candidate + "/manifest.json").good()) {
                 pkg_path = candidate;

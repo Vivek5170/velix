@@ -1,6 +1,6 @@
 {
   "name": "terminal",
-  "type": "skill",
+  "type": "tool",
   "description": "Execute commands. Supports building persistent environments (like keeping a real terminal tab open) or running background tasks.",
   "runtime": "cpp",
   "workdir": ".",

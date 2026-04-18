@@ -42,7 +42,7 @@ LLMs have fixed context limits. Velix solves this through a kernel-level **Compa
 1.  **Summarizes**: Generates a high-fidelity summary of the current state.
 2.  **Snapshots**: Saves the full history as an FTS5-indexed JSON snapshot.
 3.  **Resets**: Clears the live context and re-seeds it with the summary and a "retrieval trigger."
-This allows agents to maintain "infinite" context without losing the ability to search deep history using the **session_search** skill.
+This allows agents to maintain "infinite" context without losing the ability to search deep history using the **session_search** tool.
 
 ### 7. Persistent Multi-User Personas
 Unlike simple session-based bots, Velix distinguishes between **Personas** (Super-Users) and **Sessions**.
@@ -71,7 +71,7 @@ Velix is composed of specialized service nodes:
 
 *   **Supervisor**: The lifecycle authority. Monitors process health, enforces timeouts, and manages the execution tree.
 *   **Scheduler**: The reasoning engine. Manages LLM queues and maintains conversation state across multi-turn reasoning loops.
-*   **Executioner**: The deployment engine. Safely launches and configures skill/agent processes.
+*   **Executioner**: The deployment engine. Safely launches and configures tool/agent processes.
 *   **Bus**: The neural network. A high-speed IPC relay for PID-targeted messages and system events.
 
 ---
@@ -160,9 +160,9 @@ python -m terminal --no-stream
 python -m terminal --help
 ```
 
-### 5) Python skills require `uv`
+### 5) Python tools require `uv`
 
-Python-runtime skills (for example `skills/web_search`) are configured to run with `uv` (`uv run ...` in the skill manifest).
+Python-runtime tools (for example `tools/web_search`) are configured to run with `uv` (`uv run ...` in the tool manifest).
 
 Install `uv` once on your machine, then run Velix normally:
 
@@ -170,7 +170,7 @@ Install `uv` once on your machine, then run Velix normally:
 uv --version
 ```
 
-If `uv` is not installed, Python skills will fail to launch.
+If `uv` is not installed, Python tools will fail to launch.
 
 ### 6) LLM provider config (`config/model.json`)
 

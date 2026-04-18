@@ -16,9 +16,9 @@ _SNIPPET_HIGHLIGHT_START = ">>>"
 _SNIPPET_HIGHLIGHT_END = "<<<"
 
 
-class SessionSearchSkill(VelixProcess):
+class SessionSearchTool(VelixProcess):
     def __init__(self) -> None:
-        super().__init__("session_search", "skill")
+        super().__init__("session_search", "tool")
         self.root = self._find_velix_root()
         self.storage_cfg = self._load_storage_config()
         self.storage_backend = self.storage_cfg.get("backend", "json")
@@ -244,6 +244,8 @@ class SessionSearchSkill(VelixProcess):
         rows: list[tuple[str, str, int, int]] = []
         try:
             src = sqlite3.connect(str(self.velix_sqlite_db))
+
+            # Fetch current conversations
             cur = src.execute(
                 "SELECT convo_id, messages_json, last_activity_ms, creator_pid, user_id FROM conversations"
             )
@@ -281,6 +283,43 @@ class SessionSearchSkill(VelixProcess):
                         int(creator_pid or -1),
                     )
                 )
+
+            # Also fetch historical snapshots (for post-compaction searchability)
+            # Snapshots are stored as {session_id}_hN pseudo-convo_ids
+            snap_cur = src.execute(
+                "SELECT session_id, snapshot_n, messages_json, snapshot_ms FROM session_snapshots"
+            )
+            for (
+                session_id,
+                snapshot_n,
+                messages_json,
+                snapshot_ms,
+            ) in snap_cur.fetchall():
+                # Create pseudo-convo_id like the filesystem: session_id_hN
+                snapshot_convo_id = f"{session_id}_h{snapshot_n}"
+
+                # Apply same filtering as conversations
+                if user_id:
+                    proc_parts = self._parse_proc_session(user_id)
+                    if proc_parts is not None:
+                        if session_id != user_id:
+                            continue
+                    elif self._is_session_id(user_id):
+                        if session_id != user_id:
+                            continue
+                    else:
+                        if not session_id.startswith(user_id + "_s"):
+                            continue
+
+                rows.append(
+                    (
+                        str(snapshot_convo_id),
+                        str(messages_json or "[]"),
+                        int(snapshot_ms or 0),
+                        -1,  # snapshots don't have creator_pid
+                    )
+                )
+
             src.close()
         except Exception:
             return []
@@ -453,4 +492,4 @@ class SessionSearchSkill(VelixProcess):
 
 
 if __name__ == "__main__":
-    SessionSearchSkill().start()
+    SessionSearchTool().start()

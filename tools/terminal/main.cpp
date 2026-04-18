@@ -1,10 +1,10 @@
 /**
- * commandline — Velix Skill
+ * commandline — Velix Tool
  *
  * Fixes from original:
  *
  * BUG-25 — am_poll_until_done has a hard deadline (job_timeout + poll_grace_sec).
- *           If ApplicationManager becomes unreachable the skill times out cleanly.
+ *           If ApplicationManager becomes unreachable the tool times out cleanly.
  *
  * BUG-26 — `sandbox_cwd.empty()` → corrected to always prepend cd for PTY
  *           (sandbox_cwd is always absolute; skipping cd would run the command
@@ -428,23 +428,23 @@ static json am_poll_until_done(const std::string &job_id,
                                std::chrono::steady_clock::now() - start).count();
             if (elapsed >= total_timeout_sec) {
                 LOG_WARN("am_poll_until_done: poll deadline elapsed for job " + job_id);
-                return {{"status",     "ok"},
-                        {"job_status", "timeout"},
-                        {"exit_code",  124},
-                        {"output",     "[skill] Poll deadline exceeded — job may still be running"}};
-            }
-        }
+                 return {{"status",     "ok"},
+                         {"job_status", "timeout"},
+                         {"exit_code",  124},
+                         {"output",     "[tool] Poll deadline exceeded — job may still be running"}};
+             }
+         }
 
-        json req = {{"message_type", "POLL"}, {"job_id", job_id}};
-        json resp;
-        try {
-            resp = json::parse(am_call(req, host, port));
-        } catch (const std::exception &e) {
-            // AM unreachable — return an error rather than looping forever.
-            return {{"status",     "ok"},
-                    {"job_status", "error"},
-                    {"exit_code",  -1},
-                    {"output",     std::string("[skill] Poll failed: ") + e.what()}};
+         json req = {{"message_type", "POLL"}, {"job_id", job_id}};
+         json resp;
+         try {
+             resp = json::parse(am_call(req, host, port));
+         } catch (const std::exception &e) {
+             // AM unreachable — return an error rather than looping forever.
+             return {{"status",     "ok"},
+                     {"job_status", "error"},
+                     {"exit_code",  -1},
+                     {"output",     std::string("[tool] Poll failed: ") + e.what()}};
         }
 
         if (resp.value("status", "") != "ok") {
@@ -477,12 +477,12 @@ static ApprovalResult approved_ok(const std::string &msg) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TerminalSkill
+// TerminalTool
 // ─────────────────────────────────────────────────────────────────────────────
 
-class TerminalSkill : public VelixProcess {
+class TerminalTool : public VelixProcess {
 public:
-    TerminalSkill() : VelixProcess("terminal", "skill") {}
+    TerminalTool() : VelixProcess("terminal", "tool") {}
 
     void run() override {
         skill_config() = load_config("../../config/terminal.json");
@@ -877,9 +877,9 @@ private:
 };
 
 int main() {
-    TerminalSkill skill;
+    TerminalTool tool;
     try {
-        skill.start();
+        tool.start();
     } catch (const std::exception &) {
         return 1;
     }

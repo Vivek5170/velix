@@ -35,13 +35,26 @@ void SessionManager::validate_super_user_name(const std::string &super_user) {
   if (super_user.empty()) {
     throw std::runtime_error("super_user name must not be empty");
   }
-  for (char c : super_user) {
-    if (c == '_') {
-      throw std::runtime_error("super_user name must not contain '_'");
-    }
-    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-') {
+  
+  // Reject names with reserved _s{number} pattern (used for session IDs)
+  const auto pos = super_user.rfind("_s");
+  if (pos != std::string::npos && pos + 2 < super_user.size()) {
+    const std::string suffix = super_user.substr(pos + 2);
+    const bool numeric_suffix =
+        !suffix.empty() &&
+        std::all_of(suffix.begin(), suffix.end(),
+                    [](unsigned char ch) { return std::isdigit(ch) != 0; });
+    if (numeric_suffix) {
       throw std::runtime_error(
-          "super_user name must be alphanumeric (hyphens allowed)");
+          "super_user name must not match reserved pattern: *_s{number}");
+    }
+  }
+  
+  // Allow alphanumeric, hyphens, and underscores (as long as not _s pattern)
+  for (char c : super_user) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') {
+      throw std::runtime_error(
+          "super_user name must be alphanumeric (hyphens and underscores allowed)");
     }
   }
 }
@@ -714,11 +727,11 @@ void SessionManager::save_snapshot(const std::string &session_id,
 
 // ── Synthetic pre-seeded history ──────────────────────────────────────────
 
-void SessionManager::write_seeded_history(const std::string &session_id,
-                                          const std::string &summary,
-                                          const json &retained_recent) {
+json SessionManager::build_seeded_conversation(const std::string &session_id,
+                                              const std::string &summary,
+                                              const json &retained_recent) {
   // Synthetic tool-call history injected at the start of the reset session.
-  // No actual skill is executed — the summary is already known.
+  // No actual tool is executed — the summary is already known.
   //
   // user  → "retrieve previous continuation session summary"
   // asst  → tool_call(session_search, {"query":"continue previous session"})
@@ -755,8 +768,7 @@ void SessionManager::write_seeded_history(const std::string &session_id,
     }
   }
 
-  // Write as a bare messages array into the live conversation file.
-  // SessionIO will load this as the starting history on next access.
+  // Compute seeded tokens
   uint64_t seeded_tokens = 0;
   for (const auto &m : messages) {
     if (!m.is_object()) {
@@ -766,20 +778,26 @@ void SessionManager::write_seeded_history(const std::string &session_id,
         static_cast<uint64_t>(m.value("content", std::string("")).size() / 4);
   }
 
+  // Count only real turns (user + assistant messages), excluding synthetic summary
+  // and tool messages
+  int real_turn_count = 0;
+  for (const auto &m : messages) {
+    if (m.is_object()) {
+      const std::string role = m.value("role", "");
+      if (role == "user" || role == "assistant") {
+        real_turn_count++;
+      }
+    }
+  }
+
   json convo;
   convo["messages"] = messages;
   convo["convo_id"] = session_id;
   convo["compacted"] = true;
-  convo["turn_count"] = static_cast<int>(messages.size());
+  convo["turn_count"] = real_turn_count;
   convo["current_context_tokens"] = seeded_tokens;
-
-  const std::string path = live_convo_path(session_id);
-  fs::create_directories(session_dir(session_id));
-  std::ofstream f(path);
-  if (f.is_open())
-    f << convo.dump(2);
-  LOG_INFO_CTX("Pre-seeded history for " + session_id, "session_mgr", "", -1,
-               "session_seed");
+  
+  return convo;
 }
 
 // ── compact ───────────────────────────────────────────────────────────────
@@ -880,15 +898,14 @@ SessionManager::compact(const std::string &session_id, const json &history,
 
   result.summary = summary;
 
-  // 2. Save snapshot for session_search (only when compaction actually
-  // happens).
-  if (!history.empty()) {
-    save_snapshot(session_id, history);
-  }
+   // 2. Save snapshot for session_search (only when compaction actually
+   // happens).
+   if (!history.empty()) {
+     save_snapshot(session_id, history);
+   }
 
-  // 3. Overwrite the live conversation file with the pre-seeded history.
-  // The session_id stays the same — only the content is reset.
-  write_seeded_history(session_id, summary, retained_recent);
+   // 3. Build the seeded conversation (does NOT persist - caller uses SessionIO)
+   result.compacted_conversation = build_seeded_conversation(session_id, summary, retained_recent);
 
   // Estimate tokens after (the pre-seeded history is small).
   // user(~6w) + assistant(tool_call~10w) + tool(summary) ≈ summary/4 + 50
@@ -956,17 +973,20 @@ SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
     }
   }
 
-  const auto compact_result = compact(convo_id, history, true);
-  result.compacted = compact_result.compacted;
-  result.skip_reason = compact_result.compact_reason;
-  result.tokens_before = compact_result.tokens_before;
-  result.tokens_after = compact_result.tokens_after;
+   const auto compact_result = compact(convo_id, history, true);
+   result.compacted = compact_result.compacted;
+   result.skip_reason = compact_result.compact_reason;
+   result.tokens_before = compact_result.tokens_before;
+   result.tokens_after = compact_result.tokens_after;
 
-  if (result.compacted) {
-    // compact() writes seeded history directly to disk. Evict any cached pre-
-    // compact conversation so the next read/persist path reloads seeded state.
-    session_io.invalidate_conversation_cache(convo_id);
-  }
+   if (result.compacted) {
+     // Persist via storage provider (if available)
+     if (!compact_result.compacted_conversation.empty() && storage_provider_) {
+       storage_provider_->upsert_conversation(compact_result.compacted_conversation);
+     }
+     // Evict cache so next read reloads from storage
+     session_io.invalidate_conversation_cache(convo_id);
+   }
 
   if (!result.compacted && result.skip_reason.empty()) {
     result.skip_reason = "below_compaction_limit";

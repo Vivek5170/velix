@@ -766,7 +766,7 @@ json VelixProcess::execute_tool_internal(
                                last_exec_error);
     }
 
-    // Phase 2: Reactive Wait on the Velix Bus for the actual skill output
+    // Phase 2: Reactive Wait on the Velix Bus for the actual tool output
     json result;
     {
       std::unique_lock<std::mutex> lock(queue_mutex);

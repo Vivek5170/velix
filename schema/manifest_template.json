@@ -1,6 +1,6 @@
 {
   "name": "web_search",
-  "type": "skill",
+  "type": "tool",
   "description": "Searches the web for current info.",
   "runtime": "python",
   "entry": "main.py",
