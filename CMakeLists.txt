@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(Velix LANGUAGES CXX)
+project(Velix LANGUAGES C CXX)
 
 # Use C++17
 set(CMAKE_CXX_STANDARD 17)
