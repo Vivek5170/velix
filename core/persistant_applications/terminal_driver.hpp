@@ -148,29 +148,29 @@ class JobStore {
 public:
     void upsert(const Job &job) {
         std::scoped_lock lk(mx_);
-        jobs_[job.job_id] = job;
+        jobs_[job.job_id] = std::make_shared<Job>(job);
     }
 
     std::shared_ptr<Job> get(const std::string &job_id) const {
         std::scoped_lock lk(mx_);
         auto it = jobs_.find(job_id);
-        return it == jobs_.end() ? nullptr : std::make_shared<Job>(it->second);
+        return it == jobs_.end() ? nullptr : it->second;
     }
 
     void append_output(const std::string &job_id, std::string_view chunk) {
         if (chunk.empty()) return;
         std::scoped_lock lk(mx_);
         auto it = jobs_.find(job_id);
-        if (it != jobs_.end()) it->second.output.append(chunk);
+        if (it != jobs_.end()) it->second->output.append(chunk);
     }
 
     void finish(const std::string &job_id, JobStatus status, int exit_code) {
         std::scoped_lock lk(mx_);
         auto it = jobs_.find(job_id);
         if (it != jobs_.end()) {
-            it->second.status         = status;
-            it->second.exit_code      = exit_code;
-            it->second.finished_at_ms = now_ms();
+            it->second->status         = status;
+            it->second->exit_code      = exit_code;
+            it->second->finished_at_ms = now_ms();
         }
     }
 
@@ -178,9 +178,9 @@ public:
         const uint64_t now = now_ms();
         std::scoped_lock lk(mx_);
         for (auto it = jobs_.begin(); it != jobs_.end();) {
-            const Job &j = it->second;
-            if (j.status != JobStatus::Running &&
-                now - j.finished_at_ms > max_age_ms)
+            const auto &j = it->second;
+            if (j->status != JobStatus::Running &&
+                now - j->finished_at_ms > max_age_ms)
                 it = jobs_.erase(it);
             else
                 ++it;
@@ -189,7 +189,7 @@ public:
 
 private:
     mutable std::mutex mx_;
-    std::unordered_map<std::string, Job> jobs_;
+    std::unordered_map<std::string, std::shared_ptr<Job>> jobs_;
 
     static uint64_t now_ms() {
         return static_cast<uint64_t>(
