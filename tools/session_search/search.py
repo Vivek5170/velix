@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import sqlite3
-import sys
 import time
 from pathlib import Path
+from typing import Optional
 from runtime.sdk.python.velix_process import VelixProcess
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -14,6 +15,14 @@ _MAX_LIMIT = 50
 _SNIPPET_MAX_TOKENS = 64  # approximate word count for snippet
 _SNIPPET_HIGHLIGHT_START = ">>>"
 _SNIPPET_HIGHLIGHT_END = "<<<"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _sanitize_filename(s: str) -> str:
+    """Sanitize a string for safe use as a filename. Replace unsafe chars with underscore."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", s)
 
 
 class SessionSearchTool(VelixProcess):
@@ -27,8 +36,9 @@ class SessionSearchTool(VelixProcess):
         self.velix_sqlite_db = self.root / self.storage_cfg.get(
             "sqlite_path", ".velix/velix.db"
         )
-        self.index_db = self.root / "memory" / ".session_search_index.db"
-        self.manifest_json = self.root / "memory" / ".session_search_manifest.json"
+        # Per-tenant index DB path is set in run() after validating session_id
+        self.index_db: Optional[Path] = None
+        self.index_search_dir = self.root / ".velix" / "session_search"
 
     def _load_storage_config(self) -> dict:
         for rel in (
@@ -91,6 +101,8 @@ class SessionSearchTool(VelixProcess):
         return Path.cwd()
 
     def _open_db(self) -> sqlite3.Connection:
+        if self.index_db is None:
+            raise RuntimeError("index_db path not set")
         self.index_db.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.index_db))
         conn.execute("PRAGMA journal_mode=WAL")
@@ -137,60 +149,76 @@ class SessionSearchTool(VelixProcess):
         conn.commit()
         return conn
 
-    def _scan_convo_files(self, user_id: str, mode: str) -> list[Path]:
-        """Return session JSON files scoped to mode and optional user/session identifier."""
+    def _check_fts5_availability(self, conn: sqlite3.Connection) -> bool:
+        """Verify FTS5 and bm25 are available in the SQLite build."""
+        try:
+            result = conn.execute(
+                "SELECT sqlite_compileoption_used('ENABLE_FTS5')"
+            ).fetchone()
+            if result and result[0] == 1:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _execute_with_retry(
+        self, conn: sqlite3.Connection, sql: str, params: tuple, max_retries: int = 3
+    ) -> None:
+        """Execute SQL with retry on database locked."""
+        for attempt in range(max_retries):
+            try:
+                conn.execute(sql, params)
+                return
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    time.sleep(0.1 * (2**attempt))  # exponential backoff
+                    continue
+                raise
+
+    def _scan_convo_files(
+        self, session_id: str, mode: str, is_proc: bool, tenant_key: str
+    ) -> list[Path]:
+        """
+        Return session JSON files scoped to tenant and mode.
+        - session_id: the current session (superuser_sN or proc_...)
+        - mode: 'session' or 'user'
+        - is_proc: whether this is a proc session
+        - tenant_key: extracted tenant key (super_user or full proc session id)
+        """
         files: list[Path] = []
         if not self.sessions_root.exists():
             return files
 
         users_root = self.sessions_root / "users"
         procs_root = self.sessions_root / "procs"
-        include_users = mode in ("all", "user")
-        include_procs = mode in ("all", "proc")
 
-        if not user_id:
-            if include_users and users_root.exists():
-                for super_dir in users_root.iterdir():
-                    if not super_dir.is_dir():
-                        continue
-                    for session_dir in super_dir.iterdir():
-                        if session_dir.is_dir():
-                            files.extend(session_dir.glob("*.json"))
-            if include_procs and procs_root.exists():
-                for pid_dir in procs_root.iterdir():
-                    if not pid_dir.is_dir():
-                        continue
-                    for session_dir in pid_dir.iterdir():
-                        if session_dir.is_dir():
-                            files.extend(session_dir.glob("*.json"))
-            return files
-
-        proc_parts = self._parse_proc_session(user_id)
-        if proc_parts is not None:
-            if not include_procs:
-                return files
-            pid, sid = proc_parts
-            session_dir = procs_root / pid / sid
+        if is_proc:
+            # Proc session: only scan memory/sessions/procs/<pid>/<session_id>/*.json
+            pid, _sid = self._parse_proc_session(session_id)
+            session_dir = procs_root / pid / session_id
             if session_dir.exists() and session_dir.is_dir():
                 files.extend(session_dir.glob("*.json"))
             return files
 
-        if self._is_session_id(user_id):
-            if not include_users:
-                return files
-            super_user = self._extract_super_user(user_id)
-            session_dir = users_root / super_user / user_id
-            if session_dir.exists() and session_dir.is_dir():
-                files.extend(session_dir.glob("*.json"))
+        # Normal user session: scan under users_root / tenant_key (the super_user)
+        super_user = tenant_key
+        super_dir = users_root / super_user
+        if not super_dir.exists():
             return files
 
-        # Fallback: treat user_id as super_user and scan all their sessions.
-        if include_users:
-            super_dir = users_root / user_id
-            if super_dir.exists() and super_dir.is_dir():
-                for session_dir in super_dir.iterdir():
-                    if session_dir.is_dir():
-                        files.extend(session_dir.glob("*.json"))
+        if mode == "session":
+            # Session mode: only scan current session directory
+            # memory/sessions/users/<super_user>/<session_id>/*.json
+            session_dir = super_dir / session_id
+            if session_dir.exists() and session_dir.is_dir():
+                files.extend(session_dir.glob("*.json"))
+        else:  # mode == "user"
+            # User mode: scan all sessions for this super_user
+            # memory/sessions/users/<super_user>/*/*.json
+            for session_dir in super_dir.iterdir():
+                if session_dir.is_dir():
+                    files.extend(session_dir.glob("*.json"))
+
         return files
 
     def _index_messages(
@@ -237,8 +265,15 @@ class SessionSearchTool(VelixProcess):
         return count
 
     def _list_sqlite_conversations(
-        self, user_id: str, mode: str
+        self, session_id: str, mode: str, is_proc: bool, tenant_key: str
     ) -> list[tuple[str, str, int, int]]:
+        """
+        List conversations from Velix SQLite DB, scoped to tenant and mode.
+        - session_id: the current session (superuser_sN or proc_...)
+        - mode: 'session' or 'user'
+        - is_proc: whether this is a proc session
+        - tenant_key: extracted tenant key (super_user or full proc session id)
+        """
         if not self.velix_sqlite_db.exists():
             return []
         rows: list[tuple[str, str, int, int]] = []
@@ -256,23 +291,24 @@ class SessionSearchTool(VelixProcess):
                 creator_pid,
                 convo_user_id,
             ) in cur.fetchall():
-                if mode == "user" and int(creator_pid or -1) > 0:
-                    continue
-                if mode == "proc" and int(creator_pid or -1) <= 0:
-                    continue
-
-                if user_id:
-                    proc_parts = self._parse_proc_session(user_id)
-                    if proc_parts is not None:
-                        if convo_id != user_id:
+                # Include row based on scope
+                if is_proc:
+                    # For proc sessions, only include if convo_id matches this session
+                    if convo_id != session_id:
+                        continue
+                else:
+                    # For user sessions, filter by mode
+                    if mode == "session":
+                        # Session mode: only include exact session match
+                        if convo_id != session_id:
                             continue
-                    elif self._is_session_id(user_id):
-                        if convo_id != user_id:
-                            continue
-                    else:
-                        if str(
-                            convo_user_id or ""
-                        ) != user_id and not convo_id.startswith(user_id + "_s"):
+                    else:  # mode == "user"
+                        # User mode: include if belongs to this superuser
+                        super_user = tenant_key
+                        if not (
+                            (str(convo_user_id or "") == super_user)
+                            or convo_id.startswith(super_user + "_s")
+                        ):
                             continue
 
                 rows.append(
@@ -290,25 +326,29 @@ class SessionSearchTool(VelixProcess):
                 "SELECT session_id, snapshot_n, messages_json, snapshot_ms FROM session_snapshots"
             )
             for (
-                session_id,
+                snap_session_id,
                 snapshot_n,
                 messages_json,
                 snapshot_ms,
             ) in snap_cur.fetchall():
                 # Create pseudo-convo_id like the filesystem: session_id_hN
-                snapshot_convo_id = f"{session_id}_h{snapshot_n}"
+                snapshot_convo_id = f"{snap_session_id}_h{snapshot_n}"
 
                 # Apply same filtering as conversations
-                if user_id:
-                    proc_parts = self._parse_proc_session(user_id)
-                    if proc_parts is not None:
-                        if session_id != user_id:
+                if is_proc:
+                    # For proc sessions, include if parent session matches
+                    if snap_session_id != session_id:
+                        continue
+                else:
+                    # For user sessions, filter by mode
+                    if mode == "session":
+                        # Session mode: include only if snapshot belongs to this session
+                        if snap_session_id != session_id:
                             continue
-                    elif self._is_session_id(user_id):
-                        if session_id != user_id:
-                            continue
-                    else:
-                        if not session_id.startswith(user_id + "_s"):
+                    else:  # mode == "user"
+                        # User mode: include if snapshot belongs to any session of this superuser
+                        super_user = tenant_key
+                        if not snap_session_id.startswith(super_user + "_s"):
                             continue
 
                 rows.append(
@@ -325,11 +365,21 @@ class SessionSearchTool(VelixProcess):
             return []
         return rows
 
-    def _update_index(self, conn: sqlite3.Connection, user_id: str, mode: str) -> None:
+    def _update_index(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        mode: str,
+        is_proc: bool,
+        tenant_key: str,
+    ) -> None:
+        """Update index with tenant-scoped data. mode is 'session' or 'user'."""
         current_keys: set[str] = set()
 
         if self.storage_backend == "sqlite":
-            convos = self._list_sqlite_conversations(user_id, mode)
+            convos = self._list_sqlite_conversations(
+                session_id, mode, is_proc, tenant_key
+            )
             for convo_id, messages_json, last_activity_ms, _creator_pid in convos:
                 try:
                     messages = json.loads(messages_json)
@@ -367,7 +417,7 @@ class SessionSearchTool(VelixProcess):
             conn.commit()
             return
 
-        files = self._scan_convo_files(user_id, mode)
+        files = self._scan_convo_files(session_id, mode, is_proc, tenant_key)
         for f in files:
             source_key = "file:" + str(f)
             try:
@@ -397,25 +447,72 @@ class SessionSearchTool(VelixProcess):
         conn.commit()
 
     def run(self) -> None:
+        """Main search entrypoint. Reads VELIX_USER_ID from runtime env."""
+        # Validate query parameter
         query: str = self.params.get("query", "").strip()
         if not query:
             self._report_error("query is required")
             return
 
+        # Read and validate session_id from runtime environment (VELIX_USER_ID)
+        session_id = str(self.user_id or "").strip()
+        if not session_id:
+            self._report_error("VELIX_USER_ID not set in environment")
+            return
+
+        # Parse session type (proc or normal user session)
+        proc_parts = self._parse_proc_session(session_id)
+        is_proc = proc_parts is not None
+
+        # Validate session_id format
+        if not is_proc and not self._is_session_id(session_id):
+            self._report_error(
+                "VELIX_USER_ID must be a session id (superuser_sN) or proc session (proc_<pid>_...)"
+            )
+            return
+
+        # Determine tenant key for per-tenant index DB
+        if is_proc:
+            tenant_key = session_id
+        else:
+            tenant_key = self._extract_super_user(session_id)
+
+        # Set per-tenant index DB path with sanitization
+        sanitized_tenant = _sanitize_filename(tenant_key)
+        self.index_db = self.index_search_dir / f"{sanitized_tenant}.db"
+
+        # Read and validate mode parameter
+        mode: str = self.params.get("mode", "session").strip()
+        if mode not in ("session", "user"):
+            self._report_error("mode must be 'session' or 'user'")
+            return
+
+        # Procs can only use session mode
+        if is_proc and mode == "user":
+            self._report_error("proc sessions may only use mode='session'")
+            return
+
+        # Parse limit parameter
         limit: int = int(self.params.get("limit", _DEFAULT_LIMIT))
         limit = max(1, min(limit, _MAX_LIMIT))
-        mode: str = self.params.get("mode", "all")
-        user_id: str = self.params.get("user_id", "")
-        since_hours: float = float(self.params.get("since_hours", 0))
 
         try:
+            # Open per-tenant index DB
             conn = self._open_db()
-            self._update_index(conn, user_id, mode)
 
-            since_ms = 0
-            if since_hours > 0:
-                since_ms = int((time.time() - since_hours * 3600) * 1000)
+            # Check FTS5 availability
+            if not self._check_fts5_availability(conn):
+                self._report_error(
+                    "FTS5/bm25 not available in sqlite build; "
+                    "ensure sqlite is compiled with SQLITE_ENABLE_FTS5"
+                )
+                conn.close()
+                return
 
+            # Update index with appropriate scope
+            self._update_index(conn, session_id, mode, is_proc, tenant_key)
+
+            # Build FTS5 query with mode-based filtering
             sql = """
                 SELECT
                     t.convo_id,
@@ -434,19 +531,18 @@ class SessionSearchTool(VelixProcess):
                 query,
             ]
 
-            if since_ms:
-                sql += " AND t.ts_ms >= ?"
-                sql_params.append(since_ms)
+            # Add convo filter based on mode and session type
+            if is_proc or mode == "session":
+                # Session mode: search only current session and its snapshots
+                sql += " AND (t.convo_id = ? OR t.convo_id GLOB ?)"
+                sql_params.append(session_id)
+                sql_params.append(session_id + "_h*")
+            else:
+                # User mode: search all sessions for the superuser and their snapshots
+                sql += " AND t.convo_id GLOB ?"
+                sql_params.append(tenant_key + "_s*")
 
-            if user_id:
-                if self._is_session_id(user_id) or self._parse_proc_session(user_id):
-                    sql += " AND (t.convo_id = ? OR t.convo_id GLOB ?)"
-                    sql_params.append(user_id)
-                    sql_params.append(user_id + "_h*")
-                else:
-                    sql += " AND t.convo_id GLOB ?"
-                    sql_params.append(user_id + "_s*")
-
+            # Order by relevance (bm25 score) and limit
             sql += " ORDER BY score LIMIT ?"
             sql_params.append(limit)
 
@@ -465,6 +561,12 @@ class SessionSearchTool(VelixProcess):
                 )
 
             conn.close()
+
+            # Set file permissions on index DB
+            try:
+                os.chmod(str(self.index_db), 0o600)
+            except Exception:
+                pass  # Best effort; don't fail if permissions can't be set
 
             self.report_result(
                 self.parent_pid,

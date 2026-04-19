@@ -276,7 +276,7 @@ class SessionManager {
 
   // ── Validation ────────────────────────────────────────────────────────
   static void validate_super_user_name(const std::string& super_user);
-  static uint64_t estimate_tokens(const std::string& text);
+  static uint64_t estimate_tokens(std::string_view text);
   static uint64_t estimate_request_tokens(const json& request_messages);
 };
 

@@ -1,7 +1,7 @@
 {
   "name": "terminal",
   "type": "tool",
-  "description": "Execute commands. Supports building persistent environments (like keeping a real terminal tab open) or running background tasks.",
+  "description": "Execute shell commands. Two modes: pty=false for one-shot execution, pty=true for persistent interactive sessions that preserve state (cwd, environment, history) across calls.",
   "runtime": "cpp",
   "workdir": ".",
   "prepare": [
@@ -25,36 +25,36 @@
     "properties": {
       "cmd": {
         "type": "string",
-        "description": "Base command to execute (e.g. 'python3', 'git', 'npm')"
+        "description": "Command to execute. For pty=false: binary name only (e.g., 'npm', 'git', 'python3'). For pty=true: command to run in persistent shell (e.g., 'npm install', 'cd src', 'pwd')."
       },
       "args": {
         "type": "array",
         "items": {
           "type": "string"
         },
-        "description": "Argument list passed to cmd"
+        "description": "Command arguments (pty=false mode only). Pass args separately instead of in cmd string."
       },
       "timeout_sec": {
         "type": "number",
-        "description": "Execution timeout in seconds. 0 means no timeout. In background mode this caps the running process duration."
+        "description": "Execution timeout in seconds. 0 means no timeout (default for pty=true). In background mode, caps the running process duration."
       },
       "cwd": {
         "type": "string",
-        "description": "Optional path used as working directory. For PTY mode, this is relative to playground_root; otherwise it is resolved from the current working directory."
+        "description": "Working directory override. For pty=true: relative to playground_root. First call auto-cds here; subsequent calls preserve session cwd unless this parameter is passed."
       },
       "session_name": {
         "type": "string",
-        "description": "A 'name tag' for a persistent window (e.g. 'work'). When you use the same name, we reuse that specific window so it remembers your previous folder (cd) and variables (export) exactly."
+        "description": "REQUIRED for pty=true. Session identifier (e.g., 'build', 'debug'). Different names = independent shells. Same name = reuse shell with preserved state."
       },
       "background": {
         "type": "boolean",
         "default": false,
-        "description": "Run in the background. Returns immediately and lets the task finish on its own. Use this for starting long-running processes. And it will notify you when done."
+        "description": "Async execution. true=return immediately with status 'background', notify on completion. false=wait for completion."
       },
       "pty": {
         "type": "boolean",
         "default": false,
-        "description": "Interactive mode. Creates a 'persistent window' and remembers your context. Use this if you want subsequent calls to continue where the last one left off."
+        "description": "Execution mode. false=one-shot (simple execution, no state), true=persistent interactive shell (state preserved across calls via session_name)."
       }
     },
     "required": [

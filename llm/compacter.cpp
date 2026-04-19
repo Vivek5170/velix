@@ -30,21 +30,21 @@ struct CompacterConfig {
   int summary_source_pid{1000};
 };
 
-bool is_transient_summary_error(const std::string &error_text) {
-  return error_text.find("Recv timeout") != std::string::npos ||
+bool is_transient_summary_error(std::string_view error_text) {
+  return error_text.find("Recv timeout") != std::string_view::npos ||
          error_text.find("Resource temporarily unavailable") !=
-             std::string::npos ||
-         error_text.find("errno 11") != std::string::npos ||
+             std::string_view::npos ||
+         error_text.find("errno 11") != std::string_view::npos ||
          error_text.find("scheduler_request_deadline_exceeded") !=
-             std::string::npos ||
-         error_text.find("deadline_exceeded") != std::string::npos;
+             std::string_view::npos ||
+         error_text.find("deadline_exceeded") != std::string_view::npos;
 }
 
-std::string classify_summary_skip_reason(const std::string &error_text) {
+std::string classify_summary_skip_reason(std::string_view error_text) {
   if (is_transient_summary_error(error_text)) {
     return "summary_queue_timeout";
   }
-  if (error_text.find("Scheduler summarization failed:") != std::string::npos) {
+  if (error_text.find("Scheduler summarization failed:") != std::string_view::npos) {
     return "summary_model_error";
   }
   return "summary_generation_failed";
@@ -67,7 +67,8 @@ int load_scheduler_wait_timeout_ms() {
     model_file >> model;
     const int request_timeout_ms = model.value("request_timeout_ms", 60000);
     return request_timeout_ms + 5000;
-  } catch (...) {
+  } catch (const std::exception &e) {
+    // Failed to parse model.json or retrieve request_timeout_ms; use default
     return 65000;
   }
 }
@@ -88,7 +89,7 @@ std::string now_iso8601() {
   return oss.str();
 }
 
-std::string random_id(const std::string &prefix) {
+std::string random_id(std::string_view prefix) {
   static thread_local std::mt19937_64 rng{std::random_device{}()};
   const auto ticks =
       std::chrono::steady_clock::now().time_since_epoch().count();
@@ -150,8 +151,8 @@ CompacterConfig load_compacter_config() {
 
   // Prevent compacter-side timeout from expiring before scheduler-side wait.
   const int scheduler_wait_timeout_ms = load_scheduler_wait_timeout_ms();
-  const int aligned_timeout_ms = scheduler_wait_timeout_ms + 2000;
-  if (cfg.scheduler_timeout_ms < aligned_timeout_ms) {
+  if (const int aligned_timeout_ms = scheduler_wait_timeout_ms + 2000;
+      cfg.scheduler_timeout_ms < aligned_timeout_ms) {
     LOG_INFO("Raising compacter scheduler_timeout_ms from " +
              std::to_string(cfg.scheduler_timeout_ms) + " to " +
              std::to_string(aligned_timeout_ms) +
@@ -178,7 +179,8 @@ int load_scheduler_port() {
     nlohmann::json ports;
     ports_file >> ports;
     return ports.value("LLM_SCHEDULER", 5171);
-  } catch (...) {
+  } catch (const std::exception &e) {
+    // Failed to parse ports.json or retrieve LLM_SCHEDULER port; use default
     return 5171;
   }
 }

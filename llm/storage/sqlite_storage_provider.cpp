@@ -17,7 +17,7 @@ json parse_json_or_default(const std::string &raw, const json &fallback) {
   }
   try {
     return json::parse(raw);
-  } catch (...) {
+  } catch (const std::exception &) {
     return fallback;
   }
 }
@@ -34,10 +34,11 @@ SqliteStorageProvider::SqliteStorageProvider(std::string db_path)
 SqliteStorageProvider::~SqliteStorageProvider() { close_db(); }
 
 bool SqliteStorageProvider::open_db() {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   try {
     fs::create_directories(fs::path(db_path_).parent_path());
-  } catch (...) {
+  } catch (const fs::filesystem_error &) {
+    // Directory creation failed, continue anyway
   }
 
   if (sqlite3_open(db_path_.c_str(), &db_) != SQLITE_OK) {
@@ -60,7 +61,7 @@ bool SqliteStorageProvider::open_db() {
 }
 
 void SqliteStorageProvider::close_db() {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   if (db_) {
     sqlite3_close(db_);
     db_ = nullptr;
@@ -83,7 +84,7 @@ bool SqliteStorageProvider::exec_sql(const std::string &sql) {
 }
 
 bool SqliteStorageProvider::ensure_schema() {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   return exec_sql(
       "CREATE TABLE IF NOT EXISTS conversations ("
       "convo_id TEXT PRIMARY KEY,"
@@ -125,7 +126,7 @@ bool SqliteStorageProvider::ensure_schema() {
 }
 
 bool SqliteStorageProvider::upsert_conversation(const json &conversation) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   const char *sql =
       "INSERT INTO conversations("
       "convo_id,user_id,creator_pid,state,created_at_ms,last_activity_ms,"
@@ -187,7 +188,7 @@ bool SqliteStorageProvider::upsert_conversation(const json &conversation) {
 }
 
 std::optional<json> SqliteStorageProvider::get_conversation(const std::string &convo_id) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   const char *sql =
       "SELECT convo_id,user_id,creator_pid,state,created_at_ms,last_activity_ms,"
       "turn_count,current_context_tokens,total_tokens_used,messages_json,metadata_json "
@@ -231,7 +232,7 @@ std::optional<json> SqliteStorageProvider::get_conversation(const std::string &c
 
 bool SqliteStorageProvider::delete_conversation(const std::string &convo_id,
                                                 int creator_pid_hint) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   const char *sql = (creator_pid_hint > 0)
                         ? "DELETE FROM conversations WHERE convo_id=? AND creator_pid=?;"
                         : "DELETE FROM conversations WHERE convo_id=?;";
@@ -249,7 +250,7 @@ bool SqliteStorageProvider::delete_conversation(const std::string &convo_id,
 }
 
 void SqliteStorageProvider::delete_all_proc_convos(int creator_pid) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   const char *sql = "DELETE FROM conversations WHERE creator_pid=?;";
   sqlite3_stmt *stmt = nullptr;
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -261,7 +262,7 @@ void SqliteStorageProvider::delete_all_proc_convos(int creator_pid) {
 }
 
 std::vector<std::string> SqliteStorageProvider::list_proc_convo_ids(int creator_pid) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   std::vector<std::string> ids;
   const char *sql =
       "SELECT convo_id FROM conversations WHERE creator_pid=? ORDER BY convo_id;";
@@ -281,7 +282,7 @@ std::vector<std::string> SqliteStorageProvider::list_proc_convo_ids(int creator_
 }
 
 std::vector<int> SqliteStorageProvider::list_proc_creator_pids() {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   std::vector<int> pids;
   const char *sql =
       "SELECT DISTINCT creator_pid FROM conversations WHERE creator_pid > 0 ORDER BY creator_pid;";
@@ -297,7 +298,7 @@ std::vector<int> SqliteStorageProvider::list_proc_creator_pids() {
 }
 
 bool SqliteStorageProvider::upsert_super_user(const std::string &super_user) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   const char *sql =
       "INSERT INTO super_users(super_user) VALUES (?) "
       "ON CONFLICT(super_user) DO NOTHING;";
@@ -312,7 +313,7 @@ bool SqliteStorageProvider::upsert_super_user(const std::string &super_user) {
 }
 
 bool SqliteStorageProvider::delete_super_user(const std::string &super_user) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   const char *sql = "DELETE FROM super_users WHERE super_user=?;";
   sqlite3_stmt *stmt = nullptr;
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -348,7 +349,7 @@ bool SqliteStorageProvider::delete_super_user(const std::string &super_user) {
 }
 
 std::vector<std::string> SqliteStorageProvider::list_super_users() {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   std::vector<std::string> users;
   const char *sql = "SELECT super_user FROM super_users ORDER BY super_user;";
   sqlite3_stmt *stmt = nullptr;
@@ -368,7 +369,7 @@ std::vector<std::string> SqliteStorageProvider::list_super_users() {
 bool SqliteStorageProvider::upsert_session_index_entry(
     const std::string &super_user, const std::string &session_id,
     const std::string &title) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
 
   sqlite3_stmt *stmt = nullptr;
@@ -411,7 +412,7 @@ bool SqliteStorageProvider::upsert_session_index_entry(
 bool SqliteStorageProvider::delete_session_index_entry(
     const std::string &super_user, const std::string &session_id) {
   (void)super_user;
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   const char *sql = "DELETE FROM session_index WHERE session_id=?;";
   sqlite3_stmt *stmt = nullptr;
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -425,7 +426,7 @@ bool SqliteStorageProvider::delete_session_index_entry(
 
 std::vector<json> SqliteStorageProvider::list_session_index_entries(
     const std::string &super_user) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   std::vector<json> out;
   const char *sql =
       "SELECT session_id, title FROM session_index "
@@ -436,8 +437,8 @@ std::vector<json> SqliteStorageProvider::list_session_index_entries(
   }
   sqlite3_bind_text(stmt, 1, super_user.c_str(), -1, SQLITE_TRANSIENT);
   while (sqlite3_step(stmt) == SQLITE_ROW) {
-    const char *sid = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0));
-    const char *title = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
+    auto sid = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0));
+    auto title = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
     out.push_back(json{{"session_id", sid ? sid : ""},
                        {"title", title ? title : ""}});
   }
@@ -446,8 +447,8 @@ std::vector<json> SqliteStorageProvider::list_session_index_entries(
 }
 
 bool SqliteStorageProvider::append_snapshot(const std::string &session_id,
-                                            const json &snapshot) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+                                             const json &snapshot) {
+  std::scoped_lock lock(db_mutex_);
   sqlite3_stmt *stmt = nullptr;
   const char *next_sql =
       "SELECT COALESCE(MAX(snapshot_n),0)+1 FROM session_snapshots "
@@ -480,7 +481,7 @@ bool SqliteStorageProvider::append_snapshot(const std::string &session_id,
 }
 
 int SqliteStorageProvider::snapshot_count(const std::string &session_id) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   sqlite3_stmt *stmt = nullptr;
   if (sqlite3_prepare_v2(
           db_, "SELECT COUNT(*) FROM session_snapshots WHERE session_id=?;", -1,
@@ -497,7 +498,7 @@ int SqliteStorageProvider::snapshot_count(const std::string &session_id) {
 }
 
 bool SqliteStorageProvider::delete_snapshots(const std::string &session_id) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   sqlite3_stmt *stmt = nullptr;
   if (sqlite3_prepare_v2(
           db_, "DELETE FROM session_snapshots WHERE session_id=?;", -1, &stmt,
@@ -512,7 +513,7 @@ bool SqliteStorageProvider::delete_snapshots(const std::string &session_id) {
 
 bool SqliteStorageProvider::delete_snapshots_for_super_user(
     const std::string &super_user) {
-  std::lock_guard<std::mutex> lock(db_mutex_);
+  std::scoped_lock lock(db_mutex_);
   const std::string pattern = super_user + "_s%";
   sqlite3_stmt *stmt = nullptr;
   if (sqlite3_prepare_v2(

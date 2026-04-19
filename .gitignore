@@ -76,6 +76,7 @@ Thumbs.db
 # Environment variables
 .env
 
+.ruff_cache
 kill_all.sh
 memory/user.md
 memory/conversations/

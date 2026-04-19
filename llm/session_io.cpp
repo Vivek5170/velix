@@ -87,7 +87,8 @@ long load_process_convo_ttl_ms() {
 		const long ttl_sec =
 		    cfg.value("conversation", json::object()).value("process_convo_ttl_sec", 86400L);
 		return ttl_sec * 1000L;
-	} catch (...) {
+	} catch (const std::exception &e) {
+		// Failed to parse conversation config; use default TTL
 		return 86400L * 1000L;
 	}
 }
@@ -154,7 +155,9 @@ std::string scan_content_for_threats(const std::string& content, const std::stri
 				LOG_WARN_CTX("Threat detected in " + filename + ": " + pid, "prompt_safety", "", -1, "blocked_content");
 				return "[BLOCKED: " + filename + " contained potential prompt injection (" + pid + "). Content not loaded.]";
 			}
-		} catch (...) {}
+		} catch (const std::regex_error&) {
+			// Regex matching failed; skip threat check for this pattern
+		}
 	}
 	return content;
 }
@@ -209,7 +212,7 @@ SessionIO::SessionIO(std::shared_ptr<storage::IStorageProvider> storage,
 
 SessionIO::~SessionIO() {
 	{
-		std::lock_guard<std::mutex> lock(cleanup_mutex_);
+		std::scoped_lock<std::mutex> lock(cleanup_mutex_);
 		stop_cleanup_ = true;
 	}
 	cleanup_cv_.notify_all();
@@ -221,12 +224,14 @@ SessionIO::~SessionIO() {
 // ── Path helpers ───────────────────────────────────────────────────────────
 
 std::string SessionIO::user_convo_path(const std::string& session_id) const {
-	const std::string super_user = SessionManager::extract_super_user(session_id);
+	const auto super_user = SessionManager::extract_super_user(session_id);
 	
-	const std::string session_dir = storage_path_ + "/users/" + super_user + "/" + session_id;
+	const auto session_dir = storage_path_ + "/users/" + super_user + "/" + session_id;
 	try {
 		std::filesystem::create_directories(session_dir);
-	} catch (...) {}
+	} catch (const std::filesystem::filesystem_error&) {
+		// Failed to create directory; session_dir may not be writable
+	}
 	
 	return session_dir + "/" + session_id + ".json";
 }
@@ -236,7 +241,9 @@ std::string SessionIO::process_convo_path(int creator_pid,
 	const std::string session_dir = storage_path_ + "/procs/" + std::to_string(creator_pid) + "/" + convo_id;
 	try {
 		std::filesystem::create_directories(session_dir);
-	} catch (...) {}
+	} catch (const std::filesystem::filesystem_error&) {
+		// Failed to create directory; session_dir may not be writable
+	}
 	return session_dir + "/" + convo_id + ".json";
 }
 
@@ -391,7 +398,7 @@ std::string SessionIO::build_layered_system_prompt(
 			}
 			combined += "\nNOTE: If you request an unavailable skill, the tool may return helpful nearest matches.";
 		}
-	} catch (...) {
+	} catch (const std::exception &e) {
 		// Silently ignore skill loading errors; system prompt assembly should not fail
 	}
 	
@@ -425,7 +432,9 @@ json SessionIO::load_sampling_params() const {
 		if (cfg.contains("default_sampling_params") && cfg["default_sampling_params"].is_object()) {
 			return cfg["default_sampling_params"];
 		}
-	} catch (...) {}
+	} catch (const std::exception &e) {
+		// Failed to parse model.json or load sampling params; use defaults
+	}
 	return defaults;
 }
 
@@ -554,7 +563,7 @@ Conversation SessionIO::get_or_create_user_convo(const std::string& user_id) {
 	const std::string convo_id = session_id;
 	const std::string path     = user_convo_path(session_id);
 
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 
 	// Check cache
 	auto cache_it = convo_cache_.find(convo_id);
@@ -562,11 +571,22 @@ Conversation SessionIO::get_or_create_user_convo(const std::string& user_id) {
 		return cache_it->second;
 	}
 
-	// Check disk
+	// Check disk (filesystem JSON)
 	if (fs::exists(path)) {
 		Conversation existing = load_convo_from_path(path);
 		if (!existing.convo_id.empty()) {
 			convo_cache_[convo_id] = existing;
+			return existing;
+		}
+	}
+
+	// Check storage provider (SQLite if configured)
+	if (storage_) {
+		Conversation existing = load_conversation_from_disk_unlocked(convo_id);
+		if (!existing.convo_id.empty()) {
+			convo_cache_[convo_id] = existing;
+			LOG_INFO_CTX("Loaded existing user convo from storage for user_id=" + user_id, 
+			             "convo_mgr", "", -1, "load_user_convo");
 			return existing;
 		}
 	}
@@ -594,7 +614,7 @@ Conversation SessionIO::create_process_convo(int creator_pid) {
 		throw std::runtime_error("creator_pid must be positive for process conversations");
 	}
 
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 
 	Conversation convo;
 	convo.convo_id    = generate_process_convo_id(creator_pid);
@@ -614,7 +634,7 @@ Conversation SessionIO::create_process_convo(int creator_pid) {
 }
 
 Conversation SessionIO::get_conversation(const std::string& convo_id) {
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 	auto it = convo_cache_.find(convo_id);
 	if (it != convo_cache_.end()) {
 		return it->second;
@@ -630,7 +650,7 @@ void SessionIO::invalidate_conversation_cache(const std::string& convo_id) {
 	if (convo_id.empty()) {
 		return;
 	}
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 	convo_cache_.erase(convo_id);
 }
 
@@ -676,7 +696,7 @@ bool SessionIO::append_message(const std::string& convo_id,
                                          const std::string& content,
                                          uint64_t tokens_used,
                                          const json& extra_fields) {
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 	auto it = convo_cache_.find(convo_id);
 	Conversation convo = (it != convo_cache_.end())
 	                     ? it->second
@@ -697,7 +717,7 @@ bool SessionIO::append_message(const std::string& convo_id,
 }
 
 bool SessionIO::delete_conversation(const std::string& convo_id, int creator_pid) {
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 	try {
 		if (storage_) {
 			if (!storage_->delete_conversation(convo_id, creator_pid)) {
@@ -722,7 +742,7 @@ bool SessionIO::delete_conversation(const std::string& convo_id, int creator_pid
 
 void SessionIO::delete_process_convos_for_pid(int creator_pid) {
 	{
-		std::lock_guard<std::mutex> lock(convo_mutex_);
+		std::scoped_lock<std::mutex> lock(convo_mutex_);
 		for (auto it = convo_cache_.begin(); it != convo_cache_.end();) {
 			if (it->second.creator_pid == creator_pid) {
 				it = convo_cache_.erase(it);
@@ -749,7 +769,7 @@ void SessionIO::delete_process_convos_for_pid(int creator_pid) {
 }
 
 std::vector<std::string> SessionIO::get_process_convos_for_pid(int creator_pid) {
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 	if (storage_) {
 		return storage_->list_proc_convo_ids(creator_pid);
 	}
@@ -771,7 +791,7 @@ std::vector<std::string> SessionIO::get_process_convos_for_pid(int creator_pid) 
 }
 
 bool SessionIO::close_conversation(const std::string& convo_id) {
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 	auto it = convo_cache_.find(convo_id);
 	if (it != convo_cache_.end()) {
 		it->second.state = "CLOSED";
@@ -906,7 +926,7 @@ json SessionIO::build_conversation_messages_safely(const json& normalized_reques
 
 	Conversation convo;
 	{
-		std::lock_guard<std::mutex> lock(convo_mutex_);
+		std::scoped_lock<std::mutex> lock(convo_mutex_);
 		auto cache_it = convo_cache_.find(convo_id);
 		convo = (cache_it != convo_cache_.end())
 		            ? cache_it->second
@@ -918,14 +938,10 @@ json SessionIO::build_conversation_messages_safely(const json& normalized_reques
 	}
 
 	{
-		std::lock_guard<std::mutex> lock(convo_mutex_);
+		std::scoped_lock<std::mutex> lock(convo_mutex_);
 		if (!explicit_system_prompt.empty()) {
-			if (!convo.metadata.is_object()) {
-				convo.metadata = json::object();
-			}
-
 			if (system_prompt_override) {
-				convo.metadata["system_prompt"] = explicit_system_prompt;
+				// Clear old system messages from history
 				convo.messages.erase(
 				    std::remove_if(convo.messages.begin(), convo.messages.end(),
 				                   [](const json& msg) {
@@ -933,21 +949,19 @@ json SessionIO::build_conversation_messages_safely(const json& normalized_reques
 				                   }),
 				    convo.messages.end());
 
+				// Add new system message to history (ephemeral, not stored in metadata)
 				if (!append_message_unlocked(convo, "system", explicit_system_prompt, 0,
 				                            json::object())) {
 					throw std::runtime_error("failed to set overriding system prompt");
 				}
 			} else if (convo.messages.empty()) {
-				convo.metadata["system_prompt"] = explicit_system_prompt;
+				// First turn - add system message to history (ephemeral, not stored in metadata)
 				if (!append_message_unlocked(convo, "system", explicit_system_prompt, 0,
 				                            json::object())) {
 					throw std::runtime_error("failed to append initial system prompt");
 				}
-			} else if (!convo.metadata.contains("system_prompt") ||
-			           !convo.metadata["system_prompt"].is_string() ||
-			           convo.metadata["system_prompt"].get<std::string>().empty()) {
-				convo.metadata["system_prompt"] = explicit_system_prompt;
 			}
+			// Note: System prompts are ephemeral - not stored in metadata
 		}
 
 		for (const auto &input : pending_inputs) {
@@ -963,15 +977,9 @@ json SessionIO::build_conversation_messages_safely(const json& normalized_reques
 	json msgs = json::array();
 	// ── System message ─────────────────────────────────────────────────────
 	// Build via build_layered_system_prompt so soul+guidelines are always first.
-	// The stored_system_prompt (per-conversation custom persona set at start)
-	// is treated as a caller-supplied extension appended after the base layers.
+	// explicit_system_prompt (if provided) is appended after the base layers.
 	// If a system message is already in the persisted history we use that;
 	// otherwise we synthesise a fresh one so every API call is self-contained.
-	const std::string stored_system_prompt =
-	    (convo.metadata.is_object() && convo.metadata.contains("system_prompt") &&
-	     convo.metadata["system_prompt"].is_string())
-	        ? convo.metadata["system_prompt"].get<std::string>()
-	        : std::string("");
 
 	bool history_has_system = false;
 	for (const auto& msg : convo.messages) {
@@ -983,15 +991,9 @@ json SessionIO::build_conversation_messages_safely(const json& normalized_reques
 
 	if (!history_has_system) {
 		// No system message yet in history, synthesise the full layered one.
-		// Merge stored_system_prompt (conversation persona) + explicit_system_prompt
-		// (per-turn override). Both are appended after soul+guidelines.
-		std::string extra_for_prompt = stored_system_prompt;
-		if (!explicit_system_prompt.empty() && explicit_system_prompt != stored_system_prompt) {
-			if (!extra_for_prompt.empty()) extra_for_prompt += "\n\n";
-			extra_for_prompt += explicit_system_prompt;
-		}
+		// Use explicit_system_prompt (per-request, ephemeral).
 		const std::string full_sys =
-		    build_layered_system_prompt(mode, extra_for_prompt, convo.user_id);
+		    build_layered_system_prompt(mode, explicit_system_prompt, convo.user_id);
 		msgs.push_back({{"role", "system"}, {"content", full_sys}});
 	}
 
@@ -1019,7 +1021,7 @@ json SessionIO::build_conversation_messages_safely(const json& normalized_reques
 // ── normalize_llm_request ─────────────────────────────────────────────────
 
 json SessionIO::normalize_llm_request(const json& raw_request) {
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 
 	json normalized = raw_request;
 	const std::string mode = raw_request.value("mode", "");
@@ -1167,6 +1169,17 @@ Conversation SessionIO::get_or_create_user_convo_unlocked(const std::string& use
 			return existing;
 		}
 	}
+
+	// Check storage provider (SQLite if configured)
+	if (storage_) {
+		Conversation existing = load_conversation_from_disk_unlocked(convo_id);
+		if (!existing.convo_id.empty()) {
+			convo_cache_[convo_id] = existing;
+			return existing;
+		}
+	}
+
+	// Create new only if not found anywhere
 	Conversation convo;
 	convo.convo_id    = convo_id;
 	convo.user_id     = SessionManager::extract_super_user(session_id);
@@ -1191,7 +1204,7 @@ bool SessionIO::persist_assistant_response(const json& normalized_request,
 	const std::string convo_id = normalized_request.value("convo_id", "");
 	if (convo_id.empty()) { return false; }
 
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 	auto it = convo_cache_.find(convo_id);
 	Conversation convo = (it != convo_cache_.end())
 	                     ? it->second
@@ -1220,7 +1233,7 @@ bool SessionIO::persist_assistant_tool_call(
 		return false;
 	}
 
-	std::lock_guard<std::mutex> lock(convo_mutex_);
+	std::scoped_lock<std::mutex> lock(convo_mutex_);
 	auto it = convo_cache_.find(convo_id);
 	Conversation convo = (it != convo_cache_.end())
 	                     ? it->second
@@ -1292,7 +1305,7 @@ void SessionIO::cleanup_loop() {
 				if (!pid_entry.is_directory()) { continue; }
 				int pid = -1;
 				try { pid = std::stoi(pid_entry.path().filename().string()); }
-				catch (...) { continue; }
+				catch (const std::exception &e) { continue; }
 
 				long most_recent = 0;
 				for (const auto& session_entry : fs::directory_iterator(pid_entry.path())) {
@@ -1308,7 +1321,9 @@ void SessionIO::cleanup_loop() {
 							f >> j;
 							const long act = j.value("last_activity_ms", 0L);
 							if (act > most_recent) { most_recent = act; }
-						} catch (...) {}
+						} catch (const std::exception &e) {
+							// Failed to parse JSON file; skip it
+						}
 					}
 				}
 				if (most_recent > 0 && (now_ms - most_recent) >= ttl_ms) {

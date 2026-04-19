@@ -1,17 +1,5 @@
 /**
  * application_manager.cpp
- *
- * Network service wrapping TerminalRegistry.
- *
- * Fixes from original:
- *  BUG-22 — stop() join_watchdog() called only once via atomic flag.
- *  BUG-23 — Auth token comparison uses constant-time compare.
- *  BUG-20 — EXECUTE now accepts a full driver_config JSON blob so SSH/Docker
- *            params flow through cleanly.
- *  NEW    — CANCEL_JOB message type added.
- *  NEW    — driver_config JSON field parsed into DriverConfig and passed
- *            to registry->get_or_create().
- *
  * ── Wire protocol ────────────────────────────────────────────────────────────
  *
  *  All messages are newline-framed JSON.  Each request → one response.
@@ -71,12 +59,14 @@
 #include "../../vendor/nlohmann/json.hpp"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstring>   // for memcmp (constant-time auth)
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 
 using json = nlohmann::json;
@@ -104,16 +94,16 @@ struct AppManagerConfig {
     std::string auth_token;
 };
 
-static AppManagerConfig load_config() {
+AppManagerConfig load_config() {
     AppManagerConfig cfg;
-    const char *paths[] = {
+    constexpr std::array<std::string_view, 3> paths = {
         "config/application_manager.json",
         "../config/application_manager.json",
         "build/config/application_manager.json"
     };
     std::ifstream file;
-    for (const char *p : paths) {
-        file.open(p);
+    for (const auto &p : paths) {
+        file.open(std::string(p));
         if (file.is_open()) break;
     }
     if (!file.is_open()) {
@@ -133,9 +123,12 @@ static AppManagerConfig load_config() {
         cfg.require_auth_token    = j.value("require_auth_token",    cfg.require_auth_token);
         cfg.auth_token            = j.value("auth_token",            cfg.auth_token);
         LOG_INFO_CTX("Loaded application_manager config", "app_manager", "", -1, "config_loaded");
-    } catch (const std::exception &e) {
+    } catch (const json::exception &e) {
         LOG_ERROR_CTX(std::string("Failed to parse application_manager.json: ") + e.what(),
                       "app_manager", "", -1, "config_parse_error");
+    } catch (const std::exception &e) {
+        LOG_ERROR_CTX(std::string("Unexpected error loading config: ") + e.what(),
+                      "app_manager", "", -1, "config_error");
     }
     return cfg;
 }
@@ -144,7 +137,7 @@ static AppManagerConfig load_config() {
 // Constant-time string compare (BUG-23 fix)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static bool constant_time_equal(const std::string &a, const std::string &b) {
+bool constant_time_equal(const std::string &a, const std::string &b) {
     if (a.size() != b.size()) return false;
     // XOR all bytes; result is 0 iff all equal.
     unsigned char result = 0;
@@ -157,12 +150,12 @@ static bool constant_time_equal(const std::string &a, const std::string &b) {
 // Expected-disconnect noise check
 // ─────────────────────────────────────────────────────────────────────────────
 
-static bool is_expected_disconnect(const std::string &err) {
-    return err.find("Broken pipe")       != std::string::npos ||
-           err.find("connection closed") != std::string::npos ||
-           err.find("Connection reset")  != std::string::npos ||
-           err.find("errno 32")          != std::string::npos ||
-           err.find("errno 104")         != std::string::npos;
+bool is_expected_disconnect(std::string_view err) {
+    return err.find("Broken pipe")       != std::string_view::npos ||
+           err.find("connection closed") != std::string_view::npos ||
+           err.find("Connection reset")  != std::string_view::npos ||
+           err.find("errno 32")          != std::string_view::npos ||
+           err.find("errno 104")         != std::string_view::npos;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,7 +222,11 @@ public:
 
                     const bool submitted = thread_pool_.try_submit(
                         [this, client_ptr]() mutable {
-                            try { handle_client(std::move(*client_ptr)); } catch (...) {}
+                            try { handle_client(std::move(*client_ptr)); }
+                            catch (...) {
+                                // Suppress all errors from client handler to prevent worker thread
+                                // from crashing; errors are already logged by handle_client.
+                            }
                         });
 
                     if (!submitted) {
@@ -238,7 +235,10 @@ public:
                             json busy = {{"status", "error"},
                                          {"error", "app_manager busy: thread pool full"}};
                             velix::communication::send_json(*client_ptr, busy.dump());
-                        } catch (...) {}
+                        } catch (...) {
+                            // Suppress errors from rejection message send to prevent accept loop from
+                            // crashing; client will simply timeout if rejection can't be delivered.
+                        }
                     }
                 } catch (const std::exception &e) {
                     if (!running_) break;
@@ -290,7 +290,7 @@ private:
     std::atomic<bool> running_{false};
 
     // BUG-22 fix: track whether watchdog has been joined to prevent UB on
-    // calling join() twice.
+    // calling join() twice. (TODO: replace with std::jthread when upgrading to C++20)
     std::mutex        watchdog_joined_mx_;
     bool              watchdog_joined_ = false;
     std::thread       watchdog_thread_;

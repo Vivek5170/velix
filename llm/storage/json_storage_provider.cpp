@@ -14,9 +14,9 @@ namespace velix::llm::storage {
 JsonStorageProvider::JsonStorageProvider(std::string storage_root)
     : storage_root_(std::move(storage_root)) {
   try {
-    fs::create_directories(storage_root_ + "/users");
-    fs::create_directories(storage_root_ + "/procs");
-  } catch (const std::exception &e) {
+    fs::create_directories(fs::path(storage_root_) / "users");
+    fs::create_directories(fs::path(storage_root_) / "procs");
+  } catch (const fs::filesystem_error &e) {
     LOG_ERROR_CTX(std::string("JsonStorageProvider init failed: ") + e.what(),
                   "storage", "", -1, "json_storage_init_error");
   }
@@ -50,7 +50,9 @@ json JsonStorageProvider::load_index_unlocked() const {
         idx["users"] = json::object();
       }
       return idx;
-    } catch (...) {
+    } catch (const std::exception &) {
+      // Failed to parse index file, try next path
+      continue;
     }
   }
   return json{{"users", json::object()}};
@@ -66,22 +68,23 @@ bool JsonStorageProvider::save_index_unlocked(const json &idx) const {
     }
     out << idx.dump(2);
     return true;
-  } catch (...) {
+  } catch (const std::exception &) {
+    // Failed to save index file
     return false;
   }
 }
 
 std::string JsonStorageProvider::user_convo_path(const std::string &session_id) const {
   const std::string super_user = velix::llm::SessionManager::extract_super_user(session_id);
-  const std::string session_dir = storage_root_ + "/users/" + super_user + "/" + session_id;
-  return session_dir + "/" + session_id + ".json";
+  const fs::path session_dir = fs::path(storage_root_) / "users" / super_user / session_id;
+  return (session_dir / (session_id + ".json")).string();
 }
 
 std::string JsonStorageProvider::process_convo_path(int creator_pid,
                                                     const std::string &convo_id) const {
-  const std::string session_dir =
-      storage_root_ + "/procs/" + std::to_string(creator_pid) + "/" + convo_id;
-  return session_dir + "/" + convo_id + ".json";
+  const fs::path session_dir =
+      fs::path(storage_root_) / "procs" / std::to_string(creator_pid) / convo_id;
+  return (session_dir / (convo_id + ".json")).string();
 }
 
 std::string JsonStorageProvider::infer_convo_path(const std::string &convo_id,
@@ -101,7 +104,10 @@ std::string JsonStorageProvider::infer_convo_path(const std::string &convo_id,
       try {
         const int creator_pid = std::stoi(rest.substr(0, sep));
         return process_convo_path(creator_pid, convo_id);
-      } catch (...) {
+      } catch (const std::invalid_argument &) {
+        // Failed to parse process ID
+      } catch (const std::out_of_range &) {
+        // Process ID out of range
       }
     }
   }
@@ -110,7 +116,7 @@ std::string JsonStorageProvider::infer_convo_path(const std::string &convo_id,
 }
 
 bool JsonStorageProvider::upsert_conversation(const json &conversation) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   try {
     const std::string convo_id = conversation.value("convo_id", "");
     const int creator_pid = conversation.value("creator_pid", -1);
@@ -135,7 +141,7 @@ bool JsonStorageProvider::upsert_conversation(const json &conversation) {
 }
 
 std::optional<json> JsonStorageProvider::get_conversation(const std::string &convo_id) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   try {
     const std::string path = infer_convo_path(convo_id, -1);
     if (path.empty() || !fs::exists(path)) {
@@ -148,14 +154,15 @@ std::optional<json> JsonStorageProvider::get_conversation(const std::string &con
     json convo;
     in >> convo;
     return convo;
-  } catch (...) {
+  } catch (const std::exception &) {
+    // Failed to load conversation
     return std::nullopt;
   }
 }
 
 bool JsonStorageProvider::delete_conversation(const std::string &convo_id,
                                               int creator_pid_hint) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   try {
     const std::string path = infer_convo_path(convo_id, creator_pid_hint);
     if (path.empty()) {
@@ -165,19 +172,20 @@ bool JsonStorageProvider::delete_conversation(const std::string &convo_id,
       fs::remove(path);
     }
     return true;
-  } catch (...) {
+  } catch (const fs::filesystem_error &) {
+    // Failed to delete conversation
     return false;
   }
 }
 
 void JsonStorageProvider::delete_all_proc_convos(int creator_pid) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   try {
-    const std::string pid_dir = storage_root_ + "/procs/" + std::to_string(creator_pid);
+    const fs::path pid_dir = fs::path(storage_root_) / "procs" / std::to_string(creator_pid);
     if (fs::exists(pid_dir)) {
       fs::remove_all(pid_dir);
     }
-  } catch (const std::exception &e) {
+  } catch (const fs::filesystem_error &e) {
     LOG_ERROR_CTX(std::string("JsonStorageProvider delete_all_proc_convos failed: ") +
                       e.what(),
                   "storage", "", creator_pid, "json_storage_delete_pid_error");
@@ -185,10 +193,10 @@ void JsonStorageProvider::delete_all_proc_convos(int creator_pid) {
 }
 
 std::vector<std::string> JsonStorageProvider::list_proc_convo_ids(int creator_pid) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   std::vector<std::string> result;
   try {
-    const std::string pid_dir = storage_root_ + "/procs/" + std::to_string(creator_pid);
+    const fs::path pid_dir = fs::path(storage_root_) / "procs" / std::to_string(creator_pid);
     if (!fs::exists(pid_dir)) {
       return result;
     }
@@ -197,7 +205,7 @@ std::vector<std::string> JsonStorageProvider::list_proc_convo_ids(int creator_pi
         result.push_back(entry.path().filename().string());
       }
     }
-  } catch (const std::exception &e) {
+  } catch (const fs::filesystem_error &e) {
     LOG_ERROR_CTX(std::string("JsonStorageProvider list_proc_convo_ids failed: ") +
                       e.what(),
                   "storage", "", creator_pid, "json_storage_list_pid_error");
@@ -206,7 +214,7 @@ std::vector<std::string> JsonStorageProvider::list_proc_convo_ids(int creator_pi
 }
 
 std::vector<int> JsonStorageProvider::list_proc_creator_pids() {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   std::vector<int> pids;
   try {
     const fs::path proc_root = fs::path(storage_root_) / "procs";
@@ -219,10 +227,13 @@ std::vector<int> JsonStorageProvider::list_proc_creator_pids() {
       }
       try {
         pids.push_back(std::stoi(entry.path().filename().string()));
-      } catch (...) {
+      } catch (const std::invalid_argument &) {
+        // Invalid directory name format, skip
+      } catch (const std::out_of_range &) {
+        // PID out of range, skip
       }
     }
-  } catch (const std::exception &e) {
+  } catch (const fs::filesystem_error &e) {
     LOG_ERROR_CTX(std::string("JsonStorageProvider list_proc_creator_pids failed: ") +
                       e.what(),
                   "storage", "", -1, "json_storage_list_pids_error");
@@ -231,7 +242,7 @@ std::vector<int> JsonStorageProvider::list_proc_creator_pids() {
 }
 
 bool JsonStorageProvider::upsert_super_user(const std::string &super_user) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   try {
     fs::create_directories(fs::path(storage_root_) / "users" / super_user);
     fs::create_directories(fs::path(storage_root_).parent_path() / "agentfiles" /
@@ -242,13 +253,43 @@ bool JsonStorageProvider::upsert_super_user(const std::string &super_user) {
       idx["users"][super_user] = json::array();
     }
     return save_index_unlocked(idx);
-  } catch (...) {
+  } catch (const std::exception &) {
+    // Failed to upsert super user
     return false;
   }
 }
 
+void JsonStorageProvider::delete_session_snapshots_internal(const std::string &session_id) {
+  int n = 1;
+  while (true) {
+    const fs::path snap(snapshot_path(session_id, n));
+    if (!fs::exists(snap)) {
+      break;
+    }
+    fs::remove(snap);
+    ++n;
+  }
+}
+
+void JsonStorageProvider::list_index_entries_from_fs(const std::string &super_user,
+                                                     std::vector<json> &out) const {
+  const fs::path user_root = fs::path(storage_root_) / "users" / super_user;
+  if (!fs::exists(user_root) || !fs::is_directory(user_root)) {
+    return;
+  }
+  for (const auto &entry : fs::directory_iterator(user_root)) {
+    if (!entry.is_directory()) {
+      continue;
+    }
+    const std::string sid = entry.path().filename().string();
+    if (!sid.empty()) {
+      out.push_back(json{{"session_id", sid}, {"title", ""}});
+    }
+  }
+}
+
 bool JsonStorageProvider::delete_super_user(const std::string &super_user) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   bool existed = false;
   try {
     json idx = load_index_unlocked();
@@ -272,31 +313,26 @@ bool JsonStorageProvider::delete_super_user(const std::string &super_user) {
     }
 
     const fs::path user_root_for_snaps = fs::path(storage_root_) / "users" / super_user;
-    if (fs::exists(user_root_for_snaps) && fs::is_directory(user_root_for_snaps)) {
-      for (const auto &entry : fs::directory_iterator(user_root_for_snaps)) {
-        if (!entry.is_directory()) {
-          continue;
-        }
-        const std::string sid = entry.path().filename().string();
-        int n = 1;
-        while (true) {
-          const fs::path snap(snapshot_path(sid, n));
-          if (!fs::exists(snap)) {
-            break;
-          }
-          fs::remove(snap);
-          existed = true;
-          ++n;
-        }
-      }
+    if (!fs::exists(user_root_for_snaps) || !fs::is_directory(user_root_for_snaps)) {
+      return existed;
     }
-  } catch (...) {
+
+    for (const auto &entry : fs::directory_iterator(user_root_for_snaps)) {
+      if (!entry.is_directory()) {
+        continue;
+      }
+      const std::string sid = entry.path().filename().string();
+      delete_session_snapshots_internal(sid);
+      existed = true;
+    }
+  } catch (const fs::filesystem_error &) {
+    // Failed to delete super user
   }
   return existed;
 }
 
 std::vector<std::string> JsonStorageProvider::list_super_users() {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   std::vector<std::string> users;
   try {
     json idx = load_index_unlocked();
@@ -314,7 +350,8 @@ std::vector<std::string> JsonStorageProvider::list_super_users() {
         }
       }
     }
-  } catch (...) {
+  } catch (const fs::filesystem_error &) {
+    // Failed to list super users
   }
   std::sort(users.begin(), users.end());
   users.erase(std::unique(users.begin(), users.end()), users.end());
@@ -324,7 +361,7 @@ std::vector<std::string> JsonStorageProvider::list_super_users() {
 bool JsonStorageProvider::upsert_session_index_entry(const std::string &super_user,
                                                      const std::string &session_id,
                                                      const std::string &title) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   try {
     json idx = load_index_unlocked();
     if (!idx["users"].contains(super_user) || !idx["users"][super_user].is_array()) {
@@ -348,14 +385,15 @@ bool JsonStorageProvider::upsert_session_index_entry(const std::string &super_us
           json{{"session_id", session_id}, {"title", title}});
     }
     return save_index_unlocked(idx);
-  } catch (...) {
+  } catch (const std::exception &) {
+    // Failed to upsert session index entry
     return false;
   }
 }
 
 bool JsonStorageProvider::delete_session_index_entry(const std::string &super_user,
                                                      const std::string &session_id) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   try {
     json idx = load_index_unlocked();
     if (!idx["users"].contains(super_user) || !idx["users"][super_user].is_array()) {
@@ -379,18 +417,20 @@ bool JsonStorageProvider::delete_session_index_entry(const std::string &super_us
     idx["users"][super_user] = filtered;
     save_index_unlocked(idx);
     return existed;
-  } catch (...) {
+  } catch (const std::exception &) {
+    // Failed to delete session index entry
     return false;
   }
 }
 
 std::vector<json>
 JsonStorageProvider::list_session_index_entries(const std::string &super_user) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   std::vector<json> out;
   try {
     json idx = load_index_unlocked();
     if (!idx["users"].contains(super_user) || !idx["users"][super_user].is_array()) {
+      list_index_entries_from_fs(super_user, out);
       return out;
     }
     for (const auto &entry : idx["users"][super_user]) {
@@ -401,27 +441,17 @@ JsonStorageProvider::list_session_index_entries(const std::string &super_user) {
       }
     }
     if (out.empty()) {
-      const fs::path user_root = fs::path(storage_root_) / "users" / super_user;
-      if (fs::exists(user_root) && fs::is_directory(user_root)) {
-        for (const auto &entry : fs::directory_iterator(user_root)) {
-          if (!entry.is_directory()) {
-            continue;
-          }
-          const std::string sid = entry.path().filename().string();
-          if (!sid.empty()) {
-            out.push_back(json{{"session_id", sid}, {"title", ""}});
-          }
-        }
-      }
+      list_index_entries_from_fs(super_user, out);
     }
-  } catch (...) {
+  } catch (const fs::filesystem_error &) {
+    // Failed to list session index entries
   }
   return out;
 }
 
 bool JsonStorageProvider::append_snapshot(const std::string &session_id,
                                           const json &snapshot) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   try {
     int n = 1;
     while (fs::exists(snapshot_path(session_id, n))) {
@@ -435,13 +465,14 @@ bool JsonStorageProvider::append_snapshot(const std::string &session_id,
     }
     out << snapshot.dump(2);
     return true;
-  } catch (...) {
+  } catch (const std::exception &) {
+    // Failed to append snapshot
     return false;
   }
 }
 
 int JsonStorageProvider::snapshot_count(const std::string &session_id) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   int n = 0;
   while (fs::exists(snapshot_path(session_id, n + 1))) {
     ++n;
@@ -450,7 +481,7 @@ int JsonStorageProvider::snapshot_count(const std::string &session_id) {
 }
 
 bool JsonStorageProvider::delete_snapshots(const std::string &session_id) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   bool deleted = false;
   int n = 1;
   while (true) {
@@ -467,7 +498,7 @@ bool JsonStorageProvider::delete_snapshots(const std::string &session_id) {
 
 bool JsonStorageProvider::delete_snapshots_for_super_user(
     const std::string &super_user) {
-  std::lock_guard<std::mutex> lock(io_mutex_);
+  std::scoped_lock lock(io_mutex_);
   bool deleted = false;
   try {
     const fs::path user_root = fs::path(storage_root_) / "users" / super_user;
@@ -479,18 +510,11 @@ bool JsonStorageProvider::delete_snapshots_for_super_user(
         continue;
       }
       const std::string sid = entry.path().filename().string();
-      int n = 1;
-      while (true) {
-        const fs::path snap(snapshot_path(sid, n));
-        if (!fs::exists(snap)) {
-          break;
-        }
-        fs::remove(snap);
-        deleted = true;
-        ++n;
-      }
+      delete_session_snapshots_internal(sid);
+      deleted = true;
     }
-  } catch (...) {
+  } catch (const fs::filesystem_error &) {
+    // Failed to delete snapshots for super user
   }
   return deleted;
 }

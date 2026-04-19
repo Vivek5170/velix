@@ -59,7 +59,7 @@ void SessionManager::validate_super_user_name(const std::string &super_user) {
   }
 }
 
-uint64_t SessionManager::estimate_tokens(const std::string &text) {
+/* static */ uint64_t SessionManager::estimate_tokens(std::string_view text) {
   return static_cast<uint64_t>(text.size() / 4);
 }
 
@@ -174,7 +174,7 @@ json SessionManager::load_index() const {
     return out;
   }
 
-  std::lock_guard<std::mutex> lk(index_mutex_);
+  std::scoped_lock lk(index_mutex_);
   if (!fs::exists(index_path()))
     return json{{"users", json::object()}};
   try {
@@ -224,7 +224,7 @@ void SessionManager::index_upsert_session(const std::string &super_user,
     return;
   }
 
-  std::lock_guard<std::mutex> lk(index_mutex_);
+  std::scoped_lock lk(index_mutex_);
   json idx = [&]() {
     if (!fs::exists(index_path()))
       return json{{"users", json::object()}};
@@ -278,8 +278,9 @@ std::string SessionManager::next_session_id(const std::string &super_user) {
       const int n = std::stoi(sid.substr(pos + 2));
       if (n > max_n)
         max_n = n;
-    } catch (...) {
-    }
+       } catch (...) {
+         // Silently ignore if live session file cannot be parsed
+       }
   }
   return super_user + "_s" + std::to_string(max_n + 1);
 }
@@ -326,7 +327,7 @@ std::string SessionManager::create_super_user(const std::string &super_user) {
   fs::create_directories(storage_root_ + "/agentfiles/" + super_user);
 
   {
-    std::lock_guard<std::mutex> lk(index_mutex_);
+    std::scoped_lock lk(index_mutex_);
     json idx = json{{"users", json::object()}};
     if (fs::exists(index_path())) {
       try {
@@ -373,7 +374,7 @@ bool SessionManager::delete_session(const std::string &session_id) {
   }
 
   {
-    std::lock_guard<std::mutex> lk(index_mutex_);
+    std::scoped_lock lk(index_mutex_);
     json idx = json{{"users", json::object()}};
     if (fs::exists(index_path())) {
       try {
@@ -433,7 +434,7 @@ bool SessionManager::delete_super_user(const std::string &super_user) {
   bool removed = false;
 
   {
-    std::lock_guard<std::mutex> lk(index_mutex_);
+    std::scoped_lock lk(index_mutex_);
     json idx = load_index();
     if (idx.contains("users") && idx["users"].is_object() &&
         idx["users"].contains(super_user)) {
@@ -500,8 +501,9 @@ SessionManager::get_session_info(const std::string &session_id) const {
             convo.value("total_tokens_used", static_cast<uint64_t>(0));
         info.live_stats.turn_count = convo.value("turn_count", 0);
         info.live_stats.compacted = convo.value("compacted", false);
-      } catch (...) {
-      }
+                 } catch (...) {
+                   // Failed to parse snapshot index; skip numeric sorting
+                 }
     }
   }
 
@@ -607,8 +609,9 @@ SessionManager::list_sessions(const std::string &super_user) const {
                   if (pb != std::string::npos) {
                     nb = std::stoi(b.substr(pb + 2));
                   }
-                } catch (...) {
-                }
+               } catch (...) {
+                 // Failed to parse snapshot index; skip numeric sorting
+               }
                 if (na != nb) {
                   return na < nb;
                 }

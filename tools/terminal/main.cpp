@@ -79,6 +79,7 @@ namespace fs = std::filesystem;
 using namespace velix::core;
 using velix::app_manager::ExecResult;
 using velix::app_manager::DriverConfig;
+using velix::app_manager::TerminalDriver;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -113,9 +114,11 @@ static std::mutex &approval_mutex()  { static std::mutex mx; return mx; }
 
 static std::optional<std::string> read_env_var(const char *name) {
 #ifdef _WIN32
-    char *value = nullptr; std::size_t len = 0;
-    if (_dupenv_s(&value, &len, name) != 0 || !value) return std::nullopt;
-    std::string out(value); std::free(value); return out;
+    if (char *value = nullptr; _dupenv_s(&value, nullptr, name) != 0 || !value) {
+        return std::nullopt;
+    }
+    std::unique_ptr<char, decltype(&free)> buf(value, &free);
+    return std::string(value);
 #else
     if (const char *v = std::getenv(name)) return std::string(v);
     return std::nullopt;
@@ -123,17 +126,19 @@ static std::optional<std::string> read_env_var(const char *name) {
 }
 
 static void skill_log(const std::string &stage, const json &fields = json::object()) {
-    try {
-        std::scoped_lock lock(skill_log_mutex());
-        fs::create_directories("logs");
-        std::ofstream out("logs/approval_trace.log", std::ios::app);
-        if (!out.is_open()) return;
-        json record = {
-            {"ts_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::system_clock::now().time_since_epoch()).count()},
-            {"stage", stage}, {"fields", fields}};
-        out << record.dump() << "\n";
-    } catch (...) {}
+     try {
+         std::scoped_lock lock(skill_log_mutex());
+         fs::create_directories("logs");
+         std::ofstream out("logs/approval_trace.log", std::ios::app);
+         if (!out.is_open()) return;
+         json record = {
+             {"ts_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch()).count()},
+             {"stage", stage}, {"fields", fields}};
+         out << record.dump() << "\n";
+     } catch (const std::exception &) {
+         // Logging failures are non-critical; silently ignore to avoid disrupting execution
+     }
 }
 
 static std::string expand_home(const std::string &p) {
@@ -197,14 +202,16 @@ static TerminalConfig load_config(const std::string &path) {
             cfg.allow_path_escape = gb(s, "allow_path_escape", cfg.allow_path_escape);
         }
         if (j.contains("allowlist") && j["allowlist"].is_object()) {
-            auto &al = j["allowlist"];
-            cfg.permanent_path = gs(al, "permanent_path", cfg.permanent_path);
-            if (al.contains("entries") && al["entries"].is_array())
-                for (const auto &e : al["entries"])
-                    if (e.is_string()) cfg.entries.push_back(e.get<std::string>());
-        }
-    } catch (...) {}
-    return cfg;
+             auto &al = j["allowlist"];
+             cfg.permanent_path = gs(al, "permanent_path", cfg.permanent_path);
+             if (al.contains("entries") && al["entries"].is_array())
+                 for (const auto &e : al["entries"])
+                     if (e.is_string()) cfg.entries.push_back(e.get<std::string>());
+         }
+     } catch (const std::exception &) {
+         // Config parsing failed; use defaults
+     }
+     return cfg;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,7 +265,10 @@ static void approve_permanent(const std::string &key) {
 // Dangerous command detection
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct DangerPattern { std::string re, desc; };
+struct DangerPattern {
+    std::string re;
+    std::string desc;
+};
 
 // BUG-29 fix: removed `env` and `printenv` — reading env vars is legitimate.
 // BUG-28 fix: normalize_cmd now strips shell quotes so `rm -rf "/"` is caught.
@@ -341,26 +351,51 @@ static std::string normalize_cmd(const std::string &s) {
 }
 
 static DetectResult detect_dangerous(const std::string &cmd) {
-    const std::string norm = normalize_cmd(cmd);
-    for (const auto &dp : DANGEROUS_PATTERNS) {
-        try {
-            std::regex re(dp.re, std::regex::icase | std::regex::ECMAScript);
-            if (std::regex_search(norm, re))
-                return {true, dp.re, dp.desc};
-        } catch (const std::regex_error &) {}
-    }
-    return {};
+     const std::string norm = normalize_cmd(cmd);
+     for (const auto &dp : DANGEROUS_PATTERNS) {
+         try {
+             std::regex re(dp.re, std::regex::icase | std::regex::ECMAScript);
+             if (std::regex_search(norm, re))
+                 return {true, dp.re, dp.desc};
+         } catch (const std::regex_error &) {
+             // Malformed regex pattern; skip to next pattern
+         }
+     }
+     return {};
 }
 
 static std::string truncate_output(const std::string &s) {
-    size_t mx = skill_config().max_output_chars;
-    if (s.size() <= mx) return s;
-    size_t head = mx * 2 / 5;
-    size_t tail = mx - head;
-    size_t omit = s.size() - head - tail;
-    return s.substr(0, head) +
-           "\n... [TRUNCATED " + std::to_string(omit) + " chars] ...\n" +
-           s.substr(s.size() - tail);
+     size_t mx = skill_config().max_output_chars;
+     if (s.size() <= mx) return s;
+     size_t head = mx * 2 / 5;
+     size_t tail = mx - head;
+     size_t omit = s.size() - head - tail;
+     return s.substr(0, head) +
+            "\n... [TRUNCATED " + std::to_string(omit) + " chars] ...\n" +
+            s.substr(s.size() - tail);
+}
+
+static std::string trim_copy(const std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static bool is_interactive_shell_request(const std::string &cmd) {
+    const std::string t = trim_copy(cmd);
+    return t == "bash" || t == "sh" || t == "zsh" || t == "fish";
+}
+
+static std::string build_pty_exec_cmd(const std::string &full_cmd,
+                                      const fs::path &sandbox_cwd,
+                                      bool force_cwd_prefix) {
+    // Priority order:
+    // 1. If force_cwd_prefix is true (explicit cwd passed), always prepend cd
+    // 2. Otherwise, use command as-is (preserve session state)
+    if (!force_cwd_prefix) return full_cmd;
+    return "cd " + velix::app_manager::shell_quote(sandbox_cwd.string()) +
+           " && " + full_cmd;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -403,10 +438,47 @@ static std::string am_execute(const std::string &user_id,
     if (!session_name.empty()) req["session_name"] = session_name;
 
     json resp = json::parse(am_call(req, host, port));
-    if (resp.value("status", "") != "ok")
-        throw std::runtime_error("ApplicationManager EXECUTE error: " +
-                                 resp.value("error", "unknown"));
-    return resp.value("job_id", "");
+     if (resp.value("status", "") != "ok") {
+         throw std::runtime_error("ApplicationManager EXECUTE error: " +
+                                  resp.value("error", std::string("unknown")));
+     }
+     return resp.value("job_id", "");
+}
+
+// New helper: returns full EXECUTE response to check session_created flag
+static json am_execute_full(const std::string &user_id,
+                            const std::string &cmd,
+                            int timeout_sec,
+                            const std::string &host,
+                            int port,
+                            const std::string &session_name,
+                            const DriverConfig &dcfg) {
+    json driver_config_json = {
+        {"type",             dcfg.type},
+        {"shell",            dcfg.shell},
+        {"ssh_host",         dcfg.ssh_host},
+        {"ssh_port",         dcfg.ssh_port},
+        {"ssh_user",         dcfg.ssh_user},
+        {"ssh_key_path",     dcfg.ssh_key_path},
+        {"docker_container", dcfg.docker_container},
+        {"docker_user",      dcfg.docker_user},
+        {"docker_shell",     dcfg.docker_shell},
+    };
+    json req = {
+        {"message_type",  "EXECUTE"},
+        {"user_id",       user_id},
+        {"cmd",           cmd},
+        {"timeout_sec",   timeout_sec},
+        {"driver_config", driver_config_json}
+    };
+    if (!session_name.empty()) req["session_name"] = session_name;
+
+    json resp = json::parse(am_call(req, host, port));
+     if (resp.value("status", "") != "ok") {
+         throw std::runtime_error("ApplicationManager EXECUTE error: " +
+                                  resp.value("error", std::string("unknown")));
+     }
+     return resp;
 }
 
 // BUG-25 fix: poll with a hard deadline (job timeout + poll_grace_sec).
@@ -447,12 +519,12 @@ static json am_poll_until_done(const std::string &job_id,
                      {"output",     std::string("[tool] Poll failed: ") + e.what()}};
         }
 
-        if (resp.value("status", "") != "ok") {
-            resp["job_status"] = "error";
-            return resp;
-        }
-        const std::string job_status = resp.value("job_status", "error");
-        if (job_status != "running") return resp;
+         if (resp.value("status", "") != "ok") {
+             resp["job_status"] = "error";
+             return resp;
+         }
+         if (const std::string job_status = resp.value("job_status", "error");
+             job_status != "running") return resp;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
     }
@@ -477,6 +549,26 @@ static ApprovalResult approved_ok(const std::string &msg) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Execution context
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct ExecutionContext {
+    std::string uid;
+    std::string full_cmd;
+    std::string cmd;
+    std::vector<std::string> arg_list;
+    std::string session_name;
+    fs::path sandbox_cwd;
+    bool force_cwd_prefix;
+    int timeout_sec;
+    bool use_pty;
+    ApprovalResult approval;
+    std::string am_host;
+    int am_port;
+    DriverConfig dcfg;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TerminalTool
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -494,10 +586,11 @@ public:
         bool background   = params.value("background", false);
         std::string cwd         = params.value("cwd", "");
         std::string session_name = params.value("session_name", "");
+        const bool has_explicit_cwd = params.contains("cwd") && !cwd.empty();
 
-        int timeout_sec = params.value("timeout_sec",
-            use_pty ? 0 : skill_config().default_timeout_sec);
-        timeout_sec = std::clamp(timeout_sec, 0, skill_config().max_timeout_sec);
+         int timeout_sec = params.value("timeout_sec",
+             use_pty ? 0 : skill_config().default_timeout_sec);
+         timeout_sec = std::clamp(timeout_sec, 0, skill_config().max_timeout_sec);
 
         std::vector<std::string> arg_list;
         if (!use_pty && params.contains("args") && params["args"].is_array()) {
@@ -507,6 +600,10 @@ public:
 
         std::string full_cmd = cmd;
         for (const auto &a : arg_list) full_cmd += " " + a;
+
+        if (use_pty && is_interactive_shell_request(full_cmd)) {
+            return done_error("Refusing to run interactive shell command in PTY job mode (bash/sh/zsh/fish) because it never emits completion sentinel. Run concrete commands (e.g. 'pwd') in the existing session instead.");
+        }
 
         // Non-PTY mode: cmd must be a plain binary name (no spaces).
         if (!use_pty && cmd.find_first_of(" \t\n\r") != std::string::npos)
@@ -540,21 +637,25 @@ public:
             return done_error(std::string("Invalid cwd: ") + ex.what());
         }
 
-        if (background) {
-            run_background(uid, full_cmd, cmd, arg_list, session_name,
-                           sandbox_cwd, cwd, timeout_sec, use_pty,
-                           approval, am_host, am_port, dcfg);
-            return;
-        }
+         if (background) {
+             ExecutionContext ctx{
+                 uid, full_cmd, cmd, arg_list, session_name,
+                 sandbox_cwd, has_explicit_cwd, timeout_sec, use_pty,
+                 approval, am_host, am_port, dcfg
+             };
+             run_background(ctx);
+             return;
+         }
 
         if (use_pty) {
             run_pty_foreground(uid, full_cmd, session_name, sandbox_cwd,
+                               has_explicit_cwd,
                                timeout_sec, approval, am_host, am_port, dcfg);
             return;
         }
 
-        run_oneshot_foreground(cmd, arg_list, full_cmd, sandbox_cwd,
-                               timeout_sec, approval);
+        run_oneshot_direct(cmd, arg_list, sandbox_cwd,
+                           timeout_sec, dcfg, approval);
     }
 
 private:
@@ -562,13 +663,15 @@ private:
 
     DriverConfig resolve_driver_config() {
         // user_config is a JSON blob injected by the Supervisor into our params.
-        // Key: "user_driver_config" — a DriverConfig JSON object.
-        if (params.contains("user_driver_config") &&
-            params["user_driver_config"].is_object()) {
-            try {
-                return DriverConfig::from_json(params["user_driver_config"]);
-            } catch (...) {}
-        }
+         // Key: "user_driver_config" — a DriverConfig JSON object.
+         if (params.contains("user_driver_config") &&
+             params["user_driver_config"].is_object()) {
+             try {
+                 return DriverConfig::from_json(params["user_driver_config"]);
+             } catch (const std::exception &) {
+                 // Configuration parsing failed; fall back to legacy driver field
+             }
+         }
         // Legacy single-field driver hint.
         DriverConfig dcfg;
         dcfg.type = params.value("driver", "local_pty");
@@ -581,33 +684,55 @@ private:
                             const std::string &full_cmd,
                             const std::string &session_name,
                             const fs::path    &sandbox_cwd,
+                            bool               force_cwd_prefix,
                             int                timeout_sec,
                             const ApprovalResult &approval,
                             const std::string &am_host,
                             int                am_port,
-                            const DriverConfig &dcfg) {
+                             const DriverConfig &dcfg) {
         try {
-            // BUG-26 fix: always prepend cd to sandbox_cwd.
-            // sandbox_cwd is always absolute, and the PTY shell's cwd is
-            // unrelated to the sandbox, so we must set it explicitly.
-            const std::string exec_cmd =
-                "cd " + velix::app_manager::shell_quote(sandbox_cwd.string()) +
-                " && " + full_cmd;
+            // Get full EXECUTE response to check if session was just created
+            json exec_resp = am_execute_full(
+                uid, full_cmd, timeout_sec, am_host, am_port, session_name, dcfg);
+            
+            bool is_first_call = exec_resp.value("session_created", false);
+            
+            // Build exec command with proper cwd logic:
+            // - If explicit cwd passed (force_cwd_prefix), always prepend cd
+            // - Else if first call, auto-cd to playground_root
+            // - Else preserve session state (no cd)
+            std::string exec_cmd = full_cmd;
+            if (force_cwd_prefix) {
+                // Explicit cwd override
+                exec_cmd = "cd " + velix::app_manager::shell_quote(sandbox_cwd.string()) +
+                          " && " + full_cmd;
+            } else if (is_first_call) {
+                // First call: auto-cd to playground_root
+                exec_cmd = "cd " + velix::app_manager::shell_quote(sandbox_cwd.string()) +
+                          " && " + full_cmd;
+            }
+            // Else: use full_cmd as-is (preserve session state)
 
-            const std::string job_id = am_execute(
-                uid, exec_cmd, timeout_sec, am_host, am_port, session_name, dcfg);
-
+            const std::string job_id = exec_resp.value("job_id", "");
+            
             json final_resp = am_poll_until_done(
                 job_id, timeout_sec, skill_config().poll_interval_ms,
                 skill_config().poll_grace_sec, am_host, am_port);
 
-            const std::string job_status = final_resp.value("job_status", "error");
-            json result = {
-                {"status",    job_status == "finished" ? "ok"
-                             : job_status == "timeout" ? "timeout" : "error"},
-                {"exit_code", final_resp.value("exit_code", -1)},
-                {"output",    truncate_output(final_resp.value("output", ""))},
-                {"cwd",       sandbox_cwd.string()},
+             const std::string job_status = final_resp.value("job_status", "error");
+             std::string status_str;
+             if (job_status == "finished") {
+                 status_str = "ok";
+             } else if (job_status == "timeout") {
+                 status_str = "timeout";
+             } else {
+                 status_str = "error";
+             }
+             json result = {
+                 {"status",    status_str},
+                 {"exit_code", final_resp.value("exit_code", -1)},
+                 {"output",    truncate_output(final_resp.value("output", ""))},
+                 {"cwd",       sandbox_cwd.string()},
                 {"timed_out", job_status == "timeout"}
             };
             if (!approval.message.empty()) result["approval_note"] = approval.message;
@@ -617,20 +742,34 @@ private:
         }
     }
 
-    // ── One-shot foreground execution ─────────────────────────────────
+    // ── One-shot direct execution (foreground) ───────────────────────
 
-    void run_oneshot_foreground(const std::string &cmd,
-                                const std::vector<std::string> &arg_list,
-                                const std::string &full_cmd,
-                                const fs::path    &sandbox_cwd,
-                                int                timeout_sec,
-                                const ApprovalResult &approval) {
+    void run_oneshot_direct(const std::string &cmd,
+                            const std::vector<std::string> &arg_list,
+                            const fs::path    &sandbox_cwd,
+                            int                timeout_sec,
+                            const DriverConfig &dcfg,
+                            const ApprovalResult &approval) {
         try {
-            ExecResult exec = velix::app_manager::run_cmd(
-                cmd, arg_list, sandbox_cwd, timeout_sec, false);
+            // Instantiate driver directly (no ApplicationManager)
+            std::unique_ptr<TerminalDriver> driver = 
+                velix::app_manager::make_driver(dcfg);
+
+            // Execute command synchronously
+            ExecResult exec = driver->run_cmd(cmd, arg_list, sandbox_cwd, timeout_sec, false);
+
+            // Format result
+            std::string status_str;
+            if (exec.timed_out) {
+                status_str = "timeout";
+            } else if (exec.exit_code == 0) {
+                status_str = "ok";
+            } else {
+                status_str = "error";
+            }
+
             json result = {
-                {"status",    exec.timed_out        ? "timeout"
-                             : exec.exit_code == 0 ? "ok" : "error"},
+                {"status",    status_str},
                 {"exit_code", exec.exit_code},
                 {"output",    truncate_output(exec.out)},
                 {"stderr",    truncate_output(exec.err)},
@@ -646,139 +785,156 @@ private:
 
     // ── Background execution ──────────────────────────────────────────
 
-    void run_background(const std::string &uid,
-                        const std::string &full_cmd,
-                        const std::string &cmd,
-                        const std::vector<std::string> &arg_list,
-                        const std::string &session_name,
-                        const fs::path    &sandbox_cwd,
-                        const std::string &/*cwd_param*/,
-                        int                timeout_sec,
-                        bool               use_pty,
-                        const ApprovalResult &approval,
-                        const std::string &am_host,
-                        int                am_port,
-                        const DriverConfig &dcfg) {
+    void run_background(ExecutionContext ctx) {
+         json immediate = {
+             {"status",  "background"},
+             {"message", "Process started in background. You will be notified on completion."},
+             {"cmd",     ctx.full_cmd},
+             {"cwd",     ctx.sandbox_cwd.string()}
+         };
+         report_result(parent_pid, immediate, entry_trace_id, false);
 
-        json immediate = {
-            {"status",  "background"},
-            {"message", "Process started in background. You will be notified on completion."},
-            {"cmd",     full_cmd},
-            {"cwd",     sandbox_cwd.string()}
-        };
-        report_result(parent_pid, immediate, entry_trace_id, false);
+          if (ctx.use_pty) {
+              try {
+                  // Get full EXECUTE response to check if session was just created
+                  json exec_resp = am_execute_full(
+                      ctx.uid, ctx.full_cmd, ctx.timeout_sec, ctx.am_host, ctx.am_port, 
+                      ctx.session_name, ctx.dcfg);
+                  
+                  bool is_first_call = exec_resp.value("session_created", false);
+                  
+                  // Build exec command with proper cwd logic (same as foreground)
+                  std::string exec_cmd = ctx.full_cmd;
+                  if (ctx.force_cwd_prefix) {
+                      exec_cmd = "cd " + velix::app_manager::shell_quote(ctx.sandbox_cwd.string()) +
+                                " && " + ctx.full_cmd;
+                  } else if (is_first_call) {
+                      exec_cmd = "cd " + velix::app_manager::shell_quote(ctx.sandbox_cwd.string()) +
+                                " && " + ctx.full_cmd;
+                  }
+                  
+                  const std::string job_id = exec_resp.value("job_id", "");
+                  json final_resp = am_poll_until_done(
+                      job_id, ctx.timeout_sec, skill_config().poll_interval_ms,
+                      skill_config().poll_grace_sec, ctx.am_host, ctx.am_port);
 
-        if (use_pty) {
-            try {
-                const std::string exec_cmd =
-                    "cd " + velix::app_manager::shell_quote(sandbox_cwd.string()) +
-                    " && " + full_cmd;
-                const std::string job_id = am_execute(
-                    uid, exec_cmd, timeout_sec, am_host, am_port, session_name, dcfg);
-                json final_resp = am_poll_until_done(
-                    job_id, timeout_sec, skill_config().poll_interval_ms,
-                    skill_config().poll_grace_sec, am_host, am_port);
+                  const std::string job_status = final_resp.value("job_status", "error");
+                  std::string status_str;
+                  if (job_status == "finished") {
+                      status_str = "ok";
+                  } else if (job_status == "timeout") {
+                      status_str = "timeout";
+                  } else {
+                      status_str = "error";
+                  }
+                  json note = {
+                      {"notify_type", "TOOL_RESULT"},
+                      {"tool",        "terminal"},
+                      {"result", {
+                          {"status",    status_str},
+                          {"exit_code", final_resp.value("exit_code", -1)},
+                          {"output",    truncate_output(final_resp.value("output", ""))},
+                          {"cwd",       ctx.sandbox_cwd.string()},
+                          {"timed_out", job_status == "timeout"},
+                          {"cmd",       ctx.full_cmd},
+                          {"background", true}
+                      }}
+                  };
+                  if (!ctx.approval.message.empty()) note["result"]["approval_note"] = ctx.approval.message;
+                  send_message(-1, "NOTIFY_HANDLER", note);
+              } catch (const std::exception &ex) {
+                  send_message(-1, "NOTIFY_HANDLER", {
+                      {"notify_type", "TOOL_RESULT"}, {"tool", "terminal"},
+                      {"result", {{"status","error"},{"error",ex.what()},
+                                  {"cmd",ctx.full_cmd},{"background",true}}}
+                  });
+              }
+              return;
+          }
 
-                const std::string job_status = final_resp.value("job_status", "error");
-                json note = {
-                    {"notify_type", "TOOL_RESULT"},
-                    {"tool",        "terminal"},
-                    {"result", {
-                        {"status",    job_status == "finished" ? "ok"
-                                     : job_status == "timeout" ? "timeout" : "error"},
-                        {"exit_code", final_resp.value("exit_code", -1)},
-                        {"output",    truncate_output(final_resp.value("output", ""))},
-                        {"cwd",       sandbox_cwd.string()},
-                        {"timed_out", job_status == "timeout"},
-                        {"cmd",       full_cmd},
-                        {"background", true}
-                    }}
-                };
-                if (!approval.message.empty()) note["result"]["approval_note"] = approval.message;
-                send_message(-1, "NOTIFY_HANDLER", note);
-            } catch (const std::exception &ex) {
-                send_message(-1, "NOTIFY_HANDLER", {
-                    {"notify_type", "TOOL_RESULT"}, {"tool", "terminal"},
-                    {"result", {{"status","error"},{"error",ex.what()},
-                                {"cmd",full_cmd},{"background",true}}}
-                });
-            }
-            return;
-        }
-
-        try {
-            ExecResult exec = velix::app_manager::run_cmd(
-                cmd, arg_list, sandbox_cwd, timeout_sec, false);
-            json note = {
-                {"notify_type", "TOOL_RESULT"}, {"tool", "terminal"},
-                {"result", {
-                    {"status",    exec.timed_out        ? "timeout"
-                                 : exec.exit_code == 0 ? "ok" : "error"},
-                    {"exit_code", exec.exit_code},
-                    {"output",    truncate_output(exec.out)},
-                    {"stderr",    truncate_output(exec.err)},
-                    {"cwd",       sandbox_cwd.string()},
-                    {"timed_out", exec.timed_out},
-                    {"cmd",       full_cmd},
-                    {"background", true}
-                }}
-            };
-            if (!approval.message.empty()) note["result"]["approval_note"] = approval.message;
-            send_message(-1, "NOTIFY_HANDLER", note);
-        } catch (const std::exception &ex) {
-            send_message(-1, "NOTIFY_HANDLER", {
-                {"notify_type", "TOOL_RESULT"}, {"tool", "terminal"},
-                {"result", {{"status","error"},
-                            {"error", std::string("Execution failed: ") + ex.what()},
-                            {"cmd", full_cmd}, {"background", true}}}
-            });
-        }
-    }
+          try {
+              // Instantiate driver directly for background one-shot execution
+              std::unique_ptr<TerminalDriver> driver = 
+                  velix::app_manager::make_driver(ctx.dcfg);
+              
+              ExecResult exec = driver->run_cmd(
+                  ctx.cmd, ctx.arg_list, ctx.sandbox_cwd, ctx.timeout_sec, false);
+              
+              std::string status_str;
+              if (exec.timed_out) {
+                  status_str = "timeout";
+              } else if (exec.exit_code == 0) {
+                  status_str = "ok";
+              } else {
+                  status_str = "error";
+              }
+              json note = {
+                  {"notify_type", "TOOL_RESULT"}, {"tool", "terminal"},
+                  {"result", {
+                      {"status",    status_str},
+                      {"exit_code", exec.exit_code},
+                      {"output",    truncate_output(exec.out)},
+                      {"stderr",    truncate_output(exec.err)},
+                      {"cwd",       ctx.sandbox_cwd.string()},
+                      {"timed_out", exec.timed_out},
+                      {"cmd",       ctx.full_cmd},
+                      {"background", true}
+                  }}
+              };
+              if (!ctx.approval.message.empty()) note["result"]["approval_note"] = ctx.approval.message;
+              send_message(-1, "NOTIFY_HANDLER", note);
+          } catch (const std::exception &ex) {
+              send_message(-1, "NOTIFY_HANDLER", {
+                  {"notify_type", "TOOL_RESULT"}, {"tool", "terminal"},
+                  {"result", {{"status","error"},
+                              {"error", std::string("Execution failed: ") + ex.what()},
+                              {"cmd", ctx.full_cmd}, {"background", true}}}
+              });
+          }
+     }
 
     // ── Approval gate ─────────────────────────────────────────────────
 
     ApprovalResult check_approval(const std::string &full_cmd) {
-        const std::string uid = user_id.empty() ? "anonymous" : user_id;
+         const std::string uid = user_id.empty() ? "anonymous" : user_id;
 
-        std::string mode = skill_config().approval_mode;
-        std::transform(mode.begin(), mode.end(), mode.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (mode != "off" && mode != "manual" && mode != "smart") mode = "smart";
+         std::string mode = skill_config().approval_mode;
+         std::transform(mode.begin(), mode.end(), mode.begin(),
+                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+         if (mode != "off" && mode != "manual" && mode != "smart") mode = "smart";
 
-        const std::string exact_key = mode + ":" + uid + ":" + exact_cmd_key(full_cmd);
+         const std::string exact_key = mode + ":" + uid + ":" + exact_cmd_key(full_cmd);
 
-        if (mode == "off") {
-            skill_log("approval_skip_mode_off", {{"command", full_cmd}});
-            return approved_ok("approval disabled");
-        }
+         if (mode == "off") {
+             skill_log("approval_skip_mode_off", {{"command", full_cmd}});
+             return approved_ok("approval disabled");
+         }
 
-        bool must_prompt = (mode == "manual");
-        DetectResult det;
+         DetectResult det;
+         if (mode == "manual") {
+             det = {true, exact_key, "manual approval mode"};
+         } else {
+             det = detect_dangerous(full_cmd);
+             if (!det.is_dangerous) {
+                 skill_log("approval_not_required", {{"command", full_cmd}});
+                 return approved_ok("");
+             }
+             det.pattern_key = exact_key;
+         }
 
-        if (!must_prompt) {
-            det = detect_dangerous(full_cmd);
-            if (!det.is_dangerous) {
-                skill_log("approval_not_required", {{"command", full_cmd}});
-                return approved_ok("");
-            }
-            det.pattern_key = exact_key;
-        } else {
-            det = {true, exact_key, "manual approval mode"};
-        }
+         skill_log("approval_required",
+                   {{"command", full_cmd}, {"approval_mode", mode},
+                    {"pattern_key", det.pattern_key}, {"description", det.description}});
 
-        skill_log("approval_required",
-                  {{"command", full_cmd}, {"approval_mode", mode},
-                   {"pattern_key", det.pattern_key}, {"description", det.description}});
+         if (is_approved(det.pattern_key)) {
+             skill_log("approval_allowlist_hit",
+                       {{"command", full_cmd}, {"pattern_key", det.pattern_key}});
+             return {true, ApprovalScope::Permanent, "Previously approved",
+                     det.pattern_key, det.description};
+         }
 
-        if (is_approved(det.pattern_key)) {
-            skill_log("approval_allowlist_hit",
-                      {{"command", full_cmd}, {"pattern_key", det.pattern_key}});
-            return {true, ApprovalScope::Permanent, "Previously approved",
-                    det.pattern_key, det.description};
-        }
-
-        return ask_handler(full_cmd, det.pattern_key, det.description);
-    }
+         return ask_handler(full_cmd, det.pattern_key, det.description);
+     }
 
     ApprovalResult ask_handler(const std::string &full_cmd,
                                const std::string &pattern_key,
@@ -838,12 +994,17 @@ private:
                     "Approval timed out after " +
                     std::to_string(skill_config().approval_timeout) + "s — denied.",
                     pattern_key, description};
-        }
+         }
 
-        ApprovalScope scope = reply_scope == "once"      ? ApprovalScope::Once
-                            : reply_scope == "permanent" ? ApprovalScope::Permanent
-                                                         : ApprovalScope::Deny;
-        if (scope == ApprovalScope::Deny) {
+         ApprovalScope scope;
+         if (reply_scope == "once") {
+             scope = ApprovalScope::Once;
+         } else if (reply_scope == "permanent") {
+             scope = ApprovalScope::Permanent;
+         } else {
+             scope = ApprovalScope::Deny;
+         }
+         if (scope == ApprovalScope::Deny) {
             skill_log("approval_denied", {{"approval_trace", trace}, {"scope", reply_scope}});
             return {false, scope, "User denied: " + description, pattern_key, description};
         }

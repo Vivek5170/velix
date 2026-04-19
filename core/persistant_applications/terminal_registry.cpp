@@ -230,9 +230,13 @@ void TerminalRegistry::kill_session(const std::string &user_id,
     } // release lock
 
     for (auto &d : to_close) {
-        LOG_INFO_CTX("Killing session (user=" + user_id + ")",
-                     "app_manager", user_id, -1, "session_killed");
-        try { d->close(); } catch (...) {}
+         LOG_INFO_CTX("Killing session (user=" + user_id + ")",
+                      "app_manager", user_id, -1, "session_killed");
+         try { d->close(); } 
+         catch (...) {
+             // Suppress errors from driver close to prevent iteration from crashing;
+             // driver cleanup will be handled by shared_ptr destructor.
+         }
     }
 }
 
@@ -244,7 +248,10 @@ void TerminalRegistry::kill_session_by_id(const std::string &session_id) {
     }
     if (driver) {
         LOG_INFO_CTX("Killing session by id", "app_manager", session_id, -1, "session_killed");
-        try { driver->close(); } catch (...) {}
+        try { driver->close(); } 
+        catch (...) {
+            // Suppress errors from driver close; cleanup will be handled by shared_ptr destructor.
+        }
     }
 }
 
@@ -324,7 +331,10 @@ int TerminalRegistry::evict_dead_and_idle() {
 
     // Close drivers outside the lock (BUG-17 fix).
     for (auto &d : to_close) {
-        try { d->close(); } catch (...) {}
+        try { d->close(); } 
+        catch (...) {
+            // Suppress errors from driver close; cleanup will be handled by shared_ptr destructor.
+        }
     }
 
     return static_cast<int>(to_close.size());

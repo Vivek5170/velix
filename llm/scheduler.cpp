@@ -122,7 +122,7 @@ void mark_request_active(const std::string &trace_id,
     return;
   }
 
-  std::lock_guard<std::mutex> lock(trace_mutex);
+  std::scoped_lock<std::mutex> lock(trace_mutex);
   active_requests[trace_id] = ActiveRequest{request_id};
 }
 
@@ -132,7 +132,7 @@ bool is_request_current(const std::string &trace_id,
     return true;
   }
 
-  std::lock_guard<std::mutex> lock(trace_mutex);
+  std::scoped_lock<std::mutex> lock(trace_mutex);
   auto it = active_requests.find(trace_id);
   return it != active_requests.end() && it->second.request_id == request_id;
 }
@@ -143,7 +143,7 @@ void clear_request_if_current(const std::string &trace_id,
     return;
   }
 
-  std::lock_guard<std::mutex> lock(trace_mutex);
+  std::scoped_lock<std::mutex> lock(trace_mutex);
   auto it = active_requests.find(trace_id);
   if (it != active_requests.end() && it->second.request_id == request_id) {
     active_requests.erase(it);
@@ -400,80 +400,86 @@ void handle_session_control(const json &envelope,
       const bool deleted = sm.delete_super_user(super_user);
       reply["destroyed"] = deleted;
       reply["super_user"] = super_user;
-    } else if (action == "compact") {
-      const std::string target =
-          !session_id.empty() ? session_id
-                              : sm.get_or_create_active_session(super_user);
+     } else if (action == "compact") {
+       const std::string resolved_target =
+           !session_id.empty() ? session_id
+                               : sm.get_or_create_active_session(super_user);
 
-      const Conversation convo = session_io_ref.get_conversation(target);
-      json history = json::array();
-      for (const auto &message : convo.messages) {
-        if (message.is_object()) {
-          history.push_back(message);
-        }
-      }
-
-       const auto compact_result = sm.compact(target, history, false);
-       if (compact_result.compacted) {
-         // Persist the seeded conversation via storage provider
-         if (!compact_result.compacted_conversation.empty()) {
-           storage_provider->upsert_conversation(compact_result.compacted_conversation);
+       const Conversation convo = session_io_ref.get_conversation(resolved_target);
+       json history = json::array();
+       for (const auto &message : convo.messages) {
+         if (message.is_object()) {
+           history.push_back(message);
          }
-         session_io_ref.invalidate_conversation_cache(target);
        }
 
-      reply["session"] = sm.get_session_object(target, mc.context_length);
+        const auto compact_result = sm.compact(resolved_target, history, false);
+        if (compact_result.compacted) {
+          // Persist the seeded conversation via storage provider
+          if (!compact_result.compacted_conversation.empty()) {
+            storage_provider->upsert_conversation(compact_result.compacted_conversation);
+          }
+          session_io_ref.invalidate_conversation_cache(resolved_target);
+        }
+
+       reply["session"] = sm.get_session_object(resolved_target, mc.context_length);
       reply["summary"] = compact_result.summary;
       reply["tokens_before"] = compact_result.tokens_before;
       reply["tokens_after"] = compact_result.tokens_after;
       reply["session_compacted"] = compact_result.compacted;
       reply["compact_reason"] = compact_result.compact_reason;
       attach_session_alias_fields(reply);
-    } else if (action == "undo") {
-      const std::string target =
-          !session_id.empty() ? session_id
-                              : sm.get_or_create_active_session(super_user);
+       } else if (action == "undo") {
+         const std::string resolved_target =
+             !session_id.empty() ? session_id
+                                 : sm.get_or_create_active_session(super_user);
 
-      Conversation convo = session_io_ref.get_conversation(target);
-      auto &messages = convo.messages;
+         Conversation convo = session_io_ref.get_conversation(resolved_target);
+         auto &messages = convo.messages;
 
-      int last_assistant = -1;
-      for (int i = static_cast<int>(messages.size()) - 1; i >= 0; --i) {
-        if (messages[i].is_object() &&
-            messages[i].value("role", std::string("")) == "assistant") {
-          last_assistant = i;
-          break;
-        }
-      }
+         int last_assistant = -1;
+         for (int i = static_cast<int>(messages.size()) - 1; i >= 0; --i) {
+           if (messages[i].is_object() &&
+               messages[i].value("role", std::string("")) == "assistant") {
+             last_assistant = i;
+             break;
+           }
+         }
 
-      int cut_from = -1;
-      if (last_assistant >= 0) {
-        for (int i = last_assistant - 1; i >= 0; --i) {
-          if (!messages[i].is_object()) {
-            continue;
-          }
-          if (messages[i].value("role", std::string("")) == "user") {
-            cut_from = i;
-            break;
-          }
-        }
-      }
+         int cut_from = -1;
+         if (last_assistant >= 0) {
+           for (int i = last_assistant - 1; i >= 0; --i) {
+             if (!messages[i].is_object()) {
+               continue;
+             }
+             if (messages[i].value("role", std::string("")) == "user") {
+               cut_from = i;
+               break;
+             }
+           }
+         }
 
-      int removed = 0;
-      if (cut_from >= 0) {
-        removed = static_cast<int>(messages.size()) - cut_from;
-        messages.erase(messages.begin() + cut_from, messages.end());
-        convo.turn_count -= removed;
-        if (convo.turn_count < 0) {
-          convo.turn_count = 0;
-        }
-        session_io_ref.persist_conversation(convo);
-      }
+         int removed = 0;
+         if (cut_from >= 0) {
+           removed = static_cast<int>(messages.size()) - cut_from;
+           messages.erase(messages.begin() + cut_from, messages.end());
+           convo.turn_count -= removed;
+           if (convo.turn_count < 0) {
+             convo.turn_count = 0;
+           }
+           // Update last_activity_ms to record the undo action
+           const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+           convo.last_activity_ms = now_ms;
+           session_io_ref.persist_conversation(convo);
+           // Invalidate cache so next retrieval gets the updated version from storage
+           session_io_ref.invalidate_conversation_cache(resolved_target);
+         }
 
-      reply["session"] = sm.get_session_object(target, mc.context_length);
-      reply["turns_removed"] = removed;
-      reply["turns_remaining"] = static_cast<int>(messages.size());
-      attach_session_alias_fields(reply);
+        reply["session"] = sm.get_session_object(resolved_target, mc.context_length);
+       reply["turns_removed"] = removed;
+       reply["turns_remaining"] = static_cast<int>(messages.size());
+       attach_session_alias_fields(reply);
     } else if (action == "list") {
       if (super_user.empty()) {
         throw std::runtime_error("'list' requires user_id");
@@ -541,47 +547,47 @@ void handle_session_query(const json &envelope,
     const std::string super_user = target.super_user;
     const std::string session_id = target.session_id;
 
-    if (query_type == "info") {
-      if (super_user.empty()) {
-        throw std::runtime_error("'info' query requires user_id");
-      }
+     if (query_type == "info") {
+       if (super_user.empty()) {
+         throw std::runtime_error("'info' query requires user_id");
+       }
 
-      const std::string target =
-          !session_id.empty() ? session_id
-                              : sm.get_or_create_active_session(super_user);
+       const std::string resolved_target =
+           !session_id.empty() ? session_id
+                               : sm.get_or_create_active_session(super_user);
 
-      const auto info = sm.get_session_info(target);
-      reply["session"] =
-          SessionManager::build_session_object(info, mc.context_length);
-      const std::string mode =
-          (target.rfind("proc_", 0) == 0) ? "conversation"
-                                          : "user_conversation";
-      const auto usage = sm.compute_context_usage(
-          target, json::array(), registry, mode, mc.context_length);
+       const auto info = sm.get_session_info(resolved_target);
+       reply["session"] =
+           SessionManager::build_session_object(info, mc.context_length);
+       const std::string mode =
+           (resolved_target.rfind("proc_", 0) == 0) ? "conversation"
+                                           : "user_conversation";
+       const auto usage = sm.compute_context_usage(
+           resolved_target, json::array(), registry, mode, mc.context_length);
 
-      reply["session_tokens"] = usage.session_tokens;
-      reply["system_prompt_tokens"] = usage.system_prompt_tokens;
-      reply["tool_schema_tokens"] = usage.tool_schema_tokens;
-      reply["request_tokens"] = usage.request_tokens;
-      reply["total_context_tokens"] = usage.total_context_tokens;
-      reply["max_context_tokens"] = usage.max_context_tokens;
-      reply["context_fill_pct"] = usage.context_fill_pct;
-      reply["auto_compact_threshold_pct"] =
-          static_cast<int>(threshold * 100);
+       reply["session_tokens"] = usage.session_tokens;
+       reply["system_prompt_tokens"] = usage.system_prompt_tokens;
+       reply["tool_schema_tokens"] = usage.tool_schema_tokens;
+       reply["request_tokens"] = usage.request_tokens;
+       reply["total_context_tokens"] = usage.total_context_tokens;
+       reply["max_context_tokens"] = usage.max_context_tokens;
+       reply["context_fill_pct"] = usage.context_fill_pct;
+       reply["auto_compact_threshold_pct"] =
+           static_cast<int>(threshold * 100);
 
-      if (usage.max_context_tokens > 0) {
-        const double fill =
-            static_cast<double>(usage.total_context_tokens) /
-            static_cast<double>(usage.max_context_tokens);
-        reply["context_warning"] = (fill >= threshold);
-      }
+       if (usage.max_context_tokens > 0) {
+         const double fill =
+             static_cast<double>(usage.total_context_tokens) /
+             static_cast<double>(usage.max_context_tokens);
+         reply["context_warning"] = (fill >= threshold);
+       }
     } else if (query_type == "queue_depth") {
       const std::string queue_key =
           envelope.value("queue_key", std::string(""));
       int depth = 0;
       int total = 0;
       {
-        std::lock_guard<std::mutex> lock(queue_mutex_ref);
+        std::scoped_lock<std::mutex> lock(queue_mutex_ref);
         for (const auto &[key, queue] : tree_queues_ref) {
           const int size = static_cast<int>(queue.requests.size());
           total += size;
@@ -1246,7 +1252,7 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
     }
 
     {
-      std::lock_guard<std::mutex> lock(queue_mutex);
+      std::scoped_lock<std::mutex> lock(queue_mutex);
       release_tree_key(req.queue_key);
     }
     queue_cv.notify_one();
@@ -1429,7 +1435,7 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
         const json stream_chunk = {{"message_type", "LLM_STREAM_CHUNK"},
                                    {"request_id", request_id},
                                    {"delta", delta}};
-        std::lock_guard<std::mutex> lock(*client_send_mutex);
+        std::scoped_lock<std::mutex> lock(*client_send_mutex);
         velix::communication::send_json(*client_socket_ptr,
                                         stream_chunk.dump());
       } catch (...) {
@@ -1444,7 +1450,7 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
     const std::string request_id = req.request_id;
 
     {
-      std::lock_guard<std::mutex> lock(queue_mutex);
+      std::scoped_lock<std::mutex> lock(queue_mutex);
       TreeQueue &queue = tree_queues[queue_key];
       queue.requests.push_back(std::move(req));
       ++queue.version;
@@ -1459,7 +1465,7 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
 
     json response = future.get();
     {
-      std::lock_guard<std::mutex> lock(*client_send_mutex);
+      std::scoped_lock<std::mutex> lock(*client_send_mutex);
       velix::communication::send_json(*client_socket_ptr, response.dump());
     }
 
@@ -1472,7 +1478,7 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
       const json error = {{"message_type", "LLM_RESPONSE"},
                           {"status", "error"},
                           {"error", e.what()}};
-      std::lock_guard<std::mutex> lock(*client_send_mutex);
+      std::scoped_lock<std::mutex> lock(*client_send_mutex);
       velix::communication::send_json(*client_socket_ptr, error.dump());
     } catch (...) {
     }

@@ -48,6 +48,9 @@ private:
   std::string snapshot_path(const std::string &session_id, int n) const;
   json load_index_unlocked() const;
   bool save_index_unlocked(const json &idx) const;
+  void delete_session_snapshots_internal(const std::string &session_id);
+  void list_index_entries_from_fs(const std::string &super_user,
+                                   std::vector<json> &out) const;
 
   std::string storage_root_;
   std::mutex io_mutex_;

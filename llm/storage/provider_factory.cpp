@@ -24,7 +24,8 @@ json load_storage_config() {
       json cfg;
       in >> cfg;
       return cfg;
-    } catch (...) {
+    } catch (const std::exception &) {
+      // Failed to parse storage config, try next path
       return json::object();
     }
   }
@@ -35,9 +36,8 @@ json load_storage_config() {
 
 std::shared_ptr<IStorageProvider> make_storage_provider_from_config() {
   const json cfg = load_storage_config();
-  const std::string backend = cfg.value("backend", std::string("json"));
-
-  if (backend == "sqlite") {
+  if (const std::string backend = cfg.value("backend", std::string("json"));
+      backend == "sqlite") {
     const std::string sqlite_path =
         cfg.value("sqlite_path", std::string(".velix/velix.db"));
     return std::make_shared<SqliteStorageProvider>(sqlite_path);
