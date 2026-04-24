@@ -30,7 +30,7 @@
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
 #include "../utils/thread_pool.hpp"
-#include "../vendor/nlohmann/json.hpp"
+#include "../communication/json_include.hpp"
 #include "process_registry.hpp"
 #include "termination_engine.hpp"
 
@@ -703,14 +703,8 @@ private:
 
   void handle_client(velix::communication::SocketWrapper client_sock) {
     try {
-      const std::string request_raw =
-          velix::communication::recv_json(client_sock);
-      if (request_raw.size() > config_.max_message_bytes) {
-        json error = {{"status", "error"}, {"error", "message too large"}};
-        velix::communication::send_json(client_sock, error.dump());
-        return;
-      }
-      json request = json::parse(request_raw);
+      const json request = velix::communication::recv_json_parsed(client_sock);
+      // We can't easily check raw size here; recv_raw enforces configured max.
       json response = handle_message(request);
       velix::communication::send_json(client_sock, response.dump());
     } catch (const std::exception &e) {

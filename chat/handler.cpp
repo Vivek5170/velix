@@ -359,16 +359,14 @@ private:
             client.set_timeout_ms(8000);
 
             while (!registered) {
-                const std::string raw = recv_json(client);
-                const json req = json::parse(raw);
+                const json req = recv_json_parsed(client);
                 const std::string type = req.value("type", std::string(""));
 
                 // ── list_users ───────────────────────────────────────────
                 if (type == "list_users") {
-                    const std::string raw = send_session_query("all_sessions", "", "");
                     json j_users = json::array();
                     try {
-                        const json resp = json::parse(raw);
+                        const json resp = send_session_query_parsed("all_sessions", "", "");
                         const json users = resp.value("super_users", json::array());
                         std::lock_guard<std::mutex> lk(sessions_mutex_);
                         for (const auto& u : users) {
@@ -392,9 +390,8 @@ private:
                     const std::string su = req.value("super_user", std::string(""));
                     json j_sessions = json::array();
                     if (!su.empty()) {
-                        const std::string raw = send_session_query("all_sessions", "", "");
                         try {
-                            const json resp = json::parse(raw);
+                            const json resp = send_session_query_parsed("all_sessions", "", "");
                             const json users = resp.value("super_users", json::array());
                             std::lock_guard<std::mutex> lk(sessions_mutex_);
                             for (const auto& u : users) {
@@ -526,8 +523,8 @@ private:
 
     void session_reader(std::shared_ptr<Session> session) {
         while (is_running && session->active.load()) {
-            try {
-                const std::string raw = recv_json(session->socket);
+                try {
+                const std::string raw = recv_raw(session->socket);
                 if (raw.empty()) break;
 
                 json j = json::parse(raw);
@@ -723,8 +720,7 @@ private:
 
     void emit_context_usage(std::shared_ptr<Session> session,
                              const SendFn& send_to_client) {
-        const std::string raw =
-            send_session_query("info", "", session->active_session_id);
+        const json r = send_session_query_parsed("info", "", session->active_session_id);
         uint64_t current_tokens = 0;
         uint64_t max_tokens = 0;
         uint64_t session_tokens = 0;
@@ -732,14 +728,12 @@ private:
         uint64_t tool_schema_tokens = 0;
         uint64_t request_tokens = 0;
         try {
-            const json r = json::parse(raw);
+            // send_session_query_parsed already returns parsed JSON.
             current_tokens = r.value("total_context_tokens", static_cast<uint64_t>(0));
             max_tokens = r.value("max_context_tokens", static_cast<uint64_t>(0));
             session_tokens = r.value("session_tokens", static_cast<uint64_t>(0));
-            system_prompt_tokens =
-                r.value("system_prompt_tokens", static_cast<uint64_t>(0));
-            tool_schema_tokens =
-                r.value("tool_schema_tokens", static_cast<uint64_t>(0));
+            system_prompt_tokens = r.value("system_prompt_tokens", static_cast<uint64_t>(0));
+            tool_schema_tokens = r.value("tool_schema_tokens", static_cast<uint64_t>(0));
             request_tokens = r.value("request_tokens", static_cast<uint64_t>(0));
             if (current_tokens == 0 || max_tokens == 0) {
                 const json s = r.value("session", json::object());
@@ -822,10 +816,9 @@ private:
         command_table_["/compact"] = [this](auto session, const auto& send,
                                              const std::string& /*args*/) {
             send({{"type","token"},{"data","[Compacting…]\n"}});
-            const std::string raw =
-                send_session_control(session->active_session_id, "compact", "");
+            const json raw = send_session_control_parsed(session->active_session_id, "compact", "");
 
-            if (raw.empty()) {
+            if (raw.is_null() || raw.empty()) {
                 send({{"type","token"},
                       {"data","[Compaction status unavailable: request timed out]\n"}});
                 return true;
@@ -833,7 +826,7 @@ private:
 
             std::string msg = "[Compacted: " + session->active_session_id + "]";
             try {
-                const json r = json::parse(raw);
+                const json &r = raw;
                 if (r.value("session_compacted", false) &&
                     r.contains("tokens_before") && r.contains("tokens_after")) {
                     msg = "[Compacted: " +
@@ -854,11 +847,10 @@ private:
         // ── /undo ─────────────────────────────────────────────────────
         command_table_["/undo"] = [this](auto session, const auto& send,
                                           const std::string& /*args*/) {
-            const std::string raw =
-                send_session_control(session->active_session_id, "undo", "");
+            const json raw = send_session_control_parsed(session->active_session_id, "undo", "");
             std::string msg = "[Undo attempted]";
             try {
-                const json r = json::parse(raw);
+                const json &r = raw;
                 const int removed   = r.value("turns_removed", 0);
                 const int remaining = r.value("turns_remaining", 0);
                 msg = "[Undo: removed " + std::to_string(removed) +
@@ -871,10 +863,10 @@ private:
         // ── /sessions ─────────────────────────────────────────────────
         command_table_["/sessions"] = [this](auto session, const auto& send,
                                                const std::string& /*args*/) {
-            const std::string raw = send_session_query("all_sessions", "", "");
+            // Use parsed variant to avoid parsing the returned string here.
             json target_sessions = json::array();
             try {
-                const json resp = json::parse(raw);
+                const json resp = send_session_query_parsed("all_sessions", "", "");
                 const json users = resp.value("super_users", json::array());
                 for (const auto& u : users) {
                     if (!u.is_object()) continue;
@@ -944,8 +936,8 @@ private:
                 }
             }
 
-            const std::string raw = send_session_control(target_sid, "delete", "");
-            if (raw.empty()) {
+            const json raw = send_session_control_parsed(target_sid, "delete", "");
+            if (raw.is_null() || raw.empty()) {
                 send({{"type","token"},
                       {"data","[Delete failed: no response from scheduler]\n"}});
                 return true;
@@ -953,7 +945,7 @@ private:
 
             std::string msg = "[Delete failed]";
             try {
-                const json r = json::parse(raw);
+                const json &r = raw;
                 if (r.contains("error") && !r.value("error", std::string("")).empty()) {
                     msg = "[Delete failed: " + r.value("error", std::string("unknown")) + "]";
                 } else if (!r.value("deleted", false)) {
@@ -961,12 +953,11 @@ private:
                 } else {
                     msg = "[Deleted: " + target_sid + "]";
                     if (target_sid == session->active_session_id) {
-                        const std::string fallback_raw =
-                            send_session_control(session->super_user,
-                                                 "get_or_create", "");
+                        const json fallback_raw = send_session_control_parsed(session->super_user,
+                                                                             "get_or_create", "");
                         std::string fallback;
                         try {
-                            const json fr = json::parse(fallback_raw);
+                            const json &fr = fallback_raw;
                             fallback = fr.value("session_id", std::string(""));
                             if (fallback.empty() && fr.contains("session") &&
                                 fr["session"].is_object()) {
@@ -1025,8 +1016,8 @@ private:
                 }
             }
 
-            const std::string raw = send_session_control(target_user, "destroy_user", "");
-            if (raw.empty()) {
+            const json raw = send_session_control_parsed(target_user, "destroy_user", "");
+            if (raw.is_null() || raw.empty()) {
                 send({{"type","token"},
                       {"data","[Destroy failed: no response from scheduler]\n"}});
                 return true;
@@ -1035,7 +1026,7 @@ private:
             std::string msg = "[Destroy user failed]";
             bool disconnect_current_socket = false;
             try {
-                const json r = json::parse(raw);
+                const json &r = raw;
                 if (r.contains("error") && !r.value("error", std::string("")).empty()) {
                     msg = "[Destroy user failed: " +
                           r.value("error", std::string("unknown")) + "]";
@@ -1077,13 +1068,12 @@ private:
                 send({{"type","token"},{"data","Usage: /title <new title>\n"}});
                 return true;
             }
-            const std::string raw =
-                send_session_control(session->active_session_id, "set_title", args);
+            const json raw = send_session_control_parsed(session->active_session_id, "set_title", args);
             std::string msg = "[Title set to: " + args + "]";
             try {
-                const json r = json::parse(raw);
+                const json &r = raw;
                 if (r.contains("error"))
-                    msg = "[Error setting title: " + r.value("error","") + "]";
+                    msg = "[Error setting title: " + r.value("error", std::string("")) + "]";
             } catch (...) {}
             send({{"type","token"},{"data", msg + "\n"}});
             return true;
@@ -1092,8 +1082,7 @@ private:
         // ── /session_info ─────────────────────────────────────────────
         command_table_["/session_info"] = [this](auto session, const auto& send,
                                                    const std::string& /*args*/) {
-            const std::string raw =
-                send_session_query("info", "", session->active_session_id);
+            const json resp = send_session_query_parsed("info", "", session->active_session_id);
             json info = json::object();
             uint64_t session_tokens = 0;
             uint64_t system_prompt_tokens = 0;
@@ -1103,15 +1092,14 @@ private:
             uint64_t max_context_tokens = 0;
             double context_fill_pct = 0.0;
             try {
-                const json r = json::parse(raw);
-                info = r.value("session", json::object());
-                session_tokens = r.value("session_tokens", static_cast<uint64_t>(0));
-                system_prompt_tokens = r.value("system_prompt_tokens", static_cast<uint64_t>(0));
-                tool_schema_tokens = r.value("tool_schema_tokens", static_cast<uint64_t>(0));
-                request_tokens = r.value("request_tokens", static_cast<uint64_t>(0));
-                total_context_tokens = r.value("total_context_tokens", static_cast<uint64_t>(0));
-                max_context_tokens = r.value("max_context_tokens", static_cast<uint64_t>(0));
-                context_fill_pct = r.value("context_fill_pct", 0.0);
+                info = resp.value("session", json::object());
+                session_tokens = resp.value("session_tokens", static_cast<uint64_t>(0));
+                system_prompt_tokens = resp.value("system_prompt_tokens", static_cast<uint64_t>(0));
+                tool_schema_tokens = resp.value("tool_schema_tokens", static_cast<uint64_t>(0));
+                request_tokens = resp.value("request_tokens", static_cast<uint64_t>(0));
+                total_context_tokens = resp.value("total_context_tokens", static_cast<uint64_t>(0));
+                max_context_tokens = resp.value("max_context_tokens", static_cast<uint64_t>(0));
+                context_fill_pct = resp.value("context_fill_pct", 0.0);
             } catch (...) {}
 
             if (total_context_tokens == 0 || max_context_tokens == 0) {
@@ -1146,12 +1134,10 @@ private:
         // ── /context ──────────────────────────────────────────────────
         command_table_["/context"] = [this](auto session, const auto& send,
                                              const std::string& /*args*/) {
-            const std::string raw =
-                send_session_query("info", "", session->active_session_id);
+            const json r = send_session_query_parsed("info", "", session->active_session_id);
             uint64_t current_tokens = 0;
             uint64_t max_tokens = 0;
             try {
-                const json r = json::parse(raw);
                 current_tokens = r.value("total_context_tokens", static_cast<uint64_t>(0));
                 max_tokens = r.value("max_context_tokens", static_cast<uint64_t>(0));
                 if (current_tokens == 0 || max_tokens == 0) {
@@ -1180,10 +1166,9 @@ private:
         // ── /model_info ───────────────────────────────────────────────
         command_table_["/model_info"] = [this](auto /*s*/, const auto& send,
                             const std::string& /*args*/) {
-                const std::string raw = send_session_query("model_info", "", "");
                 json info = json::object();
                 try {
-                     info = json::parse(raw);
+                     info = send_session_query_parsed("model_info", "", "");
                 } catch (...) {}
             std::ostringstream ss;
             ss << "── Model Info ──────────────────────────\n";
@@ -1208,11 +1193,10 @@ private:
         // Asks the scheduler for queue_depth (one SESSION_QUERY round-trip).
         command_table_["/scheduler_info"] = [this](auto /*s*/, const auto& send,
                                                      const std::string& /*args*/) {
-            const std::string raw = send_session_query("queue_depth", "", "");
+            const json r = send_session_query_parsed("queue_depth", "", "");
             std::ostringstream ss;
             ss << "── Scheduler Info ──────────────────────\n";
             try {
-                const json r = json::parse(raw);
                 ss << "  total_pending  : " << r.value("total_pending", 0) << "\n";
                 ss << "  queue_depth    : " << r.value("queue_depth", 0) << "\n";
             } catch (...) {
@@ -1456,8 +1440,7 @@ private:
             if (!title.empty()) frame["title"] = title;
             send_json(sock, frame.dump());
 
-            const std::string raw  = recv_json(sock);
-            const json        resp = json::parse(raw);
+            const json resp = recv_json_parsed(sock);
 
             if (resp.value("message_type","") != "SESSION_RESPONSE") return "";
 
@@ -1467,7 +1450,7 @@ private:
                 action == "delete" ||
                 action == "destroy_user" ||
                 action == "list_super_users") {
-                return raw;
+                return resp.dump();
             }
 
             // For get_or_create / new: return resolved session_id.
@@ -1487,6 +1470,73 @@ private:
         }
     }
 
+    // Parsed variant: returns nlohmann::json directly to avoid extra parsing
+    json send_session_control_parsed(const std::string& user_id,
+                                     const std::string& action,
+                                     const std::string& title) {
+        constexpr int kPort        = 5171;
+        constexpr int kRetries     = 3;
+        constexpr int kRetryMs     = 300;
+        constexpr int kDefaultTimeoutMs = 8000;
+
+        auto load_scheduler_wait_timeout_ms = []() {
+            std::ifstream model_file("config/model.json");
+            if (!model_file.is_open()) {
+                model_file.open("../config/model.json");
+            }
+            if (!model_file.is_open()) {
+                model_file.open("build/config/model.json");
+            }
+            if (!model_file.is_open()) {
+                return 65000;
+            }
+            try {
+                json model;
+                model_file >> model;
+                const int request_timeout_ms =
+                    model.value("request_timeout_ms", 60000);
+                return request_timeout_ms + 5000;
+            } catch (...) {
+                return 65000;
+            }
+        };
+
+        const int kTimeoutMs =
+            (action == "compact")
+                ? std::max(load_scheduler_wait_timeout_ms() + 2000,
+                           kDefaultTimeoutMs)
+                : kDefaultTimeoutMs;
+
+        try {
+            SocketWrapper sock;
+            sock.create_tcp_socket();
+            sock.set_timeout_ms(kTimeoutMs);
+
+            bool ok = false;
+            for (int i = 0; i < kRetries && !ok; ++i) {
+                try { sock.connect("127.0.0.1", kPort); ok = true; }
+                catch (...) {
+                    if (i + 1 < kRetries)
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(kRetryMs));
+                }
+            }
+            if (!ok) return json::object();
+
+            json frame = {{"message_type","SESSION_CONTROL"},
+                          {"action", action},
+                          {"user_id", user_id}};
+            if (!title.empty()) frame["title"] = title;
+            send_json(sock, frame.dump());
+
+            const json resp = recv_json_parsed(sock);
+            if (resp.value("message_type","") != "SESSION_RESPONSE") return json::object();
+            return resp;
+        } catch (...) {
+            return json::object();
+        }
+    }
+
     // APPLICATION_MANAGER_QUERY: talks to port 5175.
     std::string send_application_manager_query(const json& frame) {
         constexpr int kPort      = 5175;
@@ -1497,19 +1547,34 @@ private:
             sock.set_timeout_ms(kTimeoutMs);
             sock.connect("127.0.0.1", kPort);
             send_json(sock, frame.dump());
-            return recv_json(sock);
+            // Validate JSON at transport layer and return the raw string to
+            // preserve the original API contract.
+            return recv_json_parsed(sock).dump();
         } catch (...) {
             return "{}";
         }
     }
 
+    // Parsed variant to avoid double-parse in callers.
+    json send_application_manager_query_parsed(const json& frame) {
+        try {
+            SocketWrapper sock;
+            sock.create_tcp_socket();
+            sock.set_timeout_ms(5000);
+            sock.connect("127.0.0.1", 5175);
+            send_json(sock, frame.dump());
+            return recv_json_parsed(sock);
+        } catch (...) {
+            return json::object();
+        }
+    }
+
     std::string get_terminals_summary(const std::string& user_id) {
-        const std::string raw = send_application_manager_query({
+        const json r = send_application_manager_query_parsed({
             {"message_type", "LIST_SESSIONS"},
             {"user_id",      user_id}
         });
         try {
-            json r = json::parse(raw);
             const json sessions = r.value("sessions", json::array());
             if (sessions.empty()) return "";
 
@@ -1552,9 +1617,32 @@ private:
             if (!queue_key.empty()) frame["queue_key"] = queue_key;
             if (!user_id.empty()) frame["user_id"] = user_id;
             send_json(sock, frame.dump());
-            return recv_json(sock);
+            // Validate JSON at transport layer and return the raw string to
+            // preserve the original API contract.
+            return recv_json_parsed(sock).dump();
         } catch (...) {
             return "{}";
+        }
+    }
+
+    // Parsed variant: returns nlohmann::json directly to avoid extra parsing
+    json send_session_query_parsed(const std::string& query_type,
+                                   const std::string& queue_key,
+                                   const std::string& user_id) {
+        try {
+            SocketWrapper sock;
+            sock.create_tcp_socket();
+            sock.set_timeout_ms(5000);
+            sock.connect("127.0.0.1", 5171);
+
+            json frame = {{"message_type","SESSION_QUERY"},
+                          {"query_type", query_type}};
+            if (!queue_key.empty()) frame["queue_key"] = queue_key;
+            if (!user_id.empty()) frame["user_id"] = user_id;
+            send_json(sock, frame.dump());
+            return recv_json_parsed(sock);
+        } catch (...) {
+            return json::object();
         }
     }
 
@@ -1565,8 +1653,7 @@ private:
     void initialize_known_users() {
         std::unordered_set<std::string> found;
         try {
-            const std::string raw = send_session_query("all_sessions", "", "");
-            const json resp = json::parse(raw);
+            const json resp = send_session_query_parsed("all_sessions", "", "");
             const json users = resp.value("super_users", json::array());
             for (const auto& u : users) {
                 if (!u.is_object()) {

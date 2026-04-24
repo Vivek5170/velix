@@ -11,7 +11,7 @@
 #include "../utils/string_utils.hpp"
 #include "../utils/thread_pool.hpp"
 #include "../utils/timer.hpp"
-#include "../vendor/nlohmann/json.hpp"
+#include "../communication/json_include.hpp"
 
 
 #include "adapters/factory.hpp"
@@ -970,8 +970,7 @@ json notify_supervisor_llm_request(const PendingRequest &req,
   socket.set_timeout_ms(2000);
   velix::communication::send_json(socket, event.dump());
 
-  const std::string raw_response = velix::communication::recv_json(socket);
-  const json supervisor_response = json::parse(raw_response);
+  const json supervisor_response = velix::communication::recv_json_parsed(socket);
 
   if (supervisor_response.value("status", "error") != "ok") {
     throw std::runtime_error(
@@ -1391,6 +1390,139 @@ PendingRequest parse_request_payload(const std::string &raw_payload) {
   return req;
 }
 
+// Overload that accepts an already-parsed envelope JSON to avoid dump/parse
+// roundtrips for callers that already have a json object.
+PendingRequest parse_request_payload(const json &envelope) {
+  if (envelope.value("message_type", "") != "LLM_REQUEST") {
+    throw std::runtime_error("Scheduler only accepts message_type=LLM_REQUEST");
+  }
+
+  json request_json = envelope;
+  if (envelope.contains("payload") && envelope["payload"].is_object()) {
+    request_json = envelope["payload"];
+    request_json["message_type"] = "LLM_REQUEST";
+
+    // Preserve envelope metadata if payload omitted them.
+    if (!request_json.contains("request_id") &&
+        envelope.contains("request_id")) {
+      request_json["request_id"] = envelope["request_id"];
+    }
+    if (!request_json.contains("trace_id") && envelope.contains("trace_id")) {
+      request_json["trace_id"] = envelope["trace_id"];
+    }
+    if (!request_json.contains("tree_id") && envelope.contains("tree_id")) {
+      request_json["tree_id"] = envelope["tree_id"];
+    }
+    if (!request_json.contains("source_pid") &&
+        envelope.contains("source_pid")) {
+      request_json["source_pid"] = envelope["source_pid"];
+    }
+    if (!request_json.contains("priority") && envelope.contains("priority")) {
+      request_json["priority"] = envelope["priority"];
+    }
+    if (!request_json.contains("mode") && envelope.contains("mode")) {
+      request_json["mode"] = envelope["mode"];
+    }
+  }
+
+  if (!request_json.contains("request_id") ||
+      !request_json["request_id"].is_string() ||
+      request_json["request_id"].get<std::string>().empty()) {
+    throw std::runtime_error(
+        "LLM_REQUEST requires non-empty string request_id");
+  }
+  if (!request_json.contains("tree_id") ||
+      !request_json["tree_id"].is_string() ||
+      request_json["tree_id"].get<std::string>().empty()) {
+    throw std::runtime_error("LLM_REQUEST requires non-empty string tree_id");
+  }
+  if (!request_json.contains("source_pid") ||
+      !request_json["source_pid"].is_number_integer() ||
+      request_json["source_pid"].get<int>() <= 0) {
+    throw std::runtime_error(
+        "LLM_REQUEST requires positive integer source_pid");
+  }
+  if (!request_json.contains("mode") || !request_json["mode"].is_string()) {
+    throw std::runtime_error("LLM_REQUEST requires mode");
+  }
+
+  PendingRequest req;
+  req.request_id = request_json.value("request_id", "");
+  req.trace_id = request_json.value("trace_id", "");
+  req.tree_id = request_json.value("tree_id", "");
+  req.source_pid = request_json.value("source_pid", 0);
+  req.base_priority = request_json.value("priority", 1);
+  req.enqueued_at = std::chrono::steady_clock::now();
+  req.completion = std::make_shared<std::promise<json>>();
+
+  // Fix: Queue Limits vs Fairness
+  // Human users via the Telegram handler reside in 'TREE_HANDLER'. To prevent
+  // one human's slow generation from blocking all other human users,
+  // TREE_HANDLER requests are parallelized using their unique `convo_id`.
+  // However, autonomous background agents (like a Research Agent) must be
+  // strictly limited to ONE concurrent LLM request per tree to prevent a single
+  // agent from monopolizing all GPU slots. We enforce this by queueing them
+  // strictly by `tree_id`.
+  {
+    const std::string mode = request_json.value("mode", "simple");
+    const std::string user_id = request_json.value("user_id", "");
+
+    if (req.tree_id == "TREE_HANDLER" && mode == "user_conversation" &&
+        !user_id.empty()) {
+      req.queue_key = "user_" + user_id;
+    } else {
+      req.queue_key = req.tree_id; // Strict 1-key-per-tree GPU Lock
+    }
+  }
+
+  req.payload = std::move(request_json);
+
+  const std::string mode = req.payload.value("mode", "simple");
+  if (mode == "simple") {
+    if (req.payload.value("convo_id", std::string("")).size() > 0 ||
+        req.payload.value("user_id", std::string("")).size() > 0) {
+      throw std::runtime_error(
+          "simple mode requires empty convo_id and user_id");
+    }
+    const bool has_messages_array =
+        req.payload.contains("messages") && req.payload["messages"].is_array();
+    const bool has_user_message =
+        req.payload.contains("user_message") &&
+        req.payload["user_message"].is_string() &&
+        !req.payload["user_message"].get<std::string>().empty();
+    if (!has_messages_array && !has_user_message) {
+      throw std::runtime_error(
+          "simple mode requires messages[] or user_message");
+    }
+  } else if (mode == "conversation" || mode == "user_conversation") {
+    const bool has_messages_array =
+        req.payload.contains("messages") && req.payload["messages"].is_array();
+    const bool has_alt_input = req.payload.contains("user_message") ||
+                               req.payload.contains("system_message") ||
+                               req.payload.contains("tool_result") ||
+                               req.payload.contains("tool_message") ||
+                               req.payload.contains("tool_messages");
+    if (!has_messages_array && !has_alt_input) {
+      throw std::runtime_error("conversation modes require messages[] or "
+                               "user_message/system_message/tool_result");
+    }
+
+    if (mode == "conversation") {
+      if (!req.payload.value("user_id", std::string("")).empty()) {
+        throw std::runtime_error("conversation mode requires empty user_id");
+      }
+    } else {
+      if (req.payload.value("user_id", std::string("")).empty()) {
+        throw std::runtime_error("user_conversation mode requires user_id");
+      }
+    }
+  } else {
+    throw std::runtime_error("unsupported mode: " + mode);
+  }
+
+  return req;
+}
+
 void handle_client_connection(velix::communication::SocketWrapper client_socket,
                               const SchedulerConfig &cfg) {
   auto client_socket_ptr =
@@ -1401,12 +1533,10 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
   std::string current_trace;
   std::string current_request_id;
   try {
-    const std::string raw_payload =
-        velix::communication::recv_json(*client_socket_ptr);
+    const json envelope = velix::communication::recv_json_parsed(*client_socket_ptr);
 
     // SESSION_CONTROL / SESSION_QUERY: synchronous control-plane endpoints.
     {
-      const json envelope = json::parse(raw_payload);
       const std::string message_type = envelope.value("message_type", "");
 
       if (message_type == "SESSION_CONTROL") {
@@ -1421,7 +1551,9 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
       }
     }
     // ── LLM_REQUEST (normal path) ─────────────────────────────────────────────────
-    PendingRequest req = parse_request_payload(raw_payload);
+    // We already parsed the envelope above; use the json-aware parser variant
+    // to avoid serializing and reparsing the envelope.
+    PendingRequest req = parse_request_payload(envelope);
     current_trace = req.trace_id;
     current_request_id = req.request_id;
 

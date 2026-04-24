@@ -410,6 +410,15 @@ static std::string am_call(const json &request, const std::string &host, int por
     return velix::communication::recv_json(sock);
 }
 
+// New helper: returns parsed JSON from ApplicationManager to avoid double-parse
+static json am_call_parsed(const json &request, const std::string &host, int port) {
+    velix::communication::SocketWrapper sock;
+    sock.create_tcp_socket();
+    sock.connect(host, static_cast<uint16_t>(port));
+    velix::communication::send_json(sock, request.dump());
+    return velix::communication::recv_json_parsed(sock);
+}
+
 static std::string am_execute(const std::string &user_id,
                               const std::string &cmd,
                               int timeout_sec,
@@ -437,7 +446,7 @@ static std::string am_execute(const std::string &user_id,
     };
     if (!session_name.empty()) req["session_name"] = session_name;
 
-    json resp = json::parse(am_call(req, host, port));
+    json resp = am_call_parsed(req, host, port);
      if (resp.value("status", "") != "ok") {
          throw std::runtime_error("ApplicationManager EXECUTE error: " +
                                   resp.value("error", std::string("unknown")));
@@ -473,7 +482,7 @@ static json am_execute_full(const std::string &user_id,
     };
     if (!session_name.empty()) req["session_name"] = session_name;
 
-    json resp = json::parse(am_call(req, host, port));
+    json resp = am_call_parsed(req, host, port);
      if (resp.value("status", "") != "ok") {
          throw std::runtime_error("ApplicationManager EXECUTE error: " +
                                   resp.value("error", std::string("unknown")));
@@ -507,17 +516,19 @@ static json am_poll_until_done(const std::string &job_id,
              }
          }
 
-         json req = {{"message_type", "POLL"}, {"job_id", job_id}};
-         json resp;
-         try {
-             resp = json::parse(am_call(req, host, port));
-         } catch (const std::exception &e) {
-             // AM unreachable — return an error rather than looping forever.
-             return {{"status",     "ok"},
-                     {"job_status", "error"},
-                     {"exit_code",  -1},
-                     {"output",     std::string("[tool] Poll failed: ") + e.what()}};
-        }
+          json req = {{"message_type", "POLL"}, {"job_id", job_id}};
+          json resp;
+          try {
+              // Use the parsed variant to avoid allocating a string and parsing it
+              // again at the call site.
+              resp = am_call_parsed(req, host, port);
+          } catch (const std::exception &e) {
+              // AM unreachable — return an error rather than looping forever.
+              return {{"status",     "ok"},
+                      {"job_status", "error"},
+                      {"exit_code",  -1},
+                      {"output",     std::string("[tool] Poll failed: ") + e.what()}};
+         }
 
          if (resp.value("status", "") != "ok") {
              resp["job_status"] = "error";

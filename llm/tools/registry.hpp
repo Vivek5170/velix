@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../vendor/nlohmann/json.hpp"
+#include "../../communication/json_include.hpp"
 
 #include <filesystem>
 #include <fstream>

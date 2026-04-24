@@ -357,9 +357,7 @@ std::string request_llm_summary(const nlohmann::json &older_turns,
   socket.set_timeout_ms(cfg.scheduler_timeout_ms);
 
   velix::communication::send_json(socket, req.dump());
-  const std::string response_payload = velix::communication::recv_json(socket);
-
-  auto response = nlohmann::json::parse(response_payload);
+  auto response = velix::communication::recv_json_parsed(socket);
   if (response.value("status", "error") != "ok") {
     throw std::runtime_error("Scheduler summarization failed: " +
                              response.value("error", "unknown"));

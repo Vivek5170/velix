@@ -149,9 +149,11 @@ std::string receive_scheduler_response(
     bool request_streaming, int llm_timeout,
     const std::atomic<bool> &is_running,
     const std::function<void(const std::string &)> &on_token) {
-  if (!request_streaming) {
-    return velix::communication::recv_json(scheduler_socket);
-  }
+    if (!request_streaming) {
+      // Return the raw payload bytes and let the caller parse once. Avoid
+      // parsing here and then dumping and forcing the caller to parse again.
+      return velix::communication::recv_raw(scheduler_socket);
+    }
 
   const int max_chunks =
       velix::utils::get_config("SDK_STREAM_MAX_CHUNKS", 100000);
@@ -159,7 +161,7 @@ std::string receive_scheduler_response(
   const auto stream_deadline = std::chrono::steady_clock::now() +
                                std::chrono::milliseconds(llm_timeout + 10000);
 
-  while (chunk_count++ < max_chunks) {
+    while (chunk_count++ < max_chunks) {
     if (!is_running.load()) {
       throw std::runtime_error("process shutdown during streaming");
     }
@@ -168,9 +170,12 @@ std::string receive_scheduler_response(
       throw std::runtime_error("scheduler stream deadline exceeded");
     }
 
-    std::string raw;
+    std::string raw_message;
     try {
-      raw = velix::communication::recv_json(scheduler_socket);
+      // Read raw frame once. We only parse it to inspect streaming chunks;
+      // if it's the final reply we return the original raw string so the
+      // caller can parse it exactly once.
+      raw_message = velix::communication::recv_raw(scheduler_socket);
     } catch (const velix::communication::SocketTimeoutException &) {
       continue;
     } catch (const std::exception &e) {
@@ -181,22 +186,21 @@ std::string receive_scheduler_response(
       throw;
     }
 
-    json message;
     try {
-      message = json::parse(raw);
-    } catch (...) {
-      continue;
-    }
-
-    if (message.value("message_type", std::string("")) == "LLM_STREAM_CHUNK") {
-      const std::string delta = message.value("delta", std::string(""));
-      if (!delta.empty() && on_token) {
-        on_token(delta);
+      const json message = json::parse(raw_message);
+      if (message.value("message_type", std::string("")) == "LLM_STREAM_CHUNK") {
+        const std::string delta = message.value("delta", std::string(""));
+        if (!delta.empty() && on_token) {
+          on_token(delta);
+        }
+        continue;
       }
-      continue;
+    } catch (...) {
+      // If parsing failed, just try returning the raw message to the caller;
+      // they will handle validation.
     }
 
-    return raw;
+    return raw_message;
   }
 
   throw std::runtime_error("scheduler stream chunk limit exceeded");
@@ -217,8 +221,7 @@ json receive_executioner_ack(velix::communication::SocketWrapper &exec_socket,
     }
 
     try {
-      const std::string raw = velix::communication::recv_json(exec_socket);
-      return json::parse(raw);
+      return velix::communication::recv_json_parsed(exec_socket);
     } catch (const velix::communication::SocketTimeoutException &) {
       continue;
     } catch (const std::exception &e) {
@@ -398,12 +401,10 @@ void VelixProcess::start(int override_pid,
     reg_msg["source_pid"] = parent_pid;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(socket_mutex);
-    velix::communication::send_json(supervisor_socket, reg_msg.dump());
-    const std::string raw_reply =
-        velix::communication::recv_json(supervisor_socket);
-    const json reply = json::parse(raw_reply);
+    {
+      std::lock_guard<std::mutex> lock(socket_mutex);
+      velix::communication::send_json(supervisor_socket, reg_msg.dump());
+          const json reply = velix::communication::recv_json_parsed(supervisor_socket);
 
     if (reply.value("status", "") != "ok") {
       throw std::runtime_error("VelixProcess supervisor registration failed: " +
@@ -441,7 +442,8 @@ void VelixProcess::start(int override_pid,
                       {"tree_id", tree_id},
                       {"is_root", is_root}};
       velix::communication::send_json(bus_socket, bus_reg.dump());
-      velix::communication::recv_json(bus_socket); // OK ack
+      // Read and validate the ack from the bus.
+      (void)velix::communication::recv_json_parsed(bus_socket);
 
       bus_listener_thread = std::thread(&VelixProcess::bus_listener_loop, this);
     } catch (const std::exception &e) {
@@ -496,8 +498,8 @@ void VelixProcess::run_kernel_io_loop() {
           velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
           static_cast<uint16_t>(sup_port));
       velix::communication::send_json(hb_socket, heartbeat.dump());
-      velix::communication::recv_json(
-          hb_socket); // read the {"status": "ok"} acknowledgment
+      // Read and validate the ack from the supervisor.
+      (void)velix::communication::recv_json_parsed(hb_socket);
     } catch (...) {
       if (is_running) {
         LOG_WARN("Lost supervisor connection natively during heartbeat. Engine "
@@ -543,9 +545,8 @@ void VelixProcess::run_kernel_io_loop() {
 void VelixProcess::bus_listener_loop() {
   try {
     while (is_running && bus_socket.is_open()) {
-      try {
-        std::string raw = velix::communication::recv_json(bus_socket);
-        json msg = json::parse(raw);
+        try {
+          json msg = velix::communication::recv_json_parsed(bus_socket);
 
         const std::string msg_type = msg.value("message_type", "");
         if (msg_type == "IPM_PUSH" || msg_type == "CHILD_TERMINATED") {
@@ -928,7 +929,7 @@ std::string VelixProcess::call_llm_internal(
       velix::utils::get_config("SDK_MAX_ITERATIONS", 100);
 
   auto dispatch_llm_request = [&](const json &request_payload,
-                                  bool request_streaming) -> std::string {
+                                  bool request_streaming) -> json {
     const std::string trace_id = velix::utils::generate_uuid();
     const int sched_port = resolve_port("SCHEDULER", 5171);
     velix::communication::SocketWrapper scheduler_socket;
@@ -961,8 +962,22 @@ std::string VelixProcess::call_llm_internal(
     scheduler_socket.set_timeout_ms(stream_poll_timeout_ms);
     velix::communication::send_json(scheduler_socket, envelope.dump());
 
-    return receive_scheduler_response(scheduler_socket, request_streaming,
-                                      llm_timeout, is_running, on_token);
+    if (!request_streaming) {
+      // For non-streaming requests return parsed JSON directly to avoid the
+      // caller parsing the returned raw string.
+      return velix::communication::recv_json_parsed(scheduler_socket);
+    }
+
+    // For streaming requests, receive_scheduler_response will invoke on_token
+    // for incremental chunks and return the final raw reply string; parse it
+    // once and return the parsed JSON.
+    const std::string raw = receive_scheduler_response(scheduler_socket, request_streaming,
+                                                       llm_timeout, is_running, on_token);
+    try {
+      return json::parse(raw);
+    } catch (...) {
+      return json::object();
+    }
   };
 
   int loop_count = 0;
@@ -996,8 +1011,7 @@ std::string VelixProcess::call_llm_internal(
     pending_tool_messages = json::array();
 
     const bool request_streaming = payload.value("stream", false);
-    std::string raw_reply = dispatch_llm_request(payload, request_streaming);
-    json reply = json::parse(raw_reply);
+    json reply = dispatch_llm_request(payload, request_streaming);
 
     if (reply.value("status", "error") != "ok") {
       status.store(ProcessStatus::ERROR);

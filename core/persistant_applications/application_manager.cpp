@@ -307,8 +307,7 @@ private:
 
     void handle_client(velix::communication::SocketWrapper sock) {
         try {
-            const std::string raw  = velix::communication::recv_json(sock);
-            const json request     = json::parse(raw);
+            const json request     = velix::communication::recv_json_parsed(sock);
             const json response    = dispatch(request);
             velix::communication::send_json(sock, response.dump());
         } catch (const std::exception &e) {

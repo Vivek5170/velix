@@ -5,7 +5,7 @@
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
 #include "../utils/thread_pool.hpp"
-#include "../vendor/nlohmann/json.hpp"
+#include "../communication/json_include.hpp"
 
 #include <atomic>
 #include <exception>
@@ -171,8 +171,7 @@ private:
 
     try {
       while (running_ && socket_ptr->is_open()) {
-        std::string raw = velix::communication::recv_json(*socket_ptr);
-        json msg = json::parse(raw);
+      json msg = velix::communication::recv_json_parsed(*socket_ptr);
 
         std::string msg_type = msg.value("message_type", "");
 

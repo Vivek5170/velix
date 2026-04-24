@@ -3,7 +3,7 @@
 #include "json_storage_provider.hpp"
 #include "sqlite_storage_provider.hpp"
 
-#include "../../vendor/nlohmann/json.hpp"
+#include "../../communication/json_include.hpp"
 
 #include <fstream>
 

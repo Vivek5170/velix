@@ -2,7 +2,7 @@
 
 #include "runtime_adapters/runtime_adapters.hpp"
 
-#include "../vendor/nlohmann/json.hpp"
+#include "../communication/json_include.hpp"
 
 #include <map>
 #include <string>

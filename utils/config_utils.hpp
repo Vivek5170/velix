@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <cstdlib>
 #include <cctype>
-#include "../vendor/nlohmann/json.hpp"
+#include "../communication/json_include.hpp"
 
 namespace velix::utils {
 

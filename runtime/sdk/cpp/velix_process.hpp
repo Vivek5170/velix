@@ -12,7 +12,7 @@
 #include <unordered_set>
 
 #include "../../../communication/socket_wrapper.hpp"
-#include "../../../vendor/nlohmann/json.hpp"
+#include "../../../communication/json_include.hpp"
 
 using json = nlohmann::json;
 

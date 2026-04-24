@@ -1,16 +1,12 @@
 #include "socket_wrapper.hpp"
 
 #include <cstdint>
+#include "../utils/config_utils.hpp"
 
-#if __has_include(<nlohmann/json.hpp>)
-    #include <nlohmann/json.hpp>
-    inline constexpr bool kHasNlohmannJson = true;
-#elif __has_include("../vendor/nlohmann/json.hpp")
-    #include "../vendor/nlohmann/json.hpp"
-    inline constexpr bool kHasNlohmannJson = true;
-#else
-    inline constexpr bool kHasNlohmannJson = false;
-#endif
+#include "json_include.hpp"
+inline constexpr bool kHasNlohmannJson = true;
+
+#include "json_validate.hpp"
 
 namespace velix::communication {
 
@@ -29,19 +25,10 @@ static void recv_all(SocketWrapper& socket, char* data, std::size_t len) {
     }
 }
 
-static void validate_json_if_available(const std::string& msg) {
-#if __has_include(<nlohmann/json.hpp>) || __has_include("../vendor/nlohmann/json.hpp")
-    try {
-        [[maybe_unused]] auto parsed = nlohmann::json::parse(msg);
-    } catch (const std::exception& e) {
-        throw SocketException(std::string("Invalid JSON: ") + e.what());
-    }
-#else
-    (void)msg;
-#endif
-}
-
-std::string recv_json(SocketWrapper& socket) {
+// Read raw payload (no JSON validation) and return it. This function enforces
+// the configurable maximum message size and reads directly into a pre-sized
+// std::string to avoid extra copies.
+std::string recv_raw(SocketWrapper& socket) {
     if (!socket.is_open()) {
         throw SocketException("socket not open");
     }
@@ -50,15 +37,47 @@ std::string recv_json(SocketWrapper& socket) {
     recv_all(socket, reinterpret_cast<char*>(&net_len), sizeof(net_len));
 
     std::uint32_t len = ntohl(net_len);
-    if (constexpr std::uint32_t kMaxMessageSize = 10U * 1024U * 1024U;
-        len == 0 || len > kMaxMessageSize) {
+
+    // Configurable maximum message size (security boundary)
+    const std::uint32_t kDefaultMax = 10U * 1024U * 1024U; // 10 MB
+    const std::uint32_t max_size =
+        static_cast<std::uint32_t>(velix::utils::get_config("VELIX_COMM_MAX_MESSAGE_SIZE", kDefaultMax));
+    if (len == 0 || len > max_size) {
         throw SocketException("invalid message size");
     }
 
-    std::string msg(len, '\0');
-    recv_all(socket, msg.data(), msg.size());
-    validate_json_if_available(msg);
+    // Allocate once and read directly into the string buffer to avoid extra
+    // copies while keeping memory bounded by max_size.
+    std::string msg;
+    msg.resize(static_cast<std::size_t>(len));
+
+    const std::size_t kChunkSize = 64 * 1024; // 64 KB chunks
+    std::size_t offset = 0;
+    while (offset < static_cast<std::size_t>(len)) {
+        const std::size_t to_read = std::min<std::size_t>(kChunkSize, static_cast<std::size_t>(len) - offset);
+        recv_all(socket, msg.data() + offset, to_read);
+        offset += to_read;
+    }
+
     return msg;
+}
+
+nlohmann::json recv_json_parsed(SocketWrapper& socket) {
+    const std::string raw = recv_raw(socket);
+    try {
+        return nlohmann::json::parse(raw);
+    } catch (const std::exception& e) {
+        throw SocketException(std::string("Invalid JSON: ") + e.what());
+    }
+}
+
+// Backwards-compatible helper: reads and validates JSON, returns raw string.
+std::string recv_json(SocketWrapper& socket) {
+    const std::string raw = recv_raw(socket);
+    if (kHasNlohmannJson) {
+        validate_json_if_available(raw);
+    }
+    return raw;
 }
 
 } // namespace velix::communication

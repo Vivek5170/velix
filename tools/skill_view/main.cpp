@@ -7,7 +7,7 @@
 
 #include "../../runtime/sdk/cpp/velix_process.hpp"
 #include "../../llm/skills/skill_registry.hpp"
-#include "../../vendor/nlohmann/json.hpp"
+#include "../../communication/json_include.hpp"
 #include "../../utils/logger.hpp"
 
 #include <iostream>
@@ -111,4 +111,3 @@ int main() {
   tool->start();
   return 0;
 }
-

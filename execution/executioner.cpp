@@ -7,7 +7,7 @@
 #include "../utils/logger.hpp"
 #include "../utils/process_spawner.hpp"
 #include "../utils/thread_pool.hpp"
-#include "../vendor/nlohmann/json.hpp"
+#include "../communication/json_include.hpp"
 
 #include <atomic>
 #include <array>
@@ -1004,9 +1004,8 @@ private:
     void handle_client(velix::communication::SocketWrapper sock) {
         json response;
         try {
-            const std::string raw = velix::communication::recv_json(sock);
-            if (raw.empty()) return;
-            const json req = json::parse(raw);
+            const json req = velix::communication::recv_json_parsed(sock);
+            if (req.is_null()) return;
             response = handle_exec_request(req);
         } catch (const std::exception &e) {
             LOG_WARN("handle_client exception: " + std::string(e.what()));

@@ -3,7 +3,7 @@
 #include "../communication/socket_wrapper.hpp"
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
-#include "../vendor/nlohmann/json.hpp"
+#include "../communication/json_include.hpp"
 
 #include <chrono>
 #include <thread>

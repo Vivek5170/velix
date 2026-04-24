@@ -43,7 +43,7 @@
  * ────────────────────────────────────────────────────────────────────────────
  */
 
-#include "../../vendor/nlohmann/json.hpp"
+#include "../../communication/json_include.hpp"
 
 #include <atomic>
 #include <chrono>

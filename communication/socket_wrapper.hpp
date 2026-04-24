@@ -3,6 +3,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include "json_include.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -304,6 +305,7 @@ public:
 
   int send(const char *data, int len) const {
 #ifdef _WIN32
+    // On Windows: ::send returns SOCKET_ERROR on failure and sets WSAGetLastError
     if (const int result = ::send(socket_handle, data, len, 0);
         result == SOCKET_ERROR) {
       throw SocketException("Send failed: " + get_socket_error());
@@ -311,19 +313,27 @@ public:
       return result;
     }
 #else
-    // Use MSG_NOSIGNAL when available (Linux). On platforms where it
-    // is unavailable (e.g., macOS/BSD), SIGPIPE is already disabled by
-    // init_winsock_global() via signal(SIGPIPE, SIG_IGN).
+    // POSIX: retry on EINTR; for EAGAIN/EWOULDBLOCK return -1 so caller
+    // (send_all) can decide whether to retry or fail. Use MSG_NOSIGNAL to
+    // avoid SIGPIPE on Linux.
     int flags = 0;
 #ifdef MSG_NOSIGNAL
     flags = MSG_NOSIGNAL;
 #endif
-    if (const int result = ::send(socket_handle, data, len, flags);
-        result == -1) {
+
+    int result;
+    do {
+      result = ::send(socket_handle, data, len, flags);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == -1) {
+      // Non-fatal resource temporarily unavailable - bubble up
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return -1;
+      }
       throw SocketException("Send failed: " + get_socket_error());
-    } else {
-      return result;
     }
+    return result;
 #endif
   }
 
@@ -398,6 +408,15 @@ void send_json(SocketWrapper &socket, const std::string &json);
  * Receives a complete JSON message using length-prefixed framing.
  * Frame format: [4-byte big-endian length][raw JSON bytes].
  */
+// Read the raw payload (no JSON parsing). Validates frame length against
+// VELIX_COMM_MAX_MESSAGE_SIZE and returns the raw bytes.
+std::string recv_raw(SocketWrapper &socket);
+
+// Read and parse JSON, returning a parsed nlohmann::json object.
+nlohmann::json recv_json_parsed(SocketWrapper &socket);
+
+// Backwards-compatible helper: reads raw payload and validates JSON before
+// returning the raw string (keeps previous behavior).
 std::string recv_json(SocketWrapper &socket);
 
 } // namespace velix::communication
