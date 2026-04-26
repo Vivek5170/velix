@@ -168,7 +168,7 @@ Velix is composed of specialized service nodes:
  - **Interactive Ask-User Flow** (see docs/TERMINAL.md) - ASK_USER_REQUEST / ASK_USER_REPLY protocol for user approvals and prompts
 
 ### Usage
-- **[Terminal Commands](docs/TERMINAL.md)** - Full reference for `/help`, `/session-info`, `/new`, `/list`, `/delete`, `/undo`, and more
+- **[Terminal Commands](docs/TERMINAL.md)** - Full reference for `/help`, `/session_info`, `/new`, `/sessions`, `/delete`, `/undo`, and more
 - **[C++ SDK Documentation](runtime/README.md)**
 - **[Python SDK Documentation](runtime/sdk/python/README.md)**
 - **[Node.js / Go / Rust SDKs](runtime/sdk/)**
