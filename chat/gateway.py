@@ -25,7 +25,7 @@ Optional hooks (override as needed):
   - ``on_tool_start(tool, args)``
   - ``on_tool_finish(tool, result)``
   - ``on_context_usage(current, maximum, pct)``
-  - ``on_approval_request(approval_trace, payload)``
+  
   - ``on_notify(event)``      generic / unhandled bus events
   - ``on_error(message)``     error frames from the handler
 
@@ -39,8 +39,8 @@ Events emitted by the Handler:
   type == "tool_start"    → tool execution starting
   type == "tool_finish"   → tool execution finished
   type == "context_usage" → token budget status
-  type == "approval_request" → human-in-the-loop gate
-  type == "approval_ack"  → acknowledgement of our approval_reply
+  type == "ask_user_request" → generalized human-in-the-loop gate
+  type == "ask_user_ack"  → acknowledgement of our ask_user_reply
   type == "session_switched" → session_id changed in-band
   type == "notify"        → generic bus notification
   type == "error"         → handler-side error
@@ -50,7 +50,7 @@ Commands sent by the client:
   type == "message"          → user text → LLM
   type == "tool_message"     → resume after external tool result
   type == "resume_turn"      → resume after approval result
-  type == "approval_reply"   → answer an approval request
+  type == "ask_user_reply"   → answer a generalized ask_user request
   type == "switch_session"   → swap to a different session_id
   type == "list_users"       → pre-auth: enumerate super-users
   type == "list_sessions"    → pre-auth: enumerate sessions for a super-user
@@ -262,15 +262,28 @@ class Gateway(ABC):
         """Resume a turn with a structured result payload."""
         self._send_raw({"type": "resume_turn", "payload": {"result": result}})
 
-    def send_approval_reply(self, approval_trace: str, scope: str) -> None:
-        """Answer an approval request from the Handler."""
-        self._send_raw(
-            {
-                "type": "approval_reply",
-                "approval_trace": approval_trace,
-                "scope": scope,
-            }
-        )
+    def send_ask_user_reply(
+        self,
+        trace: str,
+        *,
+        status: str = "answered",
+        selected_option_id: Optional[str] = None,
+        free_text: Optional[str] = None,
+        responder: Optional[dict] = None,
+    ) -> None:
+        """Answer a generalized ask_user request from the Handler."""
+        payload: dict = {
+            "type": "ask_user_reply",
+            "trace": trace,
+            "status": status,
+        }
+        if selected_option_id is not None:
+            payload["selected_option_id"] = selected_option_id
+        if free_text is not None:
+            payload["free_text"] = free_text
+        if responder is not None:
+            payload["responder"] = responder
+        self._send_raw(payload)
 
     def switch_session(self, session_id: str) -> None:
         """Request the Handler to switch this connection to a different session."""
@@ -438,7 +451,7 @@ class Gateway(ABC):
         Deliver a Handler event to the user.
         event["type"] is one of:
           "token", "end", "tool_start", "tool_finish", "context_usage",
-          "approval_request", "approval_ack", "session_switched",
+          "ask_user_request", "ask_user_ack", "session_switched",
           "notify", "error"
         """
 
@@ -495,15 +508,16 @@ class Gateway(ABC):
             }
         )
 
-    def on_approval_request(self, approval_trace: str, payload: dict) -> None:
+    def on_ask_user_request(self, trace: str, payload: dict) -> None:
         """
-        Called when an agent needs human approval.
+        Called when a process asks the user a generalized question.
+        payload contains: question, options, allow_free_text, timeout_sec, metadata.
         Default: delivers the event.  Override to show interactive UI.
         """
         self.deliver(
             {
-                "type": "approval_request",
-                "approval_trace": approval_trace,
+                "type": "ask_user_request",
+                "trace": trace,
                 "payload": payload,
             }
         )
@@ -592,19 +606,16 @@ class Gateway(ABC):
                 total_context_tokens=event.get("total_context_tokens", 0),
             )
 
-        elif t == "approval_request":
-            payload = event.get("payload", {})
-            trace = event.get("approval_trace", "")
-            if not trace and isinstance(payload, dict):
-                trace = str(payload.get("approval_trace", ""))
-            self.on_approval_request(
-                trace,
-                payload,
-            )
-
-        elif t == "approval_ack":
+        elif t == "ask_user_ack":
             # Deliver raw for subclasses that want to react.
             self.deliver(event)
+
+        elif t == "ask_user_request":
+            payload = event.get("payload", {})
+            trace = event.get("trace", "")
+            if not trace and isinstance(payload, dict):
+                trace = str(payload.get("trace", ""))
+            self.on_ask_user_request(trace, payload)
 
         elif t == "session_switched":
             self.on_session_switched(event.get("session_id", ""))

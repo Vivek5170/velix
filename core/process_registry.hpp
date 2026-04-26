@@ -347,6 +347,10 @@ public:
    */
   std::string create_tree(std::string_view explicit_id = "");
 
+  // Internal helper: caller MUST hold unique_lock(registry_mutex_)
+  // Performs the actual tree creation/modification without taking any lock.
+  std::string create_tree_locked(std::string_view explicit_id = "");
+
   // ─── Utilities ─────────────────────────────────────────────────────
   /**
    * Get current pid counter value (for testing/debugging).

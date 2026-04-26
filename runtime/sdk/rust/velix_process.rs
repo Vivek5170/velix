@@ -131,7 +131,8 @@ impl VelixProcess {
             next_messages.push(json!({"role": "user", "content": user_message}));
         }
 
-        let max_iterations = env::var("SDK_MAX_ITERATIONS")
+        let max_iterations = env::var("VELIX_SDK_MAX_ITERATIONS")
+            .or_else(|_| env::var("SDK_MAX_ITERATIONS"))
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(100);
@@ -244,6 +245,50 @@ impl VelixProcess {
             }
             if std::time::Instant::now() > timeout_at {
                 return Err("tool result timeout".to_string());
+            }
+            let wait = cvar.wait_timeout(map, Duration::from_millis(100)).map_err(|_| "wait failed".to_string())?;
+            map = wait.0;
+        }
+    }
+
+    pub fn ask_user(&mut self, question: &str, options: Option<Vec<Value>>, allow_free_text: bool, timeout_sec: u64, metadata: Option<Value>) -> Result<Value, String> {
+        let stream = self.bus_stream.as_mut().ok_or("no bus connection")?;
+        let trace = format!("ask_{}", now_nanos());
+
+        let mut payload = json!({
+            "trace": trace,
+            "question": question,
+            "allow_free_text": allow_free_text,
+            "timeout_sec": timeout_sec
+        });
+
+        if let Some(opts) = options {
+            payload["options"] = Value::Array(opts);
+        }
+        if let Some(meta) = metadata {
+            payload["metadata"] = meta;
+        }
+
+        let msg = json!({
+            "message_type": "IPM_RELAY",
+            "target_pid": -1,
+            "purpose": "ASK_USER_REQUEST",
+            "user_id": self.user_id,
+            "payload": payload
+        });
+
+        send_framed(stream, &msg).map_err(|e| e.to_string())?;
+
+        let (lock, cvar) = &*self.responses;
+        let mut map = lock.lock().map_err(|_| "response lock poisoned".to_string())?;
+        let timeout_at = std::time::Instant::now() + Duration::from_secs(timeout_sec);
+        
+        loop {
+            if let Some(mut reply) = map.remove(&trace) {
+                return Ok(reply);
+            }
+            if std::time::Instant::now() > timeout_at {
+                return Ok(json!({"status": "timeout"}));
             }
             let wait = cvar.wait_timeout(map, Duration::from_millis(100)).map_err(|_| "wait failed".to_string())?;
             map = wait.0;
@@ -428,16 +473,21 @@ fn recv_framed(stream: &mut TcpStream) -> std::io::Result<Value> {
 }
 
 fn get_port(name: &str, fallback: i32) -> i32 {
-    for p in ["config/ports.json", "../config/ports.json", "build/config/ports.json"] {
-        let raw = match std::fs::read_to_string(p) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let v: Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        return v.get(name).and_then(|x| x.as_i64()).unwrap_or(fallback as i64) as i32;
+    // Environment-first: ports injected by executioner as VELIX_PORT_*.
+    // Alias map for scheduler variants.
+    let env_keys: Vec<String> = match name {
+        "SCHEDULER" | "LLM_SCHEDULER" => vec![
+            "VELIX_PORT_LLM_SCHEDULER".to_string(),
+            "VELIX_PORT_SCHEDULER".to_string(),
+        ],
+        _ => vec![format!("VELIX_PORT_{}", name)],
+    };
+    for key in &env_keys {
+        if let Ok(val) = env::var(key) {
+            if let Ok(port) = val.parse::<i32>() {
+                return port;
+            }
+        }
     }
     fallback
 }

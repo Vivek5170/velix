@@ -1,804 +1,91 @@
-Below is a **single clean Markdown spec** that includes the **correct behavior for agents, tools, and handlers**, including **result reporting and notifying handlers**.
-Unnecessary internal details are removed and only **SDK rules, functions, usage, modes, and behavior contracts** are kept.
+Below is a compact, authoritative Velix SDK specification for developers.
+
+Keep this short — it defines required behavior, contracts and the minimal
+API surface you need to implement tools, agents and handlers.
 
 ---
 
 # Velix SDK – Developer Guide
 
-This document describes how developers implement **tools, agents, and handlers** using the Velix SDK.
+This document describes how developers implement tools, agents, and handlers
+using the Velix SDK.
 
-> [!NOTE]
-> This guide predominantly uses **C++** syntax for examples. If you are developing with **Python**, please refer to the [Python SDK Guide](runtime/sdk/python/README.md) for equivalent syntax and patterns.
->
-> Valid LLM modes are strictly: `simple`, `conversation`, and `user_conversation`.
-> The `chat` alias is not part of the protocol.
+> NOTE: Examples in this repo primarily use C++. See runtime/sdk/python/README.md
+> for Python-specific examples.
 
-Velix provides a **process-based runtime** where components communicate through the Velix infrastructure.
-
-Developers interact with the runtime through the **`VelixProcess` SDK class**.
+Runtime conventions (must follow)
+- Env-first configuration: use VELIX_PORT_*, VELIX_SDK_* and the injected
+  VELIX_* environment variables (VELIX_PARENT_PID, VELIX_TRACE_ID,
+  VELIX_PARAMS, VELIX_USER_ID).
+- LLM modes: only `simple`, `conversation`, `user_conversation` are valid.
 
 ---
 
 # 1. Creating a Velix Tool / Process
 
-Every Velix component must inherit from:
+Every Velix component inherits from class VelixProcess. Implement only run()
+— the runtime handles registration, supervisor comms, the BUS, and heartbeats.
 
+Minimal C++ process pattern (conceptual):
 ```cpp
-class VelixProcess
+class MyProcess : public VelixProcess { void run() override { /* your logic */ } };
 ```
-
-Minimal process example:
-
-```cpp
-#include "velix_process.hpp"
-
-using namespace velix::core;
-
-class MyProcess : public VelixProcess {
-public:
-    MyProcess() : VelixProcess("my_process", "tool") {}
-
-    void run() override {
-
-        std::string response = call_llm(
-            "You are helpful",
-            "Explain recursion",
-            "simple"
-        );
-
-        json result = {
-            {"status","ok"},
-            {"response",response}
-        };
-
-        report_result(result);
-    }
-};
-
-int main() {
-    MyProcess proc;
-    proc.start();
-}
-```
-
-The runtime automatically handles:
-
-* process registration
-* supervisor communication
-* BUS messaging
-* heartbeat monitoring
-* execution tree membership
-
-Developers only implement logic inside **`run()`**.
-
----
 
 # 2. Process Roles
 
-Velix processes usually fall into three roles.
-
-### Tool / Skill
-
-Small processes that perform a task.
-
-Properties:
-
-```
-short execution
-stateless
-returns result
-```
-
-Tools **must call `report_result()`**.
+- Tool: short-lived, stateless. MUST call report_result() exactly once.
+- Agent: uses LLMs, orchestrates tools, coordinates workflows. LLM calls may automatically trigger tool execution and resume.
+- Handler: entry point for users; forwards ask_user requests and delivers replies.
 
 ---
 
-### Agent
+# 3. Quick API Reference (what you actually need)
 
-Processes that orchestrate reasoning and tool usage.
+Core primitives:
+- run()
+- call_llm(convo_id, user_message, system_message, user_id, mode)
+- call_llm_stream(..., on_token)
+- execute_tool(tool_name, args) → executes a tool via the runtime and waits for result
+- report_result(target_pid, data, trace_id = "", append = true)
+- call_llm_resume(convo_id, tool_result, user_id, on_token)
+- send_message(target_pid, purpose, payload)
+- ask_user(question, options, allow_free_text, timeout_sec, metadata)
+- on_bus_event(msg) → auto-called on the IO thread for non-RPC events; must be fast and non-blocking. Override to observe or dispatch work to a worker thread; do not mutate core runtime state.
+- on_tool_start(tool, args) → auto-called immediately before the runtime issues a tool invocation. Use for logging/metrics or lightweight metadata annotation; do not block and do not rely on modifying args to change runtime behavior.
+- on_tool_finish(tool, result) → auto-called after a tool completes or fails (always invoked). Use for logging, analytics or triggering async follow-ups; do not block and do not modify the result expecting it to change the delivered payload.
+- on_shutdown() → auto-called during process shutdown. Override to close sockets, flush logs and stop background workers; keep cleanup quick so shutdown proceeds.
 
-Properties:
+These hooks are invoked automatically by the runtime at the points above — implement them by overriding/assigning in your VelixProcess subclass for your preferred behavior.
 
-```
-call LLM
-call tools
-coordinate workflow
-notify handler when work completes
-```
+Rules to follow:
+- Tools: call report_result() exactly once before exit. If append=false,
+  later send NOTIFY_HANDLER with final result.
+- ask_user flows: ask_user() sends ASK_USER_REQUEST with a unique trace and
+  blocks until ASK_USER_REPLY with the same trace arrives. ASK_USER_REPLY must
+  be delivered to the original requester using send_message(requester_pid,
+  "ASK_USER_REPLY", payload). Do NOT use report_result() for ASK_USER replies.
+- send_message(): purpose is passed verbatim; use purpose="NOTIFY_HANDLER" for
+  handler notifications. If handler PID is unknown, use target_pid = -1.
+- on_bus_event(): MUST be non-blocking and quick; spawn worker threads for heavy
+  work. Hooks must not throw or mutate core runtime state.
 
-Agents usually send events to handlers.
+Messaging and correlation:
+- All RPC-like flows use trace ids. Preserve trace ids exactly.
 
----
+Environment and config:
+- Use VELIX_PORT_<SERVICE> and VELIX_SDK_<KEY> environment variables.
 
-### Handler
+Failure semantics (short):
+- System is fail-fast: missing report_result() causes deadlocks; tool crashes
+  and timeouts surface as errors; bus failures are terminal.
 
-Entry points that interact with users.
-
-Examples:
-
-```
-terminal handler
-telegram handler
-api handler
-```
-
-Handlers:
-
-```
-receive user requests
-spawn agents/tools
-receive events from agents
-deliver responses to users
-```
-
----
-
-# 3. SDK Functions
-
-Velix SDK exposes the following functions.
-
-| Function        | Purpose                    |
-| --------------- | -------------------------- |
-| run             | process entry point        |
-| call_llm        | request LLM response       |
-| call_llm_stream | stream LLM tokens          |
-| execute_tool    | execute another tool       |
-| report_result   | return result to caller    |
-| send_message    | send event message         |
-| on_tool_start   | hook before tool execution |
-| on_tool_finish  | hook after tool execution  |
-| on_bus_event    | receive event messages     |
+Common mistakes to avoid:
+- blocking inside on_bus_event
+- using report_result() to deliver ASK_USER replies
+- not calling report_result() from a tool
+- passing invalid LLM mode
 
 ---
 
-# 4. `run()`
-
-### Signature
-
-```cpp
-virtual void run() = 0;
-```
-
-### Purpose
-
-Main logic of the process.
-
-Executed after the runtime initializes the process.
-
-Inside `run()` developers may:
-
-* call LLMs
-* execute tools
-* send messages
-* run loops
-* spawn threads
-
-Example:
-
-```cpp
-void run() override {
-
-    json result = execute_tool(
-        "web_search",
-        {{"query","Velix architecture"}}
-    );
-
-    std::cout << result.dump() << std::endl;
-}
-```
-
----
-
-# 5. `call_llm()`
-
-### Signature
-
-```cpp
-std::string call_llm(
-    const std::string& convo_id,
-    const std::string& user_message = "",
-    const std::string& system_message = "",
-    const std::string& user_id = "",
-    const std::string& mode = ""
-);
-```
-
-### Purpose
-
-Send a request to the configured LLM.
-
-The function blocks until the response is returned.
-
----
-
-## Mode: `simple`
-
-Stateless LLM request.
-
-Conditions:
-
-```
-mode = "simple"
-convo_id must be empty
-```
-
-Behavior:
-
-```
-no conversation history
-single independent request
-```
-
-Example:
-
-```cpp
-call_llm(
-    "",
-    "Summarize this text",
-    "You are helpful",
-    "",
-    "simple"
-);
-```
-
----
-
-## Mode: `conversation`
-
-Maintains conversation history.
-
-Conditions:
-
-```
-mode = "conversation"
-user_id must be empty
-source process owns this conversation
-```
-
-Behavior:
-
-```
-conversation history stored
-future prompts use past context
-if convo_id is empty, runtime creates one automatically
-```
-
-Example:
-
-```cpp
-call_llm(
-    "", // runtime may create a convo_id on first turn
-    "Continue discussion",
-    "You are assistant",
-    "",
-    "conversation"
-);
-```
-
----
-
-## Mode: `user_conversation`
-
-Maintains per-user conversation history for handler-driven user sessions.
-
-Conditions:
-
-```
-mode = "user_conversation"
-user_id must not be empty
-allowed for handler context
-```
-
-Behavior:
-
-```
-history is keyed by user_id
-streaming is supported for interactive handlers
-```
-
-Example:
-
-```cpp
-call_llm(
-    "",
-    "Continue for this user",
-    "",
-    "alice",
-    "user_conversation"
-);
-```
-
----
-
-## Possible Errors
-
-`call_llm()` may throw:
-
-| Error            | Cause              |
-| ---------------- | ------------------ |
-| runtime_error    | LLM request failed |
-| invalid_argument | invalid mode       |
-| timeout_error    | LLM timeout        |
-
----
-
-# 6. `call_llm_stream()`
-
-### Signature
-
-```cpp
-std::string call_llm_stream(
-    const std::string& convo_id,
-    const std::string& user_message,
-    const std::function<void(const std::string&)>& on_token,
-    const std::string& system_message = "",
-    const std::string& user_id = "",
-    const std::string& mode = ""
-);
-```
-
-### Purpose
-
-Stream LLM output token-by-token.
-
-Each token triggers:
-
-```
-token_callback(token)
-```
-
-The function also returns the final full response.
-
----
-
-### Example
-
-```cpp
-call_llm_stream(
-    "",
-    "Explain transformers",
-    [&](const std::string& token){
-        std::cout << token;
-    },
-    "You are helpful",
-    "user_123",
-    "simple"
-);
-```
-
----
-
-# 7. `execute_tool()`
-
-### Signature
-
-```cpp
-json execute_tool(
-    const std::string& tool_name,
-    const json& args
-);
-```
-
-### Purpose
-
-Execute another Velix tool.
-
-The function blocks until the tool returns a result.
-
----
-
-### Example
-
-```cpp
-json result = execute_tool(
-    "web_search",
-    {{"query","Velix runtime"}}
-);
-```
-
----
-
-### Errors
-
-| Error            | Cause                      |
-| ---------------- | -------------------------- |
-| timeout_error    | tool did not return result |
-| runtime_error    | tool failed                |
-| invalid_argument | tool name invalid          |
-
----
-
-# 8. `report_result()`
-
-### Signature
-
-```cpp
-void report_result(
-    const json& result,
-    const std::string& trace_id = "",
-    bool append = true
-);
-```
-
-### Purpose
-
-Return execution result to the caller. Used by **tools**.
-
-### Parameters
-
-*   **`result`**: The JSON payload to return.
-*   **`trace_id`**: Optional. The trace ID provided in the tool invocation.
-*   **`append`**: 
-    *   `true` (Default): **Synchronous mode**. The result is returned directly to the `execute_tool()` caller and appended to the LLM conversation history immediately.
-    *   `false`: **Asynchronous/Background mode**. Informs the system that the tool has started a background process. The result is sent to the handler as a "start acknowledgement," but the LLM is **not** immediately resumed with this data, and it is **not** appended to the main history yet.
-
-### Required Rule
-
-Tools must call `report_result()` exactly once before exiting.
-
----
-
-# 9. Asynchronous Tool Reporting
-
-When a tool starts a background process using `append=false`, it must eventually report the final result back to the Handler to resume the agent's reasoning.
-
-> [!WARNING]
-> **Supervisor Limits**: Even after calling `report_result(append=false)`, the tool process remains subject to the Supervisor's `max_runtime_sec` (Default: 300s). For tasks exceeding 5 minutes, ensure the tool either spawns a detached child and exits immediately, or that the process manifest specifies a higher runtime limit.
-
-### Workflow Example:
-
-1.  **Start**: Tool calls `report_result({ "status": "background" }, trace_id, false)`.
-2.  **Work**: Tool executes a long-running process (e.g., in a thread).
-3.  **Finish**: Tool sends a `NOTIFY_HANDLER` message via the Bus.
-
-### Final Result Message
-
-To re-activate the LLM after a background task, send a message with `notify_type: "TOOL_RESULT"`.
-
-```cpp
-send_message(
-    -1, // Route to Handler
-    "NOTIFY_HANDLER",
-    {
-        "notify_type": "TOOL_RESULT",
-        "tool": "my_tool_name",
-        "result": {
-            "status": "ok",
-            "output": "The long task finished successfully."
-        }
-    }
-);
-```
-
-The Handler will receive this, append the result to the conversation, and trigger the LLM to continue reasoning.
-
-### Other Supported `notify_type` Values
-
-Use `purpose="NOTIFY_HANDLER"` with one of the following:
-
-| notify_type   | LLM involved | Added to conversation | Delivery behavior |
-| ------------- | ------------ | --------------------- | ----------------- |
-| TOOL_RESULT   | yes          | yes                   | resume reasoning for target user |
-| INDEPENDENT   | yes (simple) | no                    | target user if `user_id` set; otherwise broadcast |
-| SYSTEM_EVENT  | no           | no                    | target user if `user_id` set; otherwise broadcast |
-
-Routing rules:
-
-- If `user_id` exists: route to that session.
-- If `user_id` is empty: broadcast.
-- For `TOOL_RESULT`, missing `user_id` should be treated as undeliverable.
-
----
-
-# 10. `send_message()`
-
-### Signature
-
-```cpp
-void send_message(
-    int target_pid,
-    const std::string& purpose,
-    const json& payload
-);
-```
-
-### Purpose
-
-Send an event message to another process.
-
-SDK behavior:
-
-```
-purpose is passed exactly as provided by the caller
-
-user_id is always attached automatically
-```
-
-Notes:
-
-- `handler_pid` is typically provided by the runtime or startup configuration.
-- If you do not have an explicit handler PID, send `target_pid = -1`.
-- The Bus will then resolve the message to the registered handler tree root PID, if available.
-
-Developer guidance for agents:
-
-```
-use purpose = "NOTIFY_HANDLER" when notifying handlers
-```
-
----
-
-### Example
-
-```cpp
-send_message(
-    handler_pid,
-    "NOTIFY_HANDLER",
-        {
-            {"notify_type", "SYSTEM_EVENT"},
-            {"message", "Task completed"}
-        }
-);
-```
-
-If `handler_pid` is not known, you may send `-1` and the Bus will route to the active handler tree root.
-
----
-
-### Typical Uses
-
-```
-agent notifying handler
-background job completion
-delegated tasks
-inter-agent communication
-```
-
----
-
-# 11. `on_bus_event`
-
-### Definition
-
-```cpp
-std::function<void(const json&)> on_bus_event;
-```
-
-### Purpose
-
-Handle incoming event messages.
-
-Triggered when a message arrives that is **not an RPC response**.
-
-This hook is intended for SDK developers building handlers and agents that need to react to custom bus notifications.
-
-# 12. `on_tool_start` / `on_tool_finish`
-
-### Definition
-
-```cpp
-std::function<void(const std::string&, const json&)> on_tool_start;
-std::function<void(const std::string&, const json&)> on_tool_finish;
-```
-
-### 2. Background Tool (Asynchronous)
-
-Use this for long-running operations like builds, web crawling, or complex simulations.
-
-**Step 1: Start work and acknowledge immediately**
-### Purpose
-
-These hooks let your SDK process observe tool execution lifecycle events.
-
-- `on_tool_start` is called immediately before a tool request is launched.
-- `on_tool_finish` is called after the tool response is received.
-
-`on_tool_finish` receives the tool reply payload.
-In normal execution, that payload is the JSON object returned by the tool’s `report_result()` call.
-If the tool fails or the execution flow throws, `on_tool_finish` is still invoked with an error payload containing at least:
-
-- `status`: `"error"`
-- `message`: the failure message
-
-Typical uses:
-
-- logging tool invocation metadata
-- forwarding tool call progress to clients
-- emitting UI events to the terminal
-- auditing or tracing tool usage
-
-### Example
-
-```cpp
-on_tool_start = [&](const std::string &tool,
-                    const json &args) {
-  std::cout << "[Hook] Tool start: " << tool
-            << " args=" << args.dump() << std::endl;
-};
-
-on_tool_finish = [&](const std::string &tool,
-                     const json &result) {
-  if (result.value("status", "") == "error") {
-    std::cerr << "[Hook] Tool failed: " << tool
-              << " message=" << result.value("message", "unknown")
-              << std::endl;
-  } else {
-    std::cout << "[Hook] Tool finish: " << tool
-              << " result=" << result.dump() << std::endl;
-  }
-};
-```
-
-SDK developers can use these hooks in handlers to display tool lifecycle events in the terminal.
-
----
-
-# 13. `on_shutdown`
-
-### Definition
-
-```cpp
-virtual void on_shutdown() {}
-```
-
-### Purpose
-
-Override this hook in your process when you need to close resources cleanly before the runtime tears down sockets and exits.
-
-This is the proper hook for:
-
-- closing sockets
-- flushing logs
-- releasing external resources
-- terminating background threads safely
-
-Use it when your process may be forced to shut down and you need a last chance to clean up.
-
----
-
-### Example
-
-```cpp
-void on_shutdown() override {
-    if (server.is_open()) {
-        server.close();
-    }
-    if (terminal_client.is_open()) {
-        terminal_client.close();
-    }
-}
-```
-
----
-
-### Event example
-
-```cpp
-on_bus_event = [&](const json& msg){
-
-    std::string purpose = msg.value("purpose","");
-    std::string sender_user_id = msg.value("user_id", "");
-
-    if(purpose == "NOTIFY_HANDLER") {
-        std::string ntype = msg.value("payload", json::object())
-                              .value("notify_type", "");
-        std::cout << "Handler event: " << ntype << std::endl;
-    }
-};
-```
-
----
-
-### Important Rule
-
-`on_bus_event` must execute quickly.
-
-Do **not run heavy operations inside it**.
-
-Instead dispatch work to worker threads.
-
----
-
-# 14. Example Agent
-
-Agents typically:
-
-```
-use LLM for reasoning
-execute tools
-notify handler when finished
-```
-
-Example:
-
-```cpp
-void run() override {
-
-    std::string plan = call_llm(
-        "",
-        "Search for AI news",
-        "You are an agent",
-        "",
-        "simple"
-    );
-
-    json result = execute_tool(
-        "web_search",
-        {{"query","AI news"}}
-    );
-
-    send_message(
-        handler_pid,
-        "NOTIFY_HANDLER",
-                {
-                    {"notify_type", "TOOL_RESULT"},
-                    {"tool", "web_search"},
-                    {"result", result}
-                }
-    );
-}
-```
-
----
-
-# 15. Best Practices
-
-### Tools
-
-```
-stateless
-fast
-single result
-```
-
----
-
-### Agents
-
-```
-use LLM for planning
-call tools for actions
-notify handlers when finished
-```
-
----
-
-### Event Handlers
-
-```
-must return quickly
-avoid blocking calls
-dispatch heavy tasks to worker threads
-```
-
----
-
-# Summary
-
-Velix SDK provides the following primitives:
-
-```
-run()
-call_llm()
-call_llm_stream()
-execute_tool()
-report_result()
-send_message()
-on_tool_start()
-on_tool_finish()
-virtual void on_shutdown()
-on_bus_event()
-```
-
-Using these functions developers can build:
-
-```
-tools
-agents
-delegation systems
-background workers
-interactive handlers
-multi-agent workflows
-```
-
-without modifying the Velix runtime.
+This file is intentionally concise. For language-specific examples and
+expanded SDK usage see runtime/sdk/<language>/README.md (Python/C++/Node/etc.).

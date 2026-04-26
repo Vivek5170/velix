@@ -129,7 +129,7 @@ static void skill_log(const std::string &stage, const json &fields = json::objec
      try {
          std::scoped_lock lock(skill_log_mutex());
          fs::create_directories("logs");
-         std::ofstream out("logs/approval_trace.log", std::ios::app);
+         std::ofstream out("logs/ask_user_trace.log", std::ios::app);
          if (!out.is_open()) return;
          json record = {
              {"ts_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -962,28 +962,53 @@ private:
         {
             std::scoped_lock lk(cv_mx);
             on_bus_event = [&cv_mx, &cv, &got_reply, &reply_scope, trace](const json &msg) {
-                if (msg.value("purpose", "") != "APPROVAL_REPLY") return;
+                const std::string purpose = msg.value("purpose", "");
+                if (purpose != "ASK_USER_REPLY") return;
                 const json &pl = msg.value("payload", json::object());
-                if (pl.value("approval_trace", "") != trace) return;
+                const std::string msg_trace = pl.value("trace", "");
+                if (msg_trace != trace) return;
+
                 {
                     std::scoped_lock ilk(cv_mx);
-                    reply_scope = pl.value("scope", "deny");
-                    got_reply   = true;
+                    // New protocol: selected_option_id; legacy: scope.
+                    const std::string selected = pl.value("selected_option_id",
+                        pl.value("scope", "deny"));
+                    // Map option IDs to legacy scope values for compatibility.
+                    if (selected == "allow") reply_scope = "once";
+                    else if (selected == "whitelist") reply_scope = "permanent";
+                    else if (selected == "deny") reply_scope = "deny";
+                    else reply_scope = selected; // passthrough (once/permanent/deny)
+                    got_reply = true;
                 }
                 cv.notify_one();
             };
         }
 
-        skill_log("approval_request_created",
-                  {{"approval_trace", trace}, {"command", full_cmd},
+        skill_log("ask_user_request_created",
+                  {{"trace", trace}, {"command", full_cmd},
                    {"pattern_key", pattern_key}, {"description", description}});
 
-        send_message(-1, "APPROVAL_REQUEST",
-                     {{"approval_trace", trace}, {"command", full_cmd},
-                      {"description", description}, {"pattern_key", pattern_key}});
+        // Build ask_user payload with options for the gateway.
+        json options = json::array();
+        options.push_back({{"id", "allow"}, {"label", "Allow"}});
+        options.push_back({{"id", "deny"}, {"label", "Deny"}});
+        options.push_back({{"id", "whitelist"}, {"label", "Whitelist"}});
 
-        skill_log("approval_request_sent",
-                  {{"approval_trace", trace},
+        std::string question = "Action Required";
+        if (!full_cmd.empty()) question += ": " + full_cmd;
+        if (!description.empty()) question += " (" + description + ")";
+
+        send_message(-1, "ASK_USER_REQUEST",
+                     {{"trace", trace},
+                      {"question", question},
+                      {"options", options},
+                      {"allow_free_text", false},
+                      {"metadata", {{"command", full_cmd},
+                                    {"description", description},
+                                    {"pattern_key", pattern_key}}}});
+
+        skill_log("ask_user_request_sent",
+                  {{"trace", trace},
                    {"timeout_sec", skill_config().approval_timeout}});
 
         bool timed_out;
@@ -1000,7 +1025,7 @@ private:
         }
 
         if (timed_out) {
-            skill_log("approval_wait_timeout", {{"approval_trace", trace}});
+            skill_log("ask_user_wait_timeout", {{"trace", trace}});
             return {false, ApprovalScope::Deny,
                     "Approval timed out after " +
                     std::to_string(skill_config().approval_timeout) + "s — denied.",
@@ -1016,13 +1041,13 @@ private:
              scope = ApprovalScope::Deny;
          }
          if (scope == ApprovalScope::Deny) {
-            skill_log("approval_denied", {{"approval_trace", trace}, {"scope", reply_scope}});
+            skill_log("ask_user_denied", {{"trace", trace}, {"scope", reply_scope}});
             return {false, scope, "User denied: " + description, pattern_key, description};
         }
         if (scope == ApprovalScope::Permanent) approve_permanent(pattern_key);
 
-        skill_log("approval_granted",
-                  {{"approval_trace", trace}, {"scope", reply_scope},
+        skill_log("ask_user_granted",
+                  {{"trace", trace}, {"scope", reply_scope},
                    {"pattern_key", pattern_key}});
         return {true, scope, "Approved (" + reply_scope + ")", pattern_key, description};
     }

@@ -99,7 +99,8 @@ class VelixProcess {
     if (systemMessage) nextMessages.push({ role: 'system', content: systemMessage });
     if (userMessage) nextMessages.push({ role: 'user', content: userMessage });
 
-    const parsedMaxIterations = Number.parseInt(process.env.SDK_MAX_ITERATIONS || '100', 10);
+    const parsedMaxIterations = Number.parseInt(
+      process.env.VELIX_SDK_MAX_ITERATIONS || process.env.SDK_MAX_ITERATIONS || '100', 10);
     const maxIterations = Number.isFinite(parsedMaxIterations) ? parsedMaxIterations : 100;
     for (let i = 0; i < maxIterations; i++) {
       this.status = 'WAITING_LLM';
@@ -267,6 +268,60 @@ class VelixProcess {
     });
   }
 
+  async askUser(question, options = null, allowFreeText = false, timeoutSec = 300, metadata = null) {
+    if (!this.busSocket) {
+      return { status: 'cancelled', error: 'no_bus_connection' };
+    }
+
+    const traceId = crypto.randomUUID().replace(/-/g, '');
+    const payload = {
+      trace: traceId,
+      question,
+      allow_free_text: allowFreeText,
+      timeout_sec: timeoutSec,
+    };
+    if (options) payload.options = options;
+    if (metadata) payload.metadata = metadata;
+
+    const msg = {
+      message_type: 'IPM_RELAY',
+      target_pid: -1,
+      purpose: 'ASK_USER_REQUEST',
+      user_id: this.userId,
+      payload,
+    };
+
+    this.#sendFramed(this.busSocket, msg);
+
+    if (this.responses.has(traceId)) {
+      const resp = this.responses.get(traceId);
+      this.responses.delete(traceId);
+      return resp || {};
+    }
+
+    return await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        const waiters = this.pendingToolWaiters.get(traceId) || [];
+        this.pendingToolWaiters.set(
+          traceId,
+          waiters.filter((w) => w.resolve !== resolve)
+        );
+        resolve({ status: 'timeout' });
+      }, timeoutSec * 1000);
+
+      const waiter = {
+        resolve: (payload) => {
+          clearTimeout(timeout);
+          resolve(payload || {});
+        },
+      };
+
+      const waiters = this.pendingToolWaiters.get(traceId) || [];
+      waiters.push(waiter);
+      this.pendingToolWaiters.set(traceId, waiters);
+    });
+  }
+
   reportResult(targetPid, data, traceId = '', append = true) {
     if (!this.busSocket) return;
     const tid = traceId || this.entryTraceId;
@@ -414,18 +469,20 @@ class VelixProcess {
   }
 
   #getPort(name, fallback) {
-    const candidates = ['config/ports.json', '../config/ports.json', 'build/config/ports.json'];
-    try {
-      for (const p of candidates) {
-        if (!fs.existsSync(p)) continue;
-        const raw = fs.readFileSync(p, 'utf-8');
-        const ports = JSON.parse(raw);
-        return Number(ports[name] || fallback);
+    // Environment-first: ports injected by executioner as VELIX_PORT_*.
+    const aliasMap = {
+      SCHEDULER: ['VELIX_PORT_LLM_SCHEDULER', 'VELIX_PORT_SCHEDULER'],
+      LLM_SCHEDULER: ['VELIX_PORT_LLM_SCHEDULER', 'VELIX_PORT_SCHEDULER'],
+    };
+    const envKeys = aliasMap[name] || [`VELIX_PORT_${name}`];
+    for (const key of envKeys) {
+      const val = process.env[key];
+      if (val) {
+        const port = Number(val);
+        if (Number.isFinite(port) && port > 0) return port;
       }
-      return fallback;
-    } catch (_) {
-      return fallback;
     }
+    return fallback;
   }
 
   #parseJson(raw) {

@@ -74,7 +74,6 @@ OPENAI_API_KEY=sk-xxxxxxxx
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxx
 OLLAMA_API_KEY=optional-if-required
 ```
-
 Set the `api_key_env` field to reference the environment variable:
 
 ```json

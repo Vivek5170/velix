@@ -156,7 +156,7 @@ std::string receive_scheduler_response(
     }
 
   const int max_chunks =
-      velix::utils::get_config("SDK_STREAM_MAX_CHUNKS", 100000);
+      VelixProcess::resolve_sdk_config("STREAM_MAX_CHUNKS", 100000);
   int chunk_count = 0;
   const auto stream_deadline = std::chrono::steady_clock::now() +
                                std::chrono::milliseconds(llm_timeout + 10000);
@@ -341,11 +341,89 @@ uint64_t VelixProcess::get_current_memory_usage_mb() const {
 
 // static
 int VelixProcess::resolve_port(const std::string &service_name, int fallback) {
+  // Environment-first: ports injected by executioner as VELIX_PORT_*.
+  // No disk reads needed.
   if (service_name == "SCHEDULER") {
-    return velix::utils::get_port(
-        "LLM_SCHEDULER", velix::utils::get_port("SCHEDULER", fallback));
+    // Try LLM_SCHEDULER alias first, then SCHEDULER.
+    if (const auto v = read_env_var("VELIX_PORT_LLM_SCHEDULER"); v.has_value()) {
+      try { return std::stoi(*v); } catch (...) {}
+    }
+    if (const auto v = read_env_var("VELIX_PORT_SCHEDULER"); v.has_value()) {
+      try { return std::stoi(*v); } catch (...) {}
+    }
+    return fallback;
   }
-  return velix::utils::get_port(service_name, fallback);
+  const std::string env_key = "VELIX_PORT_" + service_name;
+  if (const auto v = read_env_var(env_key.c_str()); v.has_value()) {
+    try { return std::stoi(*v); } catch (...) {}
+  }
+  return fallback;
+}
+
+// static
+int VelixProcess::resolve_sdk_config(const std::string &key, int fallback) {
+  // Check VELIX_SDK_{key} first (injected by executioner).
+  const std::string env_key = "VELIX_SDK_" + key;
+  if (const auto v = read_env_var(env_key.c_str()); v.has_value()) {
+    try { return std::stoi(*v); } catch (...) {}
+  }
+  // Legacy fallback: SDK_{key} bare env var.
+  const std::string legacy_key = "SDK_" + key;
+  if (const auto v = read_env_var(legacy_key.c_str()); v.has_value()) {
+    try { return std::stoi(*v); } catch (...) {}
+  }
+  return fallback;
+}
+
+json VelixProcess::ask_user(const std::string &question,
+                            const json &options,
+                            bool allow_free_text,
+                            int timeout_sec,
+                            const json &metadata) {
+  if (!bus_socket.is_open()) {
+    return {{"status", "cancelled"}, {"error", "no_bus_connection"}};
+  }
+
+  const std::string ask_trace = velix::utils::generate_uuid();
+
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    pending_response_traces.insert(ask_trace);
+  }
+
+  json payload = {
+      {"trace", ask_trace},
+      {"question", question},
+      {"allow_free_text", allow_free_text},
+      {"timeout_sec", timeout_sec},
+  };
+  if (options.is_array() && !options.empty()) {
+    payload["options"] = options;
+  }
+  if (metadata.is_object() && !metadata.empty()) {
+    payload["metadata"] = metadata;
+  }
+
+  send_message(-1, "ASK_USER_REQUEST", payload);
+
+  json result;
+  {
+    std::unique_lock<std::mutex> lock(queue_mutex);
+    bool success = queue_cv.wait_for(
+        lock, std::chrono::seconds(timeout_sec),
+        [&] { return response_map.count(ask_trace) > 0; });
+
+    if (!success) {
+      pending_response_traces.erase(ask_trace);
+      return {{"status", "timeout"}};
+    }
+
+    result = response_map[ask_trace];
+    response_map.erase(ask_trace);
+    pending_response_traces.erase(ask_trace);
+  }
+
+  return result;
 }
 
 void VelixProcess::start(int override_pid,
@@ -380,8 +458,8 @@ void VelixProcess::start(int override_pid,
   is_root = (launch_intent == "NEW_TREE");
 
   const int sup_port = resolve_port("SUPERVISOR", 5173);
-  const int retry_limit = velix::utils::get_config("SDK_RETRY_LIMIT", 3);
-  const int retry_delay = velix::utils::get_config("SDK_RETRY_DELAY_MS", 500);
+  const int retry_limit = VelixProcess::resolve_sdk_config("RETRY_LIMIT", 3);
+  const int retry_delay = VelixProcess::resolve_sdk_config("RETRY_DELAY_MS", 500);
 
   connect_with_retries(supervisor_socket, "SUPERVISOR", sup_port, retry_limit,
                        retry_delay);
@@ -511,7 +589,7 @@ void VelixProcess::run_kernel_io_loop() {
 
     // Sleep between heartbeats without eating CPU cycles.
     std::unique_lock<std::mutex> sleep_lock(sleep_mutex);
-    const int hb_interval = velix::utils::get_config("SDK_HEARTBEAT_SEC", 5);
+    const int hb_interval = VelixProcess::resolve_sdk_config("HEARTBEAT_SEC", 5);
     sleep_cv.wait_for(sleep_lock, std::chrono::seconds(hb_interval),
                       [this] { return force_terminate.load(); });
   }
@@ -549,7 +627,7 @@ void VelixProcess::bus_listener_loop() {
           json msg = velix::communication::recv_json_parsed(bus_socket);
 
         const std::string msg_type = msg.value("message_type", "");
-        if (msg_type == "IPM_PUSH" || msg_type == "CHILD_TERMINATED") {
+         if (msg_type == "IPM_PUSH" || msg_type == "CHILD_TERMINATED" || msg_type == "IPM_RELAY") {
           const std::string trace_id = msg.value("trace_id", "");
           const json payload = msg.value("payload", json::object());
           bool routed_to_rpc = false;
@@ -701,15 +779,15 @@ json VelixProcess::execute_tool_internal(
 
     const int exec_port = resolve_port("EXECUTIONER", 5172);
     const int exec_timeout =
-        velix::utils::get_config("SDK_EXEC_TIMEOUT_MS", 120000);
+        VelixProcess::resolve_sdk_config("EXEC_TIMEOUT_MS", 120000);
     const int exec_retry_limit =
-        velix::utils::get_config("SDK_EXEC_RETRY_LIMIT", 3);
+        VelixProcess::resolve_sdk_config("EXEC_RETRY_LIMIT", 3);
     const int exec_retry_delay =
-        velix::utils::get_config("SDK_EXEC_RETRY_DELAY_MS", 300);
+        VelixProcess::resolve_sdk_config("EXEC_RETRY_DELAY_MS", 300);
     const int connect_retry_limit =
-        velix::utils::get_config("SDK_RETRY_LIMIT", 3);
+        VelixProcess::resolve_sdk_config("RETRY_LIMIT", 3);
     const int connect_retry_delay =
-        velix::utils::get_config("SDK_RETRY_DELAY_MS", 500);
+        VelixProcess::resolve_sdk_config("RETRY_DELAY_MS", 500);
 
     std::string last_exec_error = "unknown";
     bool launch_acked = false;
@@ -771,7 +849,7 @@ json VelixProcess::execute_tool_internal(
     json result;
     {
       std::unique_lock<std::mutex> lock(queue_mutex);
-      const int bus_wait = velix::utils::get_config("SDK_BUS_WAIT_MIN", 60);
+      const int bus_wait = VelixProcess::resolve_sdk_config("BUS_WAIT_MIN", 60);
       bool success =
           queue_cv.wait_for(lock, std::chrono::minutes(bus_wait), [&] {
             return response_map.count(actual_trace) > 0;
@@ -926,15 +1004,15 @@ std::string VelixProcess::call_llm_internal(
   }
 
   const int max_iterations =
-      velix::utils::get_config("SDK_MAX_ITERATIONS", 100);
+      VelixProcess::resolve_sdk_config("MAX_ITERATIONS", 100);
 
   auto dispatch_llm_request = [&](const json &request_payload,
                                   bool request_streaming) -> json {
     const std::string trace_id = velix::utils::generate_uuid();
     const int sched_port = resolve_port("SCHEDULER", 5171);
     velix::communication::SocketWrapper scheduler_socket;
-    const int retry_limit = velix::utils::get_config("SDK_RETRY_LIMIT", 3);
-    const int retry_delay = velix::utils::get_config("SDK_RETRY_DELAY_MS", 500);
+    const int retry_limit = VelixProcess::resolve_sdk_config("RETRY_LIMIT", 3);
+    const int retry_delay = VelixProcess::resolve_sdk_config("RETRY_DELAY_MS", 500);
     try {
       connect_with_retries(scheduler_socket, "SCHEDULER", sched_port,
                            retry_limit, retry_delay);
@@ -953,12 +1031,9 @@ std::string VelixProcess::call_llm_internal(
     envelope["priority"] = envelope.value("priority", 1);
 
     const int llm_timeout =
-        velix::utils::get_config("SDK_LLM_TIMEOUT_MS", 305000);
-    // Use a short per-recv poll timeout so a stalled chunk is retried quickly.
-    // The stream_deadline inside receive_scheduler_response() enforces the
-    // overall wall-clock cap.
+        VelixProcess::resolve_sdk_config("LLM_TIMEOUT_MS", 305000);
     const int stream_poll_timeout_ms =
-        velix::utils::get_config("SDK_STREAM_POLL_TIMEOUT_MS", 30000);
+        VelixProcess::resolve_sdk_config("STREAM_POLL_TIMEOUT_MS", 30000);
     scheduler_socket.set_timeout_ms(stream_poll_timeout_ms);
     velix::communication::send_json(scheduler_socket, envelope.dump());
 

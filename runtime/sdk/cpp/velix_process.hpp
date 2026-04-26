@@ -76,6 +76,11 @@ public:
   void send_message(int target_pid, const std::string &purpose,
                     const json &payload);
 
+  // Generalized ask_user: sends ASK_USER_REQUEST to gateway and waits for reply.
+  // Returns: {"status": "answered", "selected_option_id": "...", "free_text": "..."}
+  json ask_user(const std::string &question, const json &options,
+                bool allow_free_text, int timeout_sec, const json &metadata);
+
   // Main lifecycle initialization. Must be called by main() before process
   // exit. Connects to the Supervisor, sends REGISTER_PID, and spawns the
   // heartbeat loop. Throws if registration/connectivity contracts fail.
@@ -191,6 +196,10 @@ protected:
   void report_result(int target_pid, const json &data,
                      const std::string &trace_id = "", bool append = true);
   static int resolve_port(const std::string &service_name, int fallback);
+public:
+  // Read SDK config from VELIX_SDK_* env (injected by executioner).
+  // key is without prefix, e.g. "RETRY_LIMIT" → reads VELIX_SDK_RETRY_LIMIT.
+  static int resolve_sdk_config(const std::string &key, int fallback);
 };
 
 } // namespace velix::core

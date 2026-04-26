@@ -165,7 +165,7 @@ Velix is composed of specialized service nodes:
 ### Setup & Configuration
 - **[LLM Provider Setup](docs/SETUP_LLM.md)** - Configure llama.cpp, Ollama, OpenAI, Anthropic, or other providers
 - **[Storage Backends](docs/STORAGE.md)** - Choose between JSON or SQLite for conversation storage
-- **[Tool Approval System](docs/APPROVAL_SYSTEM.md)** - Understand permission controls for sensitive commands
+ - **Interactive Ask-User Flow** (see docs/TERMINAL.md) - ASK_USER_REQUEST / ASK_USER_REPLY protocol for user approvals and prompts
 
 ### Usage
 - **[Terminal Commands](docs/TERMINAL.md)** - Full reference for `/help`, `/session-info`, `/new`, `/list`, `/delete`, `/undo`, and more

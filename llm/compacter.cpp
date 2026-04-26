@@ -2,6 +2,7 @@
 
 #include "../communication/network_config.hpp"
 #include "../communication/socket_wrapper.hpp"
+#include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
 
 #include <chrono>
@@ -164,25 +165,8 @@ CompacterConfig load_compacter_config() {
 }
 
 int load_scheduler_port() {
-  std::ifstream ports_file("config/ports.json");
-  if (!ports_file.is_open()) {
-    ports_file.open("../config/ports.json");
-  }
-  if (!ports_file.is_open()) {
-    ports_file.open("build/config/ports.json");
-  }
-  if (!ports_file.is_open()) {
-    return 5171;
-  }
-
-  try {
-    nlohmann::json ports;
-    ports_file >> ports;
-    return ports.value("LLM_SCHEDULER", 5171);
-  } catch (const std::exception &e) {
-    // Failed to parse ports.json or retrieve LLM_SCHEDULER port; use default
-    return 5171;
-  }
+  return velix::utils::get_port("LLM_SCHEDULER",
+             velix::utils::get_port("SCHEDULER", 5171));
 }
 
 std::size_t estimate_history_tokens(const nlohmann::json &history) {

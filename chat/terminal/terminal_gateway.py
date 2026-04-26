@@ -6,7 +6,7 @@ The interactive TUI.  Inherits from Gateway and wires up:
   - KawaiiSpinner for tool feedback
   - Streaming token display with flush reconciliation
   - Context-usage bar after every turn
-  - Approval request flow
+  - ask_user request flow
   - Full slash-command table (both client-side and forwarded)
   - In-band session switching (switch_session frame)
   - Tool-output display gated by tool_output_mode
@@ -114,10 +114,10 @@ class TerminalGateway(Gateway):
 
         # Session state
         self._prompt_session = PromptSession(history=FileHistory(str(_HISTORY_FILE)))
-        # Gate input so approval prompts don't race with main prompt session.
+        # Gate input so ask_user prompts don't race with main prompt session.
         self._turn_done = threading.Event()
         self._turn_done.set()
-        self._approval_queue = queue.Queue()
+        self._ask_user_queue = queue.Queue()
         self._approve_mode = "default"  # all | default (runtime only)
 
         # Register extra commands
@@ -204,23 +204,12 @@ class TerminalGateway(Gateway):
             )
             # Don't print the bar here; it's printed in _handle_end instead.
 
-        elif t == "approval_request":
+        elif t == "ask_user_request":
             payload = event.get("payload", {})
-            trace = event.get("approval_trace", "")
+            trace = event.get("trace", "")
             if not trace and isinstance(payload, dict):
-                trace = str(payload.get("approval_trace", ""))
-            self.on_approval_request(
-                trace,
-                payload,
-            )
-
-        elif t == "approval_ack":
-            trace = event.get("approval_trace", "")
-            _pt_print(
-                f"\n{S.DIM_CYAN}  ✓ Approval acknowledged (trace {trace[:8]}…){S.RST}"
-            )
-            # DO NOT set _turn_done here; multiple tool calls may follow.
-            # Only 'end' or 'error' frames should conclude the turn.
+                trace = str(payload.get("trace", ""))
+            self.on_ask_user_request(trace, payload)
 
         elif t == "session_switched":
             sid = event.get("session_id", "")
@@ -334,19 +323,19 @@ class TerminalGateway(Gateway):
         self._ctx_tool_schema = max(0, tool_schema_tokens)
         self._ctx_request = max(0, request_tokens)
 
-    def on_approval_request(self, approval_trace: str, payload: dict) -> None:
+    def on_ask_user_request(self, trace: str, payload: dict) -> None:
         """
         Non-blocking hook called from bg receiver thread.
         Enqueues the request for the main thread to handle interactively.
         """
-        self._approval_queue.put((approval_trace, payload))
+        self._ask_user_queue.put((trace, payload))
 
-    def _handle_approval_interactively(
-        self, approval_trace: str, payload: dict
+    def _handle_ask_user_interactively(
+        self, trace: str, payload: dict
     ) -> None:
         """
-        Interactive approval prompt in main thread (Context [B]).
-        Allows for user input while background streams continue (via patch_stdout).
+        Interactive ask_user prompt in main thread (Context [B]).
+        Supports both options-based selection and free-text input.
         """
         self._ensure_newline()
         if self._spinner.is_running():
@@ -359,54 +348,108 @@ class TerminalGateway(Gateway):
             self._current_tool = ""
             self._tool_start_time = 0.0
 
-        cmd = payload.get("command", payload.get("message", ""))
-        desc = payload.get("description", "")
+        question = payload.get("question", "Input required")
+        options = payload.get("options", [])
+        allow_free_text = payload.get("allow_free_text", False)
+
         _pt_print(f"\n{S.YELLOW}{'─' * 52}{S.RST}")
-        _pt_print(f"  {S.BOLD_YELLOW}⚠  Action Required{S.RST}")
+        _pt_print(f"  {S.BOLD_YELLOW}⚠  {sanitize(question)}{S.RST}")
         _pt_print(f"{S.YELLOW}{'─' * 52}{S.RST}")
-        if cmd:
-            _pt_print(f"  Command : {S.WHITE}{sanitize(cmd)}{S.RST}")
-        if desc:
-            _pt_print(f"  Reason  : {sanitize(desc)}")
-        if approval_trace:
-            _pt_print(f"  Trace ID: {S.CYAN}{sanitize(approval_trace)}{S.RST}")
-        _pt_print(f"{S.YELLOW}{'─' * 52}{S.RST}")
+        if trace:
+            _pt_print(f"  Trace ID: {S.CYAN}{sanitize(trace[:12])}{S.RST}")
 
-        if self._approve_mode == "all":
-            _pt_print(f"  Mode    : {S.CYAN}all{S.RST} (auto-approved)")
-            self.send_approval_reply(approval_trace, "once")
-            return
+        if options:
+            # Display numbered options
+            option_ids = []
+            for i, opt in enumerate(options, 1):
+                opt_id = opt.get("id", str(i))
+                label = opt.get("label", opt_id)
+                option_ids.append(opt_id)
+                _pt_print(f"  {S.CYAN}{i}.{S.RST} {label}")
 
-        _pt_print("  Reply:  allow / deny / whitelist")
-        ans = ""
-        while ans not in ("allow", "deny", "whitelist"):
+            if allow_free_text:
+                _pt_print(f"  {S.DIM}Or type a custom response{S.RST}")
+
+            _pt_print(f"{S.YELLOW}{'─' * 52}{S.RST}")
+
+            while True:
+                try:
+                    ans = self._prompt_session.prompt(ANSI("  ❯ ")).strip()
+                except (EOFError, KeyboardInterrupt):
+                    # User cancelled
+                    # Map legacy cancel to 'deny' selection
+                    if is_legacy:
+                        self.send_ask_user_reply(trace, selected_option_id="deny")
+                    else:
+                        self.send_ask_user_reply(trace, status="cancelled")
+                    return
+
+                if not ans:
+                    continue
+
+                # Try to match by number
+                try:
+                    idx = int(ans) - 1
+                    if 0 <= idx < len(option_ids):
+                        selected_id = option_ids[idx]
+                        # For both legacy and new flows send a standardized
+                        # ask_user reply selecting the option id.
+                        self.send_ask_user_reply(
+                            trace, selected_option_id=selected_id,
+                        )
+                        return
+                except ValueError:
+                    pass
+
+                # Try to match by option id or label
+                ans_lower = ans.lower()
+                matched = None
+                for opt in options:
+                    if ans_lower == opt.get("id", "").lower() or \
+                       ans_lower == opt.get("label", "").lower():
+                        matched = opt.get("id")
+                        break
+                if matched:
+                    # Send standardized ask_user reply with selected option id
+                    self.send_ask_user_reply(trace, selected_option_id=matched)
+                    return
+
+                # If free text is allowed, use the raw input
+                if allow_free_text:
+                    self.send_ask_user_reply(trace, free_text=ans)
+                    return
+
+                valid = ", ".join(
+                    f"{i+1}/{opt.get('label', opt.get('id', '?'))}" for i, opt in enumerate(options)
+                )
+                _pt_print(f"  Please type one of: {valid}")
+
+        elif allow_free_text:
+            # Free-text only mode
+            _pt_print(f"{S.YELLOW}{'─' * 52}{S.RST}")
             try:
-                # Use project's existing PromptSession for clean TUI state
-                ans = self._prompt_session.prompt(ANSI("  > ")).strip().lower()
+                ans = self._prompt_session.prompt(ANSI("  ❯ ")).strip()
             except (EOFError, KeyboardInterrupt):
-                ans = "deny"
-                break
-            if ans not in ("allow", "deny", "whitelist"):
-                _pt_print("  Please type exactly: allow / deny / whitelist")
-        scope = {
-            "allow": "once",
-            "deny": "deny",
-            "whitelist": "always",
-        }.get(ans, "deny")
-        self.send_approval_reply(approval_trace, scope)
+                self.send_ask_user_reply(trace, status="cancelled")
+                return
+            self.send_ask_user_reply(trace, free_text=ans)
+        else:
+            # No options and no free text — just acknowledge
+            _pt_print(f"  {S.DIM}(No response needed){S.RST}")
+            self.send_ask_user_reply(trace, status="answered")
 
     def _wait_for_turn_completion(self) -> None:
         """
         Main thread polling loop: waits for self._turn_done while
-        processing interactive signals (like approvals) from the receiver.
+        processing interactive signals (like ask_user) from the receiver.
         Ensures the queue is drained even if the turn ends abruptly.
         """
-        while not self._turn_done.is_set() or not self._approval_queue.empty():
+        while not self._turn_done.is_set() or not self._ask_user_queue.empty():
             try:
                 # Use non-blocking polling pattern for cleaner loop
-                req = self._approval_queue.get_nowait()
+                req = self._ask_user_queue.get_nowait()
                 trace, payload = req
-                self._handle_approval_interactively(trace, payload)
+                self._handle_ask_user_interactively(trace, payload)
             except queue.Empty:
                 time.sleep(0.05)
                 continue
@@ -479,10 +522,10 @@ class TerminalGateway(Gateway):
                     if not text:
                         continue
 
-                    # Prevent stale approvals from previous turns from surfacing
-                    while not self._approval_queue.empty():
+                    # Prevent stale ask_user requests from previous turns from surfacing
+                    while not self._ask_user_queue.empty():
                         try:
-                            self._approval_queue.get_nowait()
+                            self._ask_user_queue.get_nowait()
                         except queue.Empty:
                             break
 

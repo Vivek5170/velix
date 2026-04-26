@@ -36,7 +36,9 @@ ProcessRegistry::RegisterResult ProcessRegistry::register_process(
     is_tree_root = true;
   } else if (final_tree_id.empty()) {
     // Create new tree
-    final_tree_id = create_tree();
+    // register_process already holds unique_lock(registry_mutex_)
+    // so call internal unlocked helper to avoid double-locking.
+    final_tree_id = create_tree_locked();
     is_tree_root = true;
   } else {
     // Verify tree exists
@@ -423,7 +425,13 @@ void ProcessRegistry::mark_tree_failed(std::string_view tree_id) {
 }
 
 std::string ProcessRegistry::create_tree(std::string_view explicit_id) {
-  // FIX #7: Use explicit tree ID if provided, otherwise auto-generate
+  // Acquire exclusive lock for tree creation/modification
+  std::unique_lock<std::shared_mutex> lock(registry_mutex_);
+  return create_tree_locked(explicit_id);
+}
+
+std::string ProcessRegistry::create_tree_locked(std::string_view explicit_id) {
+  // Caller MUST hold unique_lock(registry_mutex_)
   std::string tree_id;
   if (!explicit_id.empty()) {
     tree_id = std::string(explicit_id);

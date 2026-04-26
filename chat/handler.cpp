@@ -222,18 +222,18 @@ private:
             const json        payload    = msg.value("payload", json::object());
             const int         source_pid = msg.value("source_pid", -1);
 
-            // ── Approval request ──────────────────────────────────────────
-            if (purpose == "APPROVAL_REQUEST") {
+            // ── ASK_USER_REQUEST (generalized ask-user) ─────────────────
+            if (purpose == "ASK_USER_REQUEST") {
                 const std::string atrace =
-                    payload.value("approval_trace", std::string(""));
+                    payload.value("trace", std::string(""));
                 if (!atrace.empty() && source_pid > 0) {
-                    std::lock_guard<std::mutex> lk(approval_map_mutex_);
-                    approval_trace_to_pid_[atrace] = source_pid;
+                    std::lock_guard<std::mutex> lk(ask_trace_map_mutex_);
+                    ask_trace_to_pid_[atrace] = source_pid;
                 }
                 if (!sender_uid.empty()) {
                     send_to_session(sender_uid,
-                                    {{"type","approval_request"},
-                                     {"approval_trace", atrace},
+                                    {{"type","ask_user_request"},
+                                     {"trace", atrace},
                                      {"payload", payload}});
                 }
                 return;
@@ -530,9 +530,9 @@ private:
                 json j = json::parse(raw);
                 const std::string type = j.value("type", std::string(""));
 
-                // Approval replies are routed directly — don't queue.
-                if (type == "approval_reply") {
-                    handle_approval_reply(j, session);
+                // Generalised ask_user_reply — direct route.
+                if (type == "ask_user_reply") {
+                    handle_ask_user_reply(j, session);
                     continue;
                 }
 
@@ -1264,32 +1264,45 @@ private:
     }
 
     // ------------------------------------------------------------------
-    // Approval reply
+    // ASK_USER_REPLY handling
     // ------------------------------------------------------------------
 
-    void handle_approval_reply(const json& j,
+    void handle_ask_user_reply(const json& j,
                                 std::shared_ptr<Session> session) {
-        const std::string atrace = j.value("approval_trace", std::string(""));
-        const std::string scope  = j.value("scope", std::string("deny"));
+        const std::string atrace = j.value("trace", std::string(""));
+        const std::string status = j.value("status", std::string("answered"));
         int target_pid = -1;
         {
-            std::lock_guard<std::mutex> lk(approval_map_mutex_);
-            auto it = approval_trace_to_pid_.find(atrace);
-            if (it != approval_trace_to_pid_.end()) {
+            std::lock_guard<std::mutex> lk(ask_trace_map_mutex_);
+            auto it = ask_trace_to_pid_.find(atrace);
+            if (it != ask_trace_to_pid_.end()) {
                 target_pid = it->second;
-                approval_trace_to_pid_.erase(it);
+                ask_trace_to_pid_.erase(it);
             }
         }
         if (target_pid > 0 && !atrace.empty()) {
-            send_message(target_pid, "APPROVAL_REPLY",
-                         {{"approval_trace", atrace}, {"scope", scope}});
+            // Build reply payload to send back to the requesting process
+            json reply_payload = {
+                {"status", status},
+                {"trace", atrace},
+            };
+            if (j.contains("selected_option_id"))
+                reply_payload["selected_option_id"] = j["selected_option_id"];
+            if (j.contains("free_text"))
+                reply_payload["free_text"] = j["free_text"];
+            if (j.contains("responder"))
+                reply_payload["responder"] = j["responder"];
+            
+            // Send reply back to the requesting process (e.g., terminal tool)
+            // via send_message() so it includes the "purpose" field for proper routing.
+            send_message(target_pid, "ASK_USER_REPLY", reply_payload);
         }
         std::lock_guard<std::mutex> slk(session->socket_mutex);
         try {
             send_json(session->socket,
-                      json{{"type","approval_ack"},
-                           {"approval_trace", atrace},
-                           {"target_pid",     target_pid}}.dump());
+                      json{{"type","ask_user_ack"},
+                           {"trace", atrace},
+                           {"target_pid", target_pid}}.dump());
         } catch (...) {}
     }
 
@@ -1780,8 +1793,8 @@ private:
     std::unordered_set<std::string> known_users_;
     std::mutex known_users_mutex_;
 
-    std::unordered_map<std::string, int> approval_trace_to_pid_;
-    std::mutex approval_map_mutex_;
+    std::unordered_map<std::string, int> ask_trace_to_pid_;
+    std::mutex ask_trace_map_mutex_;
 
     mutable std::mutex thread_ctx_mutex_;
     std::unordered_map<std::thread::id, std::string> thread_ctx_;

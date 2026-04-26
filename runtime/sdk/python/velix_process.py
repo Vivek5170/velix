@@ -257,6 +257,66 @@ class VelixProcess:
         with self._bus_lock:
             self._send_framed(self._bus_sock, relay)
 
+    def ask_user(
+        self,
+        question: str,
+        options: Optional[List[Dict[str, str]]] = None,
+        allow_free_text: bool = False,
+        timeout_sec: int = 300,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Ask the end-user a question and block until they respond.
+
+        Args:
+            question:        The prompt to display to the user.
+            options:         List of {"id": str, "label": str} dicts for multiple-choice.
+            allow_free_text: If True, user may type arbitrary text.
+            timeout_sec:     Seconds to wait before returning a timeout response.
+            metadata:        Arbitrary metadata passed through to the gateway.
+
+        Returns:
+            {
+                "status": "answered" | "timeout" | "cancelled",
+                "selected_option_id": str | None,
+                "free_text": str | None,
+                "responder": dict | None,
+            }
+        """
+        if not self._bus_sock:
+            return {"status": "cancelled", "error": "no_bus_connection"}
+
+        ask_trace = uuid.uuid4().hex
+
+        with self._response_cv:
+            self._pending_response_traces.add(ask_trace)
+
+        payload: Dict[str, Any] = {
+            "trace": ask_trace,
+            "question": question,
+            "allow_free_text": allow_free_text,
+            "timeout_sec": timeout_sec,
+        }
+        if options:
+            payload["options"] = options
+        if metadata:
+            payload["metadata"] = metadata
+
+        self.send_message(-1, "ASK_USER_REQUEST", payload)
+
+        with self._response_cv:
+            success = self._response_cv.wait_for(
+                lambda: ask_trace in self._response_map,
+                timeout=timeout_sec,
+            )
+            if not success:
+                self._pending_response_traces.discard(ask_trace)
+                return {"status": "timeout"}
+
+            result: Dict[str, Any] = self._response_map.pop(ask_trace)
+            self._pending_response_traces.discard(ask_trace)
+            return result
+
     # -------------------------------------------------------------------------
     # Internal: LLM orchestration
     # -------------------------------------------------------------------------
@@ -1029,37 +1089,42 @@ def _is_transient_socket_error(err: str) -> bool:
 
 
 def _get_config(key: str, default: int) -> int:
-    try:
-        return int(os.getenv(key, str(default)))
-    except (ValueError, TypeError):
-        return default
+    """Read SDK config from VELIX_SDK_{KEY} env var (injected by executioner).
+    Falls back to SDK_{KEY} env var, then to the provided default."""
+    # Prefer VELIX_SDK_ prefix (new convention)
+    velix_key = "VELIX_SDK_" + key.removeprefix("SDK_") if key.startswith("SDK_") else "VELIX_SDK_" + key
+    raw = os.getenv(velix_key, "")
+    if raw:
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            pass
+    # Legacy fallback: bare key in env
+    raw = os.getenv(key, "")
+    if raw:
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            pass
+    return default
 
 
 def _get_port(service_name: str, fallback: int) -> int:
+    """Resolve port from VELIX_PORT_{SERVICE} env var (injected by executioner).
+    No disk reads — environment-only resolution."""
     alias_map = {
-        "SCHEDULER": ["LLM_SCHEDULER", "SCHEDULER"],
-        "LLM_SCHEDULER": ["LLM_SCHEDULER", "SCHEDULER"],
+        "SCHEDULER": ["VELIX_PORT_LLM_SCHEDULER", "VELIX_PORT_SCHEDULER"],
+        "LLM_SCHEDULER": ["VELIX_PORT_LLM_SCHEDULER", "VELIX_PORT_SCHEDULER"],
     }
-    lookup_keys = alias_map.get(service_name, [service_name])
+    lookup_keys = alias_map.get(service_name, [f"VELIX_PORT_{service_name}"])
 
-    here = os.path.abspath(os.path.dirname(__file__))
-    repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
-    candidate_paths = [
-        os.path.join(os.getcwd(), "config", "ports.json"),
-        os.path.join(os.getcwd(), "..", "config", "ports.json"),
-        os.path.join(os.getcwd(), "build", "config", "ports.json"),
-        os.path.join(repo_root, "config", "ports.json"),
-        os.path.join(repo_root, "build", "config", "ports.json"),
-    ]
-    for path in candidate_paths:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                ports = json.load(f)
-            for key in lookup_keys:
-                if key in ports:
-                    return int(ports[key])
-        except Exception:
-            continue
+    for env_key in lookup_keys:
+        raw = os.getenv(env_key, "")
+        if raw:
+            try:
+                return int(raw)
+            except (ValueError, TypeError):
+                pass
     return fallback
 
 

@@ -854,6 +854,45 @@ private:
             {"VELIX_USER_ID",       req.value("user_id", "")},
             {"PYTHONPATH",          pythonpath},
         };
+
+        // ── Inject VELIX_PORT_* (service ports) ──────────────────────────
+        // SDK processes read ports from env instead of disk.
+        // No-overwrite policy: do NOT overwrite env already set.
+        const std::pair<const char*, int> port_injections[] = {
+            {"VELIX_PORT_SUPERVISOR",      velix::utils::get_port("SUPERVISOR", 5173)},
+            {"VELIX_PORT_BUS",             velix::utils::get_port("BUS", 5174)},
+            {"VELIX_PORT_SCHEDULER",       velix::utils::get_port("SCHEDULER", 5171)},
+            {"VELIX_PORT_LLM_SCHEDULER",   velix::utils::get_port("LLM_SCHEDULER",
+                                               velix::utils::get_port("SCHEDULER", 5171))},
+            {"VELIX_PORT_EXECUTIONER",     velix::utils::get_port("EXECUTIONER", 5172)},
+        };
+        for (const auto &[k, v] : port_injections) {
+            if (env.find(k) == env.end()) {
+                env[k] = std::to_string(v);
+            }
+        }
+
+        // ── Inject VELIX_SDK_* (SDK config keys) ─────────────────────────
+        // Only inject the specific SDK-relevant keys the SDKs actually use.
+        const std::pair<const char*, int> sdk_config_injections[] = {
+            {"VELIX_SDK_RETRY_LIMIT",            velix::utils::get_config("SDK_RETRY_LIMIT", 3)},
+            {"VELIX_SDK_RETRY_DELAY_MS",         velix::utils::get_config("SDK_RETRY_DELAY_MS", 500)},
+            {"VELIX_SDK_EXEC_TIMEOUT_MS",        velix::utils::get_config("SDK_EXEC_TIMEOUT_MS", 120000)},
+            {"VELIX_SDK_EXEC_RETRY_LIMIT",       velix::utils::get_config("SDK_EXEC_RETRY_LIMIT", 3)},
+            {"VELIX_SDK_EXEC_RETRY_DELAY_MS",    velix::utils::get_config("SDK_EXEC_RETRY_DELAY_MS", 300)},
+            {"VELIX_SDK_LLM_TIMEOUT_MS",         velix::utils::get_config("SDK_LLM_TIMEOUT_MS", 305000)},
+            {"VELIX_SDK_STREAM_POLL_TIMEOUT_MS", velix::utils::get_config("SDK_STREAM_POLL_TIMEOUT_MS", 30000)},
+            {"VELIX_SDK_STREAM_MAX_CHUNKS",      velix::utils::get_config("SDK_STREAM_MAX_CHUNKS", 100000)},
+            {"VELIX_SDK_MAX_ITERATIONS",         velix::utils::get_config("SDK_MAX_ITERATIONS", 100)},
+            {"VELIX_SDK_BUS_WAIT_MIN",           velix::utils::get_config("SDK_BUS_WAIT_MIN", 60)},
+            {"VELIX_SDK_HEARTBEAT_SEC",          velix::utils::get_config("SDK_HEARTBEAT_SEC", 5)},
+        };
+        for (const auto &[k, v] : sdk_config_injections) {
+            if (env.find(k) == env.end()) {
+                env[k] = std::to_string(v);
+            }
+        }
+
         for (const auto &[k,v] : runtime.env_overrides) env[k] = v;
 
         // 7. Compute cache key — pure in-process, thread-safe, no temp files

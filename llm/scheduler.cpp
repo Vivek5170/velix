@@ -463,10 +463,22 @@ void handle_session_control(const json &envelope,
          if (cut_from >= 0) {
            removed = static_cast<int>(messages.size()) - cut_from;
            messages.erase(messages.begin() + cut_from, messages.end());
-           convo.turn_count -= removed;
-           if (convo.turn_count < 0) {
-             convo.turn_count = 0;
+           
+           int new_turns = 0;
+           uint64_t new_tokens = 0;
+           for (const auto &m : messages) {
+               if (!m.is_object()) continue;
+               const std::string r = m.value("role", "");
+               if (r == "user" || r == "assistant") new_turns++;
+               const std::string c = m.value("content", "");
+               if (!c.empty()) new_tokens += static_cast<uint64_t>(c.size() / 4);
+               if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                   new_tokens += static_cast<uint64_t>(m["tool_calls"].dump().size() / 4);
+               }
            }
+           convo.turn_count = new_turns;
+           convo.current_context_tokens = new_tokens;
+           
            // Update last_activity_ms to record the undo action
            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch()).count();
@@ -987,6 +999,24 @@ json process_llm_request_stateless(
   if (!req.payload.contains("messages") ||
       !req.payload["messages"].is_array()) {
     throw std::runtime_error("LLM_REQUEST missing messages[]");
+  }
+
+  uint64_t input_tokens = SessionManager::estimate_request_tokens(req.payload["messages"]);
+  int current_max = req.payload.value("max_tokens", 
+      req.payload.value("sampling_params", json::object()).value("max_tokens", 8192));
+  
+  if (cfg.model_info.context_length > 0) {
+      if (input_tokens >= static_cast<uint64_t>(cfg.model_info.context_length > 100 ? cfg.model_info.context_length - 100 : 0)) {
+          throw std::runtime_error("Context length exceeded (" + std::to_string(input_tokens) + " > " + std::to_string(cfg.model_info.context_length) + " tokens). Please use /undo to remove recent large outputs or /new to start a new session.");
+      }
+      int available = static_cast<int>(cfg.model_info.context_length) - static_cast<int>(input_tokens) - 100;
+      if (available < 10) available = 10;
+      if (current_max > available) {
+          req.payload["max_tokens"] = available;
+          if (req.payload.contains("sampling_params") && req.payload["sampling_params"].is_object()) {
+              req.payload["sampling_params"]["max_tokens"] = available;
+          }
+      }
   }
 
   // The conversation manager already produced a fully layered system prompt

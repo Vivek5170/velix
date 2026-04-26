@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -46,6 +47,21 @@ struct TransparentStringEqual {
 using DotEnvMap = std::unordered_map<std::string, std::string, TransparentStringHash, TransparentStringEqual>;
 
 namespace detail {
+
+using SteadyClock = std::chrono::steady_clock;
+using TimePoint   = SteadyClock::time_point;
+
+// TTL for config cache, configurable via VELIX_CONFIG_TTL_SEC env var.
+inline int config_ttl_sec() {
+    static const int ttl = []() {
+        if (const char *v = std::getenv("VELIX_CONFIG_TTL_SEC"); v && *v) {
+            try { return std::stoi(v); } catch (...) {}
+        }
+        return 5; // default 5 seconds
+    }();
+    return ttl;
+}
+
 inline std::unordered_map<std::string, int, TransparentStringHash, TransparentStringEqual> &get_ports_cache() {
     static std::unordered_map<std::string, int, TransparentStringHash, TransparentStringEqual> cache;
     return cache;
@@ -61,18 +77,26 @@ inline std::mutex &get_config_mutex() {
     return mtx;
 }
 
-inline bool &ports_loaded() {
-    static bool loaded = false;
-    return loaded;
+inline TimePoint &ports_loaded_at() {
+    static TimePoint t{};
+    return t;
 }
 
-inline bool &config_loaded() {
-    static bool loaded = false;
-    return loaded;
+inline TimePoint &config_loaded_at() {
+    static TimePoint t{};
+    return t;
+}
+
+inline bool is_stale(const TimePoint &loaded_at) {
+    if (loaded_at == TimePoint{}) return true; // never loaded
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        SteadyClock::now() - loaded_at).count();
+    return elapsed >= config_ttl_sec();
 }
 
 inline void load_ports_impl() {
     auto &ports = get_ports_cache();
+    ports.clear();
     std::ifstream pfile("config/ports.json");
     if (!pfile.is_open()) {
         pfile.open("../config/ports.json");
@@ -91,11 +115,12 @@ inline void load_ports_impl() {
             // Keep empty cache on malformed ports file.
         }
     }
-    ports_loaded() = true;
+    ports_loaded_at() = SteadyClock::now();
 }
 
 inline void load_configs_impl() {
     auto &config = get_config_cache();
+    config = nlohmann::json::object();
     std::ifstream cfile("config/config.json");
     if (!cfile.is_open()) {
         cfile.open("../config/config.json");
@@ -110,7 +135,7 @@ inline void load_configs_impl() {
             config = nlohmann::json::object();
         }
     }
-    config_loaded() = true;
+    config_loaded_at() = SteadyClock::now();
 }
 } // namespace detail
 
@@ -119,7 +144,7 @@ inline void load_configs_impl() {
  */
 inline int get_port(const std::string &name, int fallback) {
     std::scoped_lock lock(detail::get_config_mutex());
-    if (!detail::ports_loaded()) {
+    if (detail::is_stale(detail::ports_loaded_at())) {
         detail::load_ports_impl();
     }
     auto &cache = detail::get_ports_cache();
@@ -133,7 +158,7 @@ inline int get_port(const std::string &name, int fallback) {
  */
 inline std::string get_service_host(const std::string &name, const std::string &fallback) {
     std::scoped_lock lock(detail::get_config_mutex());
-    if (!detail::config_loaded()) {
+    if (detail::is_stale(detail::config_loaded_at())) {
         detail::load_configs_impl();
     }
     auto &config = detail::get_config_cache();
@@ -209,7 +234,7 @@ inline std::string get_env_value(const std::string &name, const DotEnvMap &dot_e
 
 inline std::string get_bind_host(const std::string &name, const std::string &fallback) {
     std::scoped_lock lock(detail::get_config_mutex());
-    if (!detail::config_loaded()) {
+    if (detail::is_stale(detail::config_loaded_at())) {
         detail::load_configs_impl();
     }
     auto &config = detail::get_config_cache();
@@ -235,7 +260,7 @@ inline std::string get_bind_host(const std::string &name, const std::string &fal
 template <typename T>
 inline T get_config(const std::string &key, T fallback) {
     std::scoped_lock lock(detail::get_config_mutex());
-    if (!detail::config_loaded()) {
+    if (detail::is_stale(detail::config_loaded_at())) {
         detail::load_configs_impl();
     }
     auto &config = detail::get_config_cache();
@@ -257,8 +282,8 @@ inline void reload_configs() {
     std::scoped_lock lock(detail::get_config_mutex());
     detail::get_ports_cache().clear();
     detail::get_config_cache().clear();
-    detail::ports_loaded() = false;
-    detail::config_loaded() = false;
+    detail::ports_loaded_at() = detail::TimePoint{};
+    detail::config_loaded_at() = detail::TimePoint{};
     detail::load_configs_impl();
     detail::load_ports_impl();
 }

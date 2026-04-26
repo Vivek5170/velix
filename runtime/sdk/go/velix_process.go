@@ -141,7 +141,8 @@ func (p *VelixProcess) callLLMInternal(convoID, userMessage, systemMessage, user
 		nextMessages = append(nextMessages, map[string]any{"role": "user", "content": userMessage})
 	}
 
-	maxIterations := readEnvInt("SDK_MAX_ITERATIONS", 100)
+	maxIterations := readEnvInt("VELIX_SDK_MAX_ITERATIONS",
+		readEnvInt("SDK_MAX_ITERATIONS", 100))
 	for i := 0; i < maxIterations; i++ {
 		p.Status = "WAITING_LLM"
 
@@ -340,8 +341,54 @@ func (p *VelixProcess) ExecuteTool(name string, params map[string]any) (map[stri
 		}
 		p.respCond.Wait()
 	}
+	}
 }
 
+func (p *VelixProcess) AskUser(question string, options []map[string]string, allowFreeText bool, timeoutSec int, metadata map[string]any) (map[string]any, error) {
+	if p.busConn == nil {
+		return nil, errors.New("no bus connection")
+	}
+
+	traceID := fmt.Sprintf("ask_%d", time.Now().UnixNano())
+	payload := map[string]any{
+		"trace":           traceID,
+		"question":        question,
+		"allow_free_text": allowFreeText,
+		"timeout_sec":     timeoutSec,
+	}
+	if len(options) > 0 {
+		payload["options"] = options
+	}
+	if len(metadata) > 0 {
+		payload["metadata"] = metadata
+	}
+
+	msg := map[string]any{
+		"message_type": "IPM_RELAY",
+		"target_pid":   -1,
+		"purpose":      "ASK_USER_REQUEST",
+		"user_id":      p.UserID,
+		"payload":      payload,
+	}
+
+	if err := sendFramed(p.busConn, msg); err != nil {
+		return nil, err
+	}
+
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for {
+		if v, ok := p.responses[traceID]; ok {
+			delete(p.responses, traceID)
+			return v, nil
+		}
+		if time.Now().After(deadline) {
+			return map[string]any{"status": "timeout"}, nil
+		}
+		p.respCond.Wait()
+	}
+}
 func (p *VelixProcess) ReportResult(targetPID int, data map[string]any, traceID string, appendToConvo bool) error {
 	if p.busConn == nil {
 		return nil
@@ -470,24 +517,20 @@ func recvFramed(conn net.Conn) (map[string]any, error) {
 }
 
 func getPort(name string, fallback int) int {
-	paths := []string{"config/ports.json", "../config/ports.json", "build/config/ports.json"}
-	var raw []byte
-	var err error
-	for _, p := range paths {
-		raw, err = os.ReadFile(p)
-		if err == nil {
-			break
+	// Environment-first: ports injected by executioner as VELIX_PORT_*.
+	var envKeys []string
+	switch name {
+	case "SCHEDULER", "LLM_SCHEDULER":
+		envKeys = []string{"VELIX_PORT_LLM_SCHEDULER", "VELIX_PORT_SCHEDULER"}
+	default:
+		envKeys = []string{fmt.Sprintf("VELIX_PORT_%s", name)}
+	}
+	for _, key := range envKeys {
+		if v := os.Getenv(key); v != "" {
+			if port, err := strconv.Atoi(v); err == nil {
+				return port
+			}
 		}
-	}
-	if err != nil {
-		return fallback
-	}
-	var ports map[string]int
-	if err := json.Unmarshal(raw, &ports); err != nil {
-		return fallback
-	}
-	if v, ok := ports[name]; ok {
-		return v
 	}
 	return fallback
 }
