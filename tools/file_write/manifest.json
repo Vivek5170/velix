@@ -1,0 +1,38 @@
+{
+  "name": "file_write",
+  "type": "tool",
+  "description": "Create or overwrite a file atomically, or append to it under an exclusive lock.\n\n- Default (append: false) \n- Append mode (append: true): Acquires an exclusive advisory lock, seeks to end-of-file, then writes. Safe for concurrent agents logging to the same file. Append size is limited to 10 MiB per request to prevent resource exhaustion.",
+  "runtime": "cpp",
+  "workdir": ".",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Destination file path. Any format accepted (absolute, relative, ~, $HOME, %USERPROFILE%, Windows, UNC). Intermediate directories are created automatically. Always prefer absolute paths to avoid ambiguity."
+      },
+      "content": {
+        "type": "string",
+        "description": "Content to write. In overwrite mode (default) this replaces the entire file. In append mode this is added to the end of the file. Maximum append size: 10 MiB."
+      },
+      "append": {
+        "type": "boolean",
+        "default": false,
+        "description": "If true, appends content to the end of the file instead of overwriting it. Uses an advisory exclusive lock so concurrent agents queue safely. Append size limited to 10 MiB. If false (default), atomically overwrites via tmp+rename."
+      },
+      "lock_timeout_ms": {
+        "type": "number",
+        "default": 5000,
+        "description": "Only relevant when append is true. Maximum milliseconds to wait for the exclusive lock. Default 5000 (5 seconds)."
+      }
+    },
+    "required": [
+      "path",
+      "content"
+    ]
+  },
+  "run": {
+    "command": "./build/main",
+    "args": []
+  }
+}

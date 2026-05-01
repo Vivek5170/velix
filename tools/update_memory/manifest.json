@@ -1,7 +1,7 @@
 {
   "name": "update_memory",
   "type": "tool",
-  "description": "Updates persistent user persona memory files (soul.md or user.md) based on conversation state. Uses runtime-injected session context (VELIX_USER_ID via SDK), not explicit tool args.",
+  "description": "Updates permenant memory. Auto injected into system prompt",
   "runtime": "python",
   "workdir": ".",
   "parameters": {
@@ -20,7 +20,7 @@
       },
       "content": {
         "type": "string",
-        "description": "The new information or fully overwritten content to write to the memory file."
+        "description": "The information to write."
       }
     },
     "required": ["target_file", "content"]

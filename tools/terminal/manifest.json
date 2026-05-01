@@ -7,17 +7,7 @@
   "prepare": [
     {
       "command": "mkdir",
-      "args": [
-        "-p",
-        "agent_playground/tmp"
-      ]
-    },
-    {
-      "command": "mkdir",
-      "args": [
-        "-p",
-        "agent_playground/repo"
-      ]
+      "args": ["-p", "agent_playground/repo"]
     }
   ],
   "parameters": {
@@ -49,7 +39,7 @@
       "background": {
         "type": "boolean",
         "default": false,
-        "description": "Async execution. true=return immediately with status 'background', notify on completion. false=wait for completion."
+        "description": "Async execution. true=notify on completion. false=wait for completion(blocking)."
       },
       "pty": {
         "type": "boolean",
@@ -57,9 +47,7 @@
         "description": "Execution mode. false=one-shot (simple execution, no state), true=persistent interactive shell (state preserved across calls via session_name)."
       }
     },
-    "required": [
-      "cmd"
-    ]
+    "required": ["cmd"]
   },
   "run": {
     "command": "./build/main",

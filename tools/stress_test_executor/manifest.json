@@ -9,11 +9,11 @@
     "properties": {
       "calls": {
         "type": "number",
-        "description": "Number of concurrent terminal calls to launch (default 10, max 50)."
+        "description": "Number of concurrent terminal calls to launch (default 10, max 300)."
       },
       "cmd": {
         "type": "string",
-        "description": "Terminal command to run for each call."
+        "description": "Terminal command to run for each call. Prefer using easy commands like ls"
       },
       "timeout_sec": {
         "type": "number",

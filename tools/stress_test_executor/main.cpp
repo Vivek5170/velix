@@ -16,7 +16,7 @@ public:
 
   void run() override {
     int calls = params.value("calls", 10);
-    calls = std::clamp(calls, 1, 50);
+    calls = std::clamp(calls, 1, 300);
 
     const std::string cmd = params.value("cmd", std::string("echo stress_test_executor"));
     const int timeout_sec = std::clamp(params.value("timeout_sec", 30), 1, 600);

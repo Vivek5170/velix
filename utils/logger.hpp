@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string_view>
+#include "../communication/json_include.hpp"
 
 namespace velix::utils {
 
@@ -26,23 +27,7 @@ private:
     inline static bool initialized = false;
     inline static std::mutex write_mutex;
 
-    static std::string escape_json(std::string_view value) {
-        std::string out;
-        out.reserve(value.size() + 8);
-        for (char c : value) {
-            switch (c) {
-                case '"': out += "\\\""; break;
-                case '\\': out += "\\\\"; break;
-                case '\b': out += "\\b"; break;
-                case '\f': out += "\\f"; break;
-                case '\n': out += "\\n"; break;
-                case '\r': out += "\\r"; break;
-                case '\t': out += "\\t"; break;
-                default: out += c; break;
-            }
-        }
-        return out;
-    }
+    // JSON escaping is now handled by nlohmann::json
 
     static std::string get_timestamp() {
         auto now = std::chrono::system_clock::now();
@@ -66,17 +51,16 @@ private:
     static std::string build_json_line(std::string_view level,
                                        std::string_view message,
                                        const LogContext& context) {
-        std::ostringstream oss;
-        oss << "{"
-            << "\"timestamp\":\"" << escape_json(get_timestamp()) << "\"," 
-            << "\"level\":\"" << escape_json(level) << "\"," 
-            << "\"component\":\"" << escape_json(context.component) << "\"," 
-            << "\"tree_id\":\"" << escape_json(context.tree_id) << "\"," 
-            << "\"pid\":" << context.pid << ","
-            << "\"event\":\"" << escape_json(context.event) << "\"," 
-            << "\"message\":\"" << escape_json(message) << "\""
-            << "}";
-        return oss.str();
+        nlohmann::json j = {
+            {"timestamp", get_timestamp()},
+            {"level", level},
+            {"component", context.component},
+            {"tree_id", context.tree_id},
+            {"pid", context.pid},
+            {"event", context.event},
+            {"message", message}
+        };
+        return j.dump();
     }
 
     static void ensure_initialized() {

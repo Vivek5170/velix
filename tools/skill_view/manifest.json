@@ -1,7 +1,7 @@
 {
   "name": "skill_view",
   "type": "tool",
-  "description": "Load and view the full content of a skill (SKILL.md file). Returns parsed JSON with metadata and body.",
+  "description": "Load and view the full content of a skill. Returns parsed JSON with metadata and body.",
   "runtime": "cpp",
   "workdir": ".",
   "parameters": {

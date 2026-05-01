@@ -1,34 +1,5 @@
 /**
  * commandline — Velix Tool
- *
- * Fixes from original:
- *
- * BUG-25 — am_poll_until_done has a hard deadline (job_timeout + poll_grace_sec).
- *           If ApplicationManager becomes unreachable the tool times out cleanly.
- *
- * BUG-26 — `sandbox_cwd.empty()` → corrected to always prepend cd for PTY
- *           (sandbox_cwd is always absolute; skipping cd would run the command
- *           in the shell's current directory, not the sandboxed one).
- *
- * BUG-27 — Approval race fixed: on_bus_event set BEFORE sending the bus
- *           message, under the same mutex used by wait_for. The lambda now
- *           holds the lock momentarily to set got_reply and calls notify_one.
- *
- * BUG-28 — normalize_cmd now also strips shell quotes before regex matching
- *           so `rm -rf "/"` is caught by the rm-on-root pattern.
- *
- * BUG-29 — `env` and `printenv` removed from DANGEROUS_PATTERNS.
- *           They are informational, not destructive. Reading environment
- *           variables in a sandboxed agent context is legitimate.
- *
- * BUG-30 — Driver config now loaded from user config (user_driver_config key).
- *           Falls back to local_pty if not set.
- *
- * NEW    — CANCEL_JOB support: if the running job receives SIGINT from
- *           the agent it sends CANCEL_JOB to ApplicationManager.
- *
- * NEW    — Output is streamed incrementally via repeated POLL calls and
- *           the agent receives a partial-output notification on timeout.
  */
 
 #include "../../runtime/sdk/cpp/velix_process.hpp"
@@ -112,18 +83,7 @@ static fs::path &config_root_dir() {
 static std::mutex &skill_log_mutex() { static std::mutex mx; return mx; }
 static std::mutex &approval_mutex()  { static std::mutex mx; return mx; }
 
-static std::optional<std::string> read_env_var(const char *name) {
-#ifdef _WIN32
-    if (char *value = nullptr; _dupenv_s(&value, nullptr, name) != 0 || !value) {
-        return std::nullopt;
-    }
-    std::unique_ptr<char, decltype(&free)> buf(value, &free);
-    return std::string(value);
-#else
-    if (const char *v = std::getenv(name)) return std::string(v);
-    return std::nullopt;
-#endif
-}
+// read_env_var removed in favor of velix::utils::get_env_value
 
 static void skill_log(const std::string &stage, const json &fields = json::object()) {
      try {
@@ -144,11 +104,12 @@ static void skill_log(const std::string &stage, const json &fields = json::objec
 static std::string expand_home(const std::string &p) {
     if (p.empty() || p[0] != '~') return p;
 #ifdef _WIN32
-    const auto h = read_env_var("USERPROFILE");
+    std::string h = velix::utils::get_env_value("USERPROFILE");
 #else
-    const auto h = read_env_var("HOME");
+    std::string h = velix::utils::get_env_value("HOME");
 #endif
-    return std::string(h.value_or("/tmp")) + p.substr(1);
+    if (h.empty()) h = "/tmp";
+    return h + p.substr(1);
 }
 
 static fs::path resolve_config_path(const std::string &p) {

@@ -1,0 +1,41 @@
+{
+  "name": "file_read",
+  "type": "tool",
+  "description": "Read the content of any file with large-file safety, binary detection, UTF-8 validation, and line-offset pagination. Accepts absolute paths, relative paths, paths with ~ or $HOME/$VAR/%VAR%, Windows paths (C:\\...), and UNC paths. If the exact path is not found, returns the closest matching file(s) so the agent can self-correct. Returns at most max_lines lines (default 300) starting from offset_line. Use next_offset_line from a truncated response to continue reading.\n\nValidation pipeline: (1) Binary detection (null-bytes) → reject, (2) UTF-8 validation → if invalid, decode with replacement chars + warning flag, (3) Return content.\n\nIf max_bytes truncates mid-line, content is trimmed to the last complete line and truncated_mid_line=true. Optional symlink resolution for security-sensitive operations.",
+  "runtime": "cpp",
+  "workdir": ".",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Path to the file to read. Any format is accepted: absolute (/home/user/file.cpp), relative (src/main.cpp), home-relative (~/project/file.cpp), env-var ($HOME/file.cpp, %USERPROFILE%\\file.cpp), or Windows (C:\\project\\file.cpp). Surrounding quotes are stripped automatically."
+      },
+      "offset_line": {
+        "type": "number",
+        "default": 1,
+        "description": "1-based line number to start reading from. Use this to paginate through large files — set to next_offset_line from a previous truncated response."
+      },
+      "max_lines": {
+        "type": "number",
+        "default": 300,
+        "description": "Maximum number of lines to return. 0 means no line limit (still bounded by max_bytes). Default 300 lines per read."
+      },
+      "max_bytes": {
+        "type": "number",
+        "default": 524288,
+        "description": "Maximum bytes to read from the file. Prevents crashes on huge files (logs, binaries). Default 512 KiB (524288). Set to 0 for unlimited."
+      },
+      "resolve_symlinks": {
+        "type": "boolean",
+        "default": false,
+        "description": "If true, resolves symlinks to their canonical paths (strict mode). If false (default), uses the path as-is. Useful for security-sensitive operations."
+      }
+    },
+    "required": ["path"]
+  },
+  "run": {
+    "command": "./build/main",
+    "args": []
+  }
+}

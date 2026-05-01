@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <cstdlib>
 #include <cctype>
+#include "string_utils.hpp"
 #include "../communication/json_include.hpp"
 
 namespace velix::utils {
@@ -191,17 +192,15 @@ inline DotEnvMap load_dotenv(const std::string &path) {
 
     std::string line;
     while (std::getline(in, line)) {
-        auto trimmed = line;
-        while (!trimmed.empty() && isspace(static_cast<unsigned char>(trimmed.front()))) trimmed.erase(trimmed.begin());
-        while (!trimmed.empty() && isspace(static_cast<unsigned char>(trimmed.back()))) trimmed.pop_back();
+        auto trimmed = trim(line);
         if (trimmed.empty() || trimmed.front() == '#') continue;
+        
         auto eq = trimmed.find('=');
         if (eq == std::string::npos) continue;
-        std::string key = trimmed.substr(0, eq);
-        std::string val = trimmed.substr(eq + 1);
-        while (!key.empty() && isspace(static_cast<unsigned char>(key.back()))) key.pop_back();
-        while (!val.empty() && isspace(static_cast<unsigned char>(val.front()))) val.erase(val.begin());
-        while (!val.empty() && isspace(static_cast<unsigned char>(val.back()))) val.pop_back();
+        
+        std::string key = rtrim(trimmed.substr(0, eq));
+        std::string val = ltrim(trimmed.substr(eq + 1));
+        
         if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
             val = val.substr(1, val.size() - 2);
         }
@@ -210,7 +209,7 @@ inline DotEnvMap load_dotenv(const std::string &path) {
     return map;
 }
 
-inline std::string get_env_value(const std::string &name, const DotEnvMap &dot_env) {
+inline std::string get_env_value(const std::string &name, const DotEnvMap &dot_env = {}) {
     if (auto it = dot_env.find(name); it != dot_env.end() && !it->second.empty()) {
         return it->second;
     }

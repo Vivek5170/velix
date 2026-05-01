@@ -1,7 +1,7 @@
 {
   "name": "web_search",
   "type": "tool",
-  "description": "High-performance agentic search engine with multi-provider fallback, parallel aggregation, and robust Gzip decompression support.",
+  "description": "Web search tool. Use when you need to get latest data or verify global facts or know about something new/related..",
   "runtime": "python",
   "entry": "main.py",
   "workdir": ".",

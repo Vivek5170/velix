@@ -1,7 +1,7 @@
 {
   "name": "session_search",
   "type": "tool",
-  "description": "Full-text search across conversation history using SQLite FTS5 with per-tenant isolation. Returns BM25-ranked snippets of matching turns. User isolation is guaranteed via VELIX_USER_ID environment variable.",
+  "description": "Gives you related context the user has shared based on the query.",
   "runtime": "python",
   "workdir": ".",
   "parameters": {
@@ -9,7 +9,7 @@
     "properties": {
       "query": {
         "type": "string",
-        "description": "Full-text search query (supports FTS5 syntax: phrases in quotes, boolean operators)"
+        "description": "Full-text search query (supports FTS5 syntax: phrases in quotes, boolean operators). Add related terminalogy so that the search works effectively"
       },
       "limit": {
         "type": "integer",
@@ -18,22 +18,15 @@
       },
       "mode": {
         "type": "string",
-        "enum": [
-          "session",
-          "user"
-        ],
-        "description": "Search scope. 'session' (default)=current session histories only, 'user'=all sessions and histories for the superuser. Procs can only use 'session' mode.",
+        "enum": ["session", "user"],
+        "description": "Search scope. 'session' (default)=current session histories only, 'user'=all sessions and histories for the superuser.",
         "default": "session"
       }
     },
-    "required": [
-      "query"
-    ]
+    "required": ["query"]
   },
   "run": {
     "command": "python3",
-    "args": [
-      "search.py"
-    ]
+    "args": ["search.py"]
   }
 }
