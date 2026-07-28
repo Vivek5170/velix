@@ -1,0 +1,6 @@
+{
+  "max_context_tokens": 4096,
+  "max_tool_output_chars": 4000,
+  "max_file_read_bytes": 32768,
+  "context_budget_per_tool_tokens": 800
+}

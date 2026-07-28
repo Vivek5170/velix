@@ -9,5 +9,7 @@
   "summary_retry_count": 2,
   "summary_retry_backoff_ms": 250,
   "summary_tree_id": "TREE_HANDLER",
-  "summary_source_pid": 1000
+  "summary_source_pid": 2147483647,
+  "dedicated_thread": true,
+  "chars_per_token": 3
 }

@@ -75,6 +75,8 @@ Thumbs.db
 
 # Environment variables
 .env
+tasks.md
+.venv
 
 .ruff_cache
 kill_all.sh

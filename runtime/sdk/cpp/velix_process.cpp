@@ -22,6 +22,9 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #endif
 
 namespace velix {
@@ -326,7 +329,18 @@ uint64_t VelixProcess::get_current_memory_usage_mb() const {
     return static_cast<uint64_t>(pmc.WorkingSetSize / (1024 * 1024));
   }
   return 0;
+#elif defined(__APPLE__)
+  // macOS: use Mach task_info() to read the current RSS.
+  // /proc/self/statm does not exist on macOS.
+  mach_task_basic_info_data_t info;
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+    return static_cast<uint64_t>(info.resident_size / (1024 * 1024));
+  }
+  return 0;
 #else
+  // Linux: read RSS from /proc/self/statm (pages → bytes → MB)
   uint64_t rss = 0;
   std::ifstream statm("/proc/self/statm");
   if (statm) {
@@ -569,15 +583,29 @@ void VelixProcess::run_kernel_io_loop() {
           {"memory_mb", static_cast<double>(get_current_memory_usage_mb())}}}};
 
     try {
-      const int sup_port = resolve_port("SUPERVISOR", 5173);
-      velix::communication::SocketWrapper hb_socket;
-      hb_socket.create_tcp_socket();
-      hb_socket.connect(
-          velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
-          static_cast<uint16_t>(sup_port));
-      velix::communication::send_json(hb_socket, heartbeat.dump());
-      // Read and validate the ack from the supervisor.
-      (void)velix::communication::recv_json_parsed(hb_socket);
+      // Task 12: Send heartbeat via the persistent bus_socket instead of
+      // opening a new TCP connection to the Supervisor per heartbeat cycle.
+      // The Bus forwards the message to the Supervisor and relays the ACK back.
+      // This eliminates N fresh TCP connect/close cycles per second (one per
+      // process per heartbeat interval), replacing them with a single shared
+      // Bus thread-pool connection.
+      if (bus_socket.is_open()) {
+        std::lock_guard<std::mutex> lock(bus_mutex);
+        velix::communication::send_json(bus_socket, heartbeat.dump());
+        // Fire and forget. The Bus relays the Supervisor ACK back asynchronously.
+        // If the Supervisor is unreachable, the Bus will send back an error
+        // which the bus_listener_loop will catch and terminate the process.
+      } else {
+        // Bus not connected — fall back to a direct Supervisor connection.
+        const int sup_port = resolve_port("SUPERVISOR", 5173);
+        velix::communication::SocketWrapper hb_socket;
+        hb_socket.create_tcp_socket();
+        hb_socket.connect(
+            velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
+            static_cast<uint16_t>(sup_port));
+        velix::communication::send_json(hb_socket, heartbeat.dump());
+        (void)velix::communication::recv_json_parsed(hb_socket);
+      }
     } catch (...) {
       if (is_running) {
         LOG_WARN("Lost supervisor connection natively during heartbeat. Engine "
@@ -596,6 +624,10 @@ void VelixProcess::run_kernel_io_loop() {
 
   // Final Death Rattle: Broadcast immediate KILLED/FINISHED trace so the
   // Supervisor doesn't hang.
+  // NOTE: We use a direct Supervisor connection here because bus_socket may
+  // already be closed by shutdown() (which closes bus_socket before joining
+  // runtime_io_thread). A direct connection guarantees delivery of the
+  // terminal status even during teardown.
   if (velix_pid > 0) {
     try {
       json final_heartbeat = {
@@ -650,6 +682,10 @@ void VelixProcess::bus_listener_loop() {
               LOG_WARN("on_bus_event hook failed with unknown exception");
             }
           }
+        } else if (msg.value("status", std::string("")) == "error") {
+          // Task 12: Catch asynchronous heartbeat forwarding errors from the Bus
+          throw std::runtime_error("Supervisor unreachable via Bus: " + 
+                                   msg.value("error", std::string("unknown")));
         }
       } catch (const velix::communication::SocketTimeoutException &) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

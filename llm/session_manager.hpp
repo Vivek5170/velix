@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using json = nlohmann::json;
@@ -60,7 +61,7 @@ class SessionManager {
       const std::string& storage_root = "memory",
       std::shared_ptr<storage::IStorageProvider> storage_provider = nullptr);
 
-  ~SessionManager()                               = default;
+  ~SessionManager();
   SessionManager(const SessionManager&)           = delete;
   SessionManager& operator=(const SessionManager&) = delete;
 
@@ -73,6 +74,7 @@ class SessionManager {
     uint64_t total_tokens_used      = 0;  // cumulative tokens across the session
     int      turn_count             = 0;  // number of persisted turns
     bool     compacted              = false; // whether session has been compacted
+    bool     needs_compaction       = false; // queued for background compaction
   };
 
   struct SessionInfo {
@@ -210,6 +212,14 @@ class SessionManager {
       double auto_compact_threshold,
       SessionIO& session_io);
 
+  void enqueue_auto_compaction_if_needed(
+      const std::string& convo_id,
+      const ContextUsage& usage,
+      double auto_compact_threshold,
+      SessionIO& session_io);
+
+  bool session_needs_compaction(const std::string& session_id) const;
+
     ContextUsage compute_context_usage(const std::string& session_id,
                      const json& request_messages,
                      const tools::ToolRegistry& tools,
@@ -246,10 +256,15 @@ class SessionManager {
                              const std::string& filename)        const;
 
  private:
+  class CompactionQueue;
+
   std::string storage_root_;
   std::shared_ptr<storage::IStorageProvider> storage_provider_;
+  std::unique_ptr<CompactionQueue> compaction_queue_;
 
   mutable std::mutex index_mutex_;
+  mutable std::mutex compaction_state_mutex_;
+  std::unordered_set<std::string> sessions_needing_compaction_;
 
   // ── Session index helpers ─────────────────────────────────────────────
   std::string index_path() const;

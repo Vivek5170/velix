@@ -783,6 +783,7 @@ private:
             ss << "  /delete <sid>     — delete a session by id\n";
             ss << "  /destroy_user     — delete all sessions + user identity\n";
             ss << "  /terminals        — list active persistent terminals\n";
+            ss << "  /reload_tools     — reload tool manifests from disk\n";
             ss << "  /title <text>     — set title for current session\n";
             ss << "  /session_info     — current session stats from disk\n";
             ss << "  /model_info       — model & adapter configuration\n";
@@ -1204,6 +1205,34 @@ private:
             }
             ss << "────────────────────────────────────────\n";
             send({{"type","token"},{"data", ss.str()}});
+            return true;
+        };
+
+        // ── /reload_tools ──────────────────────────────────────────────
+        command_table_["/reload_tools"] = [this](auto /*s*/, const auto& send,
+                                                  const std::string& /*args*/) {
+            constexpr int kPort = 5171;
+            try {
+                SocketWrapper sock;
+                sock.create_tcp_socket();
+                sock.set_timeout_ms(5000);
+                sock.connect("127.0.0.1", kPort);
+                json frame = {{"message_type", "RELOAD_TOOLS"}};
+                send_json(sock, frame.dump());
+                const json resp = recv_json_parsed(sock);
+                if (resp.value("status", "") == "ok") {
+                    send({{"type","token"},
+                          {"data","[Tools reloaded from disk]\n"}});
+                } else {
+                    send({{"type","token"},
+                          {"data","[Tool reload failed: " +
+                           resp.value("error", "unknown") + "]\n"}});
+                }
+            } catch (const std::exception& e) {
+                send({{"type","token"},
+                      {"data","[Tool reload error: " +
+                       std::string(e.what()) + "]\n"}});
+            }
             return true;
         };
 

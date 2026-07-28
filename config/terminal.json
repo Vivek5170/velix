@@ -12,7 +12,7 @@
     "_comment_max_timeout_sec": "Hard ceiling — caller cannot exceed this",
     "max_timeout_sec": 600,
     "_comment_max_output_chars": "stdout/stderr each truncated to this (head 40% + tail 60%)",
-    "max_output_chars": 50000
+    "max_output_chars": 4000
   },
   "sandbox": {
     "_comment_playground_root": "Root directory for cwd_mode resolution (relative to skill workdir)",

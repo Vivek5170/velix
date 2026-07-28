@@ -1,4 +1,5 @@
 #include "scheduler.hpp"
+#include "compacter.hpp"
 #include "session_io.hpp"
 #include "session_manager.hpp"
 #include "storage/provider_factory.hpp"
@@ -40,6 +41,10 @@ namespace velix::llm {
 
 namespace {
 
+namespace fs = std::filesystem;
+
+bool load_json_with_fallback(const std::vector<std::string> &paths, json &out);
+
 struct ModelConfig {
   std::string model_name{"unknown"};
   std::string model_type{"unknown"};
@@ -75,10 +80,6 @@ struct PendingRequest {
   std::shared_ptr<std::promise<json>> completion;
 };
 
-struct ActiveRequest {
-  std::string request_id; // unique per attempt for a trace
-};
-
 struct TreeQueue {
   std::deque<PendingRequest> requests;
   bool has_active_key{false};
@@ -97,24 +98,79 @@ struct TreeCandidateCompare {
   }
 };
 
-std::mutex queue_mutex;
-std::condition_variable queue_cv;
-std::unordered_map<std::string, TreeQueue> tree_queues;
-std::priority_queue<TreeCandidate, std::vector<TreeCandidate>,
-                    TreeCandidateCompare>
-    ready_tree_queue;
-std::atomic<bool> shutting_down{false};
-std::shared_ptr<storage::IStorageProvider> storage_provider =
-    storage::make_storage_provider_from_config();
-SessionIO session_io{storage_provider, "memory/sessions"};
-SessionManager session_manager{"memory", storage_provider};
-tools::ToolRegistry tool_registry;
+struct ActiveRequest {
+  std::string request_id; // unique per attempt for a trace
+};
 
-// Active request tracking keyed by trace_id.
-// A trace_id can be retried, so workers must match both trace_id and
-// request_id.
-std::mutex trace_mutex;
-std::unordered_map<std::string, ActiveRequest> active_requests;
+std::string load_scheduler_session_io_root() {
+  json cfg;
+  if (load_json_with_fallback({"config/storage.json", "../config/storage.json",
+                               "build/config/storage.json"},
+                              cfg)) {
+    return cfg.value("json_root", std::string("memory/sessions"));
+  }
+  return "memory/sessions";
+}
+
+std::string session_manager_root_from_session_io_root(
+    const std::string &session_io_root) {
+  fs::path root(session_io_root);
+  if (root.filename() == "sessions" && root.has_parent_path()) {
+    return root.parent_path().string();
+  }
+  return "memory";
+}
+
+class SchedulerService {
+ public:
+  SchedulerService()
+      : storage_provider(storage::make_storage_provider_from_config()),
+        session_io(storage_provider, load_scheduler_session_io_root()),
+        session_manager(
+            session_manager_root_from_session_io_root(load_scheduler_session_io_root()),
+            storage_provider) {}
+
+  void shutdown() {
+    shutting_down.store(true);
+    queue_cv.notify_all();
+  }
+
+  std::mutex queue_mutex;
+  std::condition_variable queue_cv;
+  std::unordered_map<std::string, TreeQueue> tree_queues;
+  std::priority_queue<TreeCandidate, std::vector<TreeCandidate>,
+                      TreeCandidateCompare>
+      ready_tree_queue;
+  std::atomic<bool> shutting_down{false};
+  std::shared_ptr<storage::IStorageProvider> storage_provider;
+  SessionIO session_io;
+  SessionManager session_manager;
+  tools::ToolRegistry tool_registry;
+  std::mutex trace_mutex;
+  std::unordered_map<std::string, ActiveRequest> active_requests;
+  // Task 14: Per-tree LLM request counts tracked locally to eliminate the
+  // N+1 TCP round trip to the Supervisor that previously happened on every
+  // LLM request. Protected by queue_mutex (already held by worker_loop).
+  std::unordered_map<std::string, int> llm_request_counts;
+};
+
+SchedulerService &scheduler_service() {
+  static SchedulerService svc;
+  return svc;
+}
+
+#define queue_mutex (scheduler_service().queue_mutex)
+#define queue_cv (scheduler_service().queue_cv)
+#define tree_queues (scheduler_service().tree_queues)
+#define ready_tree_queue (scheduler_service().ready_tree_queue)
+#define shutting_down (scheduler_service().shutting_down)
+#define storage_provider (scheduler_service().storage_provider)
+#define session_io (scheduler_service().session_io)
+#define session_manager (scheduler_service().session_manager)
+#define tool_registry (scheduler_service().tool_registry)
+#define trace_mutex (scheduler_service().trace_mutex)
+#define active_requests (scheduler_service().active_requests)
+#define llm_request_counts (scheduler_service().llm_request_counts)
 
 void mark_request_active(const std::string &trace_id,
                          const std::string &request_id) {
@@ -471,9 +527,9 @@ void handle_session_control(const json &envelope,
                const std::string r = m.value("role", "");
                if (r == "user" || r == "assistant") new_turns++;
                const std::string c = m.value("content", "");
-               if (!c.empty()) new_tokens += static_cast<uint64_t>(c.size() / 4);
-               if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
-                   new_tokens += static_cast<uint64_t>(m["tool_calls"].dump().size() / 4);
+                if (!c.empty()) new_tokens += static_cast<uint64_t>(std::max<std::size_t>(1, c.size() / 3));
+                if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                    new_tokens += static_cast<uint64_t>(std::max<std::size_t>(1, m["tool_calls"].dump().size() / 3));
                }
            }
            convo.turn_count = new_turns;
@@ -629,7 +685,7 @@ void handle_session_query(const json &envelope,
     } else if (query_type == "tool_info") {
       const json schemas = registry.get_tool_schemas();
       const int tool_count = static_cast<int>(schemas.size());
-      const int tool_context_tokens = static_cast<int>(schemas.dump().size() / 4);
+      const int tool_context_tokens = static_cast<int>(std::max<std::size_t>(1, schemas.dump().size() / 3));
 
       json tools = json::array();
       for (const auto &schema : schemas) {
@@ -961,8 +1017,13 @@ json normalize_tool_call(const json &tool_call, int fallback_index) {
         {"arguments", normalize_tool_arguments_object(raw_arguments)}}}};
 }
 
-json notify_supervisor_llm_request(const PendingRequest &req,
-                                   const SchedulerConfig &cfg) {
+// Task 14: notify_supervisor_llm_request() has been removed from the hot path.
+// The Scheduler now tracks LLM request counts locally (see llm_request_counts
+// in SchedulerService) and infers is_handler from tree_id == "TREE_HANDLER".
+// This function is kept as a monitoring-only helper for future use cases that
+// need to push a count update to the Supervisor on demand.
+static json notify_supervisor_llm_request_monitoring(const PendingRequest &req,
+                                                     const SchedulerConfig &cfg) {
   json event = {
       {"message_type", "LLM_REQUEST"}, {"request_id", req.request_id},
       {"tree_id", req.tree_id},        {"source_pid", req.source_pid},
@@ -1056,8 +1117,8 @@ json process_llm_request_stateless(
       final_response.usage.value("completion_tokens", static_cast<uint64_t>(0));
       const uint64_t completion_estimate =
         !final_response.content.empty()
-          ? static_cast<uint64_t>(final_response.content.size() / 4)
-          : static_cast<uint64_t>(normalized_tool_calls.dump().size() / 4);
+          ? static_cast<uint64_t>(std::max<std::size_t>(1, final_response.content.size() / 3))
+          : static_cast<uint64_t>(std::max<std::size_t>(1, normalized_tool_calls.dump().size() / 3));
     const uint64_t tokens_used =
       completion_tokens > 0
         ? completion_tokens
@@ -1208,6 +1269,9 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
     }
 
     json response;
+    bool enqueue_background_compaction = false;
+    std::string background_compaction_convo_id;
+    SessionManager::ContextUsage background_compaction_usage;
     try {
       // Worker Check: Is the client still alive in the lobby?
       const bool client_alive =
@@ -1217,10 +1281,19 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
         LOG_INFO("Skipping LLM inference for cancelled trace_id: " +
                  req.trace_id);
       } else {
-        const json supervisor_response =
-            notify_supervisor_llm_request(req, cfg);
-        req.payload["is_handler"] =
-            supervisor_response.value("is_handler", false);
+        // Task 14: Instead of calling notify_supervisor_llm_request() which
+        // opened a fresh TCP connection to the Supervisor on every LLM request,
+        // we now:
+        //   (1) Increment the per-tree LLM request count locally.
+        //   (2) Infer is_handler directly from tree_id (no network round trip).
+        // The Supervisor's handle_llm_request() remains available as a
+        // monitoring-only endpoint but is no longer on the hot path.
+        const bool is_handler_req = (req.tree_id == "TREE_HANDLER");
+        {
+          std::scoped_lock<std::mutex> count_lock(queue_mutex);
+          llm_request_counts[req.tree_id]++;
+        }
+        req.payload["is_handler"] = is_handler_req;
         req.payload = session_io.normalize_llm_request(req.payload);
         const std::string mode =
             req.payload.value("mode", std::string("simple"));
@@ -1236,29 +1309,37 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
                     req.payload);
           }
 
-          const std::string convo_id =
-              req.payload.value("convo_id", std::string(""));
-            const auto usage = session_manager.compute_context_usage(
-              convo_id, req.payload["messages"], tool_registry, mode,
-              cfg.model_info.context_length);
-
-          const auto guard_result = session_manager.run_auto_compact_guard(
-              convo_id, usage, cfg.auto_compact_threshold, session_io);
-
-          req.payload["auto_compacted"] = guard_result.compacted;
-          req.payload["compact_skip_reason"] = guard_result.skip_reason;
-          if (guard_result.compacted) {
-            req.payload["session_compacted"] = true;
-            req.payload["tokens_before"] = guard_result.tokens_before;
-            req.payload["tokens_after"] = guard_result.tokens_after;
-            req.payload["messages"] =
-                session_io.build_conversation_messages_safely(req.payload);
-          }
-
         }
         response = process_llm_request_stateless(req, cfg, [&req]() {
           return is_request_current(req.trace_id, req.request_id);
         });
+
+        if ((mode == "conversation" || mode == "user_conversation") &&
+            response.value("status", "error") == "ok") {
+          const std::string convo_id =
+              req.payload.value("convo_id", std::string(""));
+          if (!convo_id.empty()) {
+            background_compaction_usage = session_manager.compute_context_usage(
+                convo_id, json::array(), tool_registry, mode,
+                cfg.model_info.context_length);
+            if (background_compaction_usage.max_context_tokens > 0) {
+              const double auto_compact_threshold =
+                  cfg.auto_compact_threshold > 0.0 ? cfg.auto_compact_threshold
+                                                   : 0.70;
+              const double fill_ratio =
+                  static_cast<double>(
+                      background_compaction_usage.total_context_tokens) /
+                  static_cast<double>(
+                      background_compaction_usage.max_context_tokens);
+              if (fill_ratio >= auto_compact_threshold) {
+                enqueue_background_compaction = true;
+                background_compaction_convo_id = convo_id;
+                response["needs_compaction"] = true;
+                response["auto_compaction_queued"] = true;
+              }
+            }
+          }
+        }
       }
     } catch (const std::exception &e) {
       response = {{"status", "error"},
@@ -1285,139 +1366,17 @@ void worker_loop(const SchedulerConfig &cfg, int worker_id) {
       release_tree_key(req.queue_key);
     }
     queue_cv.notify_one();
+
+    if (enqueue_background_compaction) {
+      session_manager.enqueue_auto_compaction_if_needed(
+          background_compaction_convo_id, background_compaction_usage,
+          cfg.auto_compact_threshold, session_io);
+    }
   }
 }
 
 PendingRequest parse_request_payload(const std::string &raw_payload) {
-  const json envelope = json::parse(raw_payload);
-  if (envelope.value("message_type", "") != "LLM_REQUEST") {
-    throw std::runtime_error("Scheduler only accepts message_type=LLM_REQUEST");
-  }
-
-  json request_json = envelope;
-  if (envelope.contains("payload") && envelope["payload"].is_object()) {
-    request_json = envelope["payload"];
-    request_json["message_type"] = "LLM_REQUEST";
-
-    // Preserve envelope metadata if payload omitted them.
-    if (!request_json.contains("request_id") &&
-        envelope.contains("request_id")) {
-      request_json["request_id"] = envelope["request_id"];
-    }
-    if (!request_json.contains("trace_id") && envelope.contains("trace_id")) {
-      request_json["trace_id"] = envelope["trace_id"];
-    }
-    if (!request_json.contains("tree_id") && envelope.contains("tree_id")) {
-      request_json["tree_id"] = envelope["tree_id"];
-    }
-    if (!request_json.contains("source_pid") &&
-        envelope.contains("source_pid")) {
-      request_json["source_pid"] = envelope["source_pid"];
-    }
-    if (!request_json.contains("priority") && envelope.contains("priority")) {
-      request_json["priority"] = envelope["priority"];
-    }
-    if (!request_json.contains("mode") && envelope.contains("mode")) {
-      request_json["mode"] = envelope["mode"];
-    }
-  }
-
-  if (!request_json.contains("request_id") ||
-      !request_json["request_id"].is_string() ||
-      request_json["request_id"].get<std::string>().empty()) {
-    throw std::runtime_error(
-        "LLM_REQUEST requires non-empty string request_id");
-  }
-  if (!request_json.contains("tree_id") ||
-      !request_json["tree_id"].is_string() ||
-      request_json["tree_id"].get<std::string>().empty()) {
-    throw std::runtime_error("LLM_REQUEST requires non-empty string tree_id");
-  }
-  if (!request_json.contains("source_pid") ||
-      !request_json["source_pid"].is_number_integer() ||
-      request_json["source_pid"].get<int>() <= 0) {
-    throw std::runtime_error(
-        "LLM_REQUEST requires positive integer source_pid");
-  }
-  if (!request_json.contains("mode") || !request_json["mode"].is_string()) {
-    throw std::runtime_error("LLM_REQUEST requires mode");
-  }
-
-  PendingRequest req;
-  req.request_id = request_json.value("request_id", "");
-  req.trace_id = request_json.value("trace_id", "");
-  req.tree_id = request_json.value("tree_id", "");
-  req.source_pid = request_json.value("source_pid", 0);
-  req.base_priority = request_json.value("priority", 1);
-  req.enqueued_at = std::chrono::steady_clock::now();
-  req.completion = std::make_shared<std::promise<json>>();
-
-  // Fix: Queue Limits vs Fairness
-  // Human users via the Telegram handler reside in 'TREE_HANDLER'. To prevent
-  // one human's slow generation from blocking all other human users,
-  // TREE_HANDLER requests are parallelized using their unique `convo_id`.
-  // However, autonomous background agents (like a Research Agent) must be
-  // strictly limited to ONE concurrent LLM request per tree to prevent a single
-  // agent from monopolizing all GPU slots. We enforce this by queueing them
-  // strictly by `tree_id`.
-  {
-    const std::string mode = request_json.value("mode", "simple");
-    const std::string user_id = request_json.value("user_id", "");
-
-    if (req.tree_id == "TREE_HANDLER" && mode == "user_conversation" &&
-        !user_id.empty()) {
-      req.queue_key = "user_" + user_id;
-    } else {
-      req.queue_key = req.tree_id; // Strict 1-key-per-tree GPU Lock
-    }
-  }
-
-  req.payload = std::move(request_json);
-
-  const std::string mode = req.payload.value("mode", "simple");
-  if (mode == "simple") {
-    if (req.payload.value("convo_id", std::string("")).size() > 0 ||
-        req.payload.value("user_id", std::string("")).size() > 0) {
-      throw std::runtime_error(
-          "simple mode requires empty convo_id and user_id");
-    }
-    const bool has_messages_array =
-        req.payload.contains("messages") && req.payload["messages"].is_array();
-    const bool has_user_message =
-        req.payload.contains("user_message") &&
-        req.payload["user_message"].is_string() &&
-        !req.payload["user_message"].get<std::string>().empty();
-    if (!has_messages_array && !has_user_message) {
-      throw std::runtime_error(
-          "simple mode requires messages[] or user_message");
-    }
-  } else if (mode == "conversation" || mode == "user_conversation") {
-    const bool has_messages_array =
-        req.payload.contains("messages") && req.payload["messages"].is_array();
-    const bool has_alt_input = req.payload.contains("user_message") ||
-                               req.payload.contains("system_message") ||
-                               req.payload.contains("tool_result") ||
-                               req.payload.contains("tool_message") ||
-                               req.payload.contains("tool_messages");
-    if (!has_messages_array && !has_alt_input) {
-      throw std::runtime_error("conversation modes require messages[] or "
-                               "user_message/system_message/tool_result");
-    }
-
-    if (mode == "conversation") {
-      if (!req.payload.value("user_id", std::string("")).empty()) {
-        throw std::runtime_error("conversation mode requires empty user_id");
-      }
-    } else {
-      if (req.payload.value("user_id", std::string("")).empty()) {
-        throw std::runtime_error("user_conversation mode requires user_id");
-      }
-    }
-  } else {
-    throw std::runtime_error("unsupported mode: " + mode);
-  }
-
-  return req;
+  return parse_request_payload(json::parse(raw_payload));
 }
 
 // Overload that accepts an already-parsed envelope JSON to avoid dump/parse
@@ -1466,9 +1425,10 @@ PendingRequest parse_request_payload(const json &envelope) {
       request_json["tree_id"].get<std::string>().empty()) {
     throw std::runtime_error("LLM_REQUEST requires non-empty string tree_id");
   }
+  const int source_pid = request_json.value("source_pid", 0);
   if (!request_json.contains("source_pid") ||
       !request_json["source_pid"].is_number_integer() ||
-      request_json["source_pid"].get<int>() <= 0) {
+      (source_pid <= 0 && source_pid != kCompacterInternalPid)) {
     throw std::runtime_error(
         "LLM_REQUEST requires positive integer source_pid");
   }
@@ -1565,7 +1525,7 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
   try {
     const json envelope = velix::communication::recv_json_parsed(*client_socket_ptr);
 
-    // SESSION_CONTROL / SESSION_QUERY: synchronous control-plane endpoints.
+    // SESSION_CONTROL / SESSION_QUERY / GET_LLM_COUNT: synchronous control-plane endpoints.
     {
       const std::string message_type = envelope.value("message_type", "");
 
@@ -1577,6 +1537,38 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
       if (message_type == "SESSION_QUERY") {
         handle_session_query(envelope, *client_socket_ptr, session_manager,
                              tool_registry, tree_queues, queue_mutex, cfg);
+        return;
+      }
+      if (message_type == "GET_LLM_COUNT") {
+        // Task 14 monitoring endpoint: returns per-tree LLM request counts
+        // tracked locally by the Scheduler (no Supervisor round trip needed).
+        const std::string tree_id = envelope.value("tree_id", std::string(""));
+        json reply = {{"message_type", "LLM_COUNT_RESPONSE"},
+                      {"status", "ok"}};
+        {
+          std::scoped_lock<std::mutex> lock(queue_mutex);
+          if (tree_id.empty()) {
+            json counts = json::object();
+            for (const auto &[tid, count] : llm_request_counts) {
+              counts[tid] = count;
+            }
+            reply["counts"] = counts;
+          } else {
+            auto it = llm_request_counts.find(tree_id);
+            reply["tree_id"] = tree_id;
+            reply["count"] = (it != llm_request_counts.end()) ? it->second : 0;
+          }
+        }
+        velix::communication::send_json(*client_socket_ptr, reply.dump());
+        return;
+      }
+      if (message_type == "RELOAD_TOOLS") {
+        // Task 19: Reload tool manifests from disk so newly installed tools
+        // are picked up without a full system restart.
+        tool_registry.reload();
+        json reply = {{"message_type", "RELOAD_TOOLS_RESPONSE"},
+                      {"status", "ok"}};
+        velix::communication::send_json(*client_socket_ptr, reply.dump());
         return;
       }
     }
@@ -1662,6 +1654,17 @@ void start_scheduler(int port) {
 
   LOG_INFO("Starting Scheduler on " + bind_host + ":" + std::to_string(port) +
            " with max_llm_keys=" + std::to_string(cfg.max_llm_keys));
+
+  // Task 19: Background thread that reloads tool manifests every 60 seconds
+  // so newly installed tools are discovered without a full restart.
+  std::thread tool_reloader([&] {
+    while (!shutting_down.load()) {
+      std::this_thread::sleep_for(std::chrono::seconds(60));
+      if (shutting_down.load()) break;
+      tool_registry.reload();
+    }
+  });
+  tool_reloader.detach();
 
   velix::utils::ThreadPool lobby_pool(cfg.max_client_threads, 512);
 

@@ -75,6 +75,40 @@ struct TransparentStringEqual {
     }
 };
 
+struct ContextToolLimits {
+    int max_tool_output_chars = 4000;
+    int max_file_read_bytes = 32768;
+};
+
+ContextToolLimits load_context_tool_limits() {
+    ContextToolLimits limits;
+    for (const char *path : {"config/context.json", "../config/context.json",
+                             "build/config/context.json"}) {
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            continue;
+        }
+        try {
+            json cfg;
+            file >> cfg;
+            limits.max_tool_output_chars =
+                cfg.value("max_tool_output_chars", limits.max_tool_output_chars);
+            limits.max_file_read_bytes =
+                cfg.value("max_file_read_bytes", limits.max_file_read_bytes);
+        } catch (const std::exception &) {
+        }
+        break;
+    }
+
+    if (limits.max_tool_output_chars <= 0) {
+        limits.max_tool_output_chars = 4000;
+    }
+    if (limits.max_file_read_bytes <= 0) {
+        limits.max_file_read_bytes = 32768;
+    }
+    return limits;
+}
+
 // ---------------------------------------------------------------------------
 // SHA-256 — portable, no external deps, standard C++/C only
 // Based on the public domain implementation by Brad Conte.
@@ -892,6 +926,12 @@ private:
                 env[k] = std::to_string(v);
             }
         }
+
+        const ContextToolLimits context_limits = load_context_tool_limits();
+        env.emplace("VELIX_MAX_TOOL_OUTPUT_CHARS",
+                    std::to_string(context_limits.max_tool_output_chars));
+        env.emplace("VELIX_MAX_FILE_READ_BYTES",
+                    std::to_string(context_limits.max_file_read_bytes));
 
         for (const auto &[k,v] : runtime.env_overrides) env[k] = v;
 

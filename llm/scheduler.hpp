@@ -2,6 +2,8 @@
 
 namespace velix::llm {
 
+class SchedulerService;
+
 /**
  * Start the scheduler server on the given port.
  *

@@ -7,20 +7,107 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <unordered_set>
 
 namespace fs = std::filesystem;
 
 namespace velix::llm {
 
+class SessionManager::CompactionQueue {
+ public:
+  explicit CompactionQueue(SessionManager &manager) : manager_(manager) {
+    worker_ = std::thread([this] { worker_loop(); });
+  }
+
+  ~CompactionQueue() {
+    {
+      std::scoped_lock<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  void enqueue(const std::string &session_id, const ContextUsage &usage,
+               double threshold, SessionIO &session_io) {
+    if (session_id.empty()) {
+      return;
+    }
+
+    std::scoped_lock<std::mutex> lock(mutex_);
+    if (!queued_sessions_.insert(session_id).second) {
+      return;
+    }
+    queue_.push_back(QueueItem{session_id, usage, threshold, &session_io});
+    cv_.notify_one();
+  }
+
+ private:
+  struct QueueItem {
+    std::string session_id;
+    ContextUsage usage;
+    double threshold = 0.70;
+    SessionIO *session_io = nullptr;
+  };
+
+  void worker_loop() {
+    while (true) {
+      QueueItem item;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+        if (stopping_ && queue_.empty()) {
+          return;
+        }
+        item = queue_.front();
+        queue_.pop_front();
+      }
+
+      try {
+        if (item.session_io) {
+          manager_.run_auto_compact_guard(item.session_id, item.usage,
+                                          item.threshold, *item.session_io);
+        }
+      } catch (const std::exception &e) {
+        LOG_ERROR_CTX("Background compaction failed for " + item.session_id +
+                          ": " + e.what(),
+                      "session_mgr", "", -1, "session_compact_async_error");
+      }
+
+      {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        queued_sessions_.erase(item.session_id);
+      }
+      {
+        std::scoped_lock<std::mutex> lock(manager_.compaction_state_mutex_);
+        manager_.sessions_needing_compaction_.erase(item.session_id);
+      }
+    }
+  }
+
+  SessionManager &manager_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<QueueItem> queue_;
+  std::unordered_set<std::string> queued_sessions_;
+  bool stopping_ = false;
+  std::thread worker_;
+};
+
 // ── Construction ──────────────────────────────────────────────────────────
 
 SessionManager::SessionManager(
     const std::string &storage_root,
     std::shared_ptr<storage::IStorageProvider> storage_provider)
-    : storage_root_(storage_root), storage_provider_(std::move(storage_provider)) {
+    : storage_root_(storage_root), storage_provider_(std::move(storage_provider)),
+      compaction_queue_(std::make_unique<CompactionQueue>(*this)) {
   try {
     fs::create_directories(storage_root_ + "/sessions/users");
     fs::create_directories(storage_root_ + "/sessions/procs");
@@ -30,6 +117,8 @@ SessionManager::SessionManager(
                   "session_mgr", "", -1, "init_error");
   }
 }
+
+SessionManager::~SessionManager() = default;
 
 void SessionManager::validate_super_user_name(const std::string &super_user) {
   if (super_user.empty()) {
@@ -60,7 +149,7 @@ void SessionManager::validate_super_user_name(const std::string &super_user) {
 }
 
 /* static */ uint64_t SessionManager::estimate_tokens(std::string_view text) {
-  return static_cast<uint64_t>(text.size() / 4);
+  return static_cast<uint64_t>(std::max<std::size_t>(1, text.size() / 3));
 }
 
 uint64_t SessionManager::estimate_request_tokens(const json &request_messages) {
@@ -507,6 +596,7 @@ SessionManager::get_session_info(const std::string &session_id) const {
     }
   }
 
+  info.live_stats.needs_compaction = session_needs_compaction(session_id);
   info.snapshot_count = snapshot_count(session_id);
   return info;
 }
@@ -531,6 +621,7 @@ json SessionManager::build_session_object(const SessionInfo &info,
   session["turn_count"] = info.live_stats.turn_count;
   session["snapshot_count"] = info.snapshot_count;
   session["compacted"] = info.live_stats.compacted;
+  session["needs_compaction"] = info.live_stats.needs_compaction;
 
   if (max_ctx > 0) {
     session["max_context_tokens"] = max_ctx;
@@ -778,7 +869,7 @@ json SessionManager::build_seeded_conversation(const std::string &session_id,
       continue;
     }
     seeded_tokens +=
-        static_cast<uint64_t>(m.value("content", std::string("")).size() / 4);
+        static_cast<uint64_t>(std::max<std::size_t>(1, m.value("content", std::string("")).size() / 3));
   }
 
   // Count only real turns (user + assistant messages), excluding synthetic summary
@@ -820,7 +911,7 @@ SessionManager::compact(const std::string &session_id, const json &history,
   for (const auto &m : history) {
     if (m.is_object())
       result.tokens_before +=
-          static_cast<int>(m.value("content", std::string("")).size()) / 4;
+          static_cast<int>(std::max<std::size_t>(1, m.value("content", std::string("")).size() / 3));
   }
 
   // 1. Run compacter and only reset/snapshot when compaction is applicable.
@@ -913,7 +1004,7 @@ SessionManager::compact(const std::string &session_id, const json &history,
   // Estimate tokens after (the pre-seeded history is small).
   // user(~6w) + assistant(tool_call~10w) + tool(summary) ≈ summary/4 + 50
   result.tokens_after =
-      static_cast<int>(summary.size()) / 4 + (is_auto ? 60 : 50);
+      static_cast<int>(std::max<std::size_t>(1, summary.size() / 3)) + (is_auto ? 60 : 50);
 
   LOG_INFO_CTX("Compact " + session_id + " tokens " +
                    std::to_string(result.tokens_before) + " → " +
@@ -982,12 +1073,30 @@ SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
    result.tokens_before = compact_result.tokens_before;
    result.tokens_after = compact_result.tokens_after;
 
-   if (result.compacted) {
-     // Persist via storage provider (if available)
-     if (!compact_result.compacted_conversation.empty() && storage_provider_) {
-       storage_provider_->upsert_conversation(compact_result.compacted_conversation);
+   if (result.compacted && !compact_result.compacted_conversation.empty()) {
+     Conversation compacted_convo = convo;
+     compacted_convo.messages.clear();
+     const json messages = compact_result.compacted_conversation.value(
+         "messages", json::array());
+     if (messages.is_array()) {
+       for (const auto &message : messages) {
+         if (message.is_object()) {
+           compacted_convo.messages.push_back(message);
+         }
+       }
      }
-     // Evict cache so next read reloads from storage
+     compacted_convo.turn_count = compact_result.compacted_conversation.value(
+         "turn_count", compacted_convo.turn_count);
+     compacted_convo.current_context_tokens =
+         compact_result.compacted_conversation.value(
+             "current_context_tokens", compacted_convo.current_context_tokens);
+     compacted_convo.metadata["compacted"] = true;
+     compacted_convo.metadata["needs_compaction"] = false;
+
+     if (!session_io.persist_conversation(compacted_convo)) {
+       LOG_WARN_CTX("Failed to persist auto-compacted conversation " + convo_id,
+                    "session_mgr", "", -1, "session_compact_persist_error");
+     }
      session_io.invalidate_conversation_cache(convo_id);
    }
 
@@ -996,6 +1105,40 @@ SessionManager::AutoCompactGuardResult SessionManager::run_auto_compact_guard(
   }
 
   return result;
+}
+
+void SessionManager::enqueue_auto_compaction_if_needed(
+    const std::string &convo_id, const ContextUsage &usage,
+    double auto_compact_threshold, SessionIO &session_io) {
+  if (convo_id.empty() || usage.max_context_tokens == 0) {
+    return;
+  }
+  if (auto_compact_threshold <= 0.0) {
+    auto_compact_threshold = 0.70;
+  }
+
+  const double fill_ratio = static_cast<double>(usage.total_context_tokens) /
+                            static_cast<double>(usage.max_context_tokens);
+  if (fill_ratio < auto_compact_threshold) {
+    return;
+  }
+
+  {
+    std::scoped_lock<std::mutex> lock(compaction_state_mutex_);
+    sessions_needing_compaction_.insert(convo_id);
+  }
+
+  LOG_INFO_CTX("Queued background auto-compaction for " + convo_id +
+                   " ratio=" + std::to_string(fill_ratio) +
+                   " threshold=" + std::to_string(auto_compact_threshold),
+               "session_mgr", "", -1, "session_compact_async_queued");
+  compaction_queue_->enqueue(convo_id, usage, auto_compact_threshold, session_io);
+}
+
+bool SessionManager::session_needs_compaction(
+    const std::string &session_id) const {
+  std::scoped_lock<std::mutex> lock(compaction_state_mutex_);
+  return sessions_needing_compaction_.count(session_id) > 0;
 }
 
 SessionManager::ContextUsage SessionManager::compute_context_usage(

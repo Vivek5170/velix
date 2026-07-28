@@ -1,7 +1,7 @@
 {
   "name": "update_memory",
   "type": "tool",
-  "description": "Updates permenant memory. Auto injected into system prompt",
+  "description": "Updates persistent memory. Store one fact per line in compact format (e.g. 'likes spicy food'). Append never duplicates an exact line. Remove and patch require the exact line content to match — provide the complete line text verbatim. Remove deletes one exact line. Patch replaces the exact matched line with replacement.",
   "runtime": "python",
   "workdir": ".",
   "parameters": {
@@ -14,13 +14,17 @@
       },
       "update_mode": {
         "type": "string",
-        "enum": ["append", "overwrite"],
-        "description": "Whether to append the new content to the existing file or overwrite it entirely. Default is append.",
+        "enum": ["append", "remove", "patch"],
+        "description": "How to update: 'append' adds content, 'remove' deletes matching lines, 'patch' finds a line and replaces it with replacement.",
         "default": "append"
       },
       "content": {
         "type": "string",
-        "description": "The information to write."
+        "description": "The line content for append/remove/patch. For append: the new line to add. For remove: the exact line to delete. For patch: the exact line to find and replace."
+      },
+      "replacement": {
+        "type": "string",
+        "description": "Required for patch mode. The text to replace the matched line with."
       }
     },
     "required": ["target_file", "content"]

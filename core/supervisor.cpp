@@ -565,6 +565,18 @@ private:
       return;
     }
     if (pid == 0) {
+      // Close all file descriptors above stderr before execv().
+      // All TCP sockets already have O_CLOEXEC set via set_close_on_exec()
+      // in SocketWrapper, so they are automatically closed by execv().
+      // However, the log file (and any other std::ofstream/fopen handles)
+      // is opened without O_CLOEXEC and would otherwise be inherited,
+      // causing: (1) interleaved log writes between supervisor and handler,
+      // (2) the supervisor's log file being held open until the handler exits,
+      // (3) log rotation failures while the handler holds the old fd.
+      const int max_fd = static_cast<int>(::sysconf(_SC_OPEN_MAX));
+      for (int fd = STDERR_FILENO + 1; fd < max_fd; ++fd) {
+        ::close(fd); // Ignoring errors; most fds will not be open.
+      }
       ::execv(config_.handler_binary.c_str(),
               const_cast<char *const *>(argv.data()));
       ::_exit(1);
@@ -911,8 +923,12 @@ private:
   }
 
   json handle_llm_request(const json &message) {
-    // NOTE: Simplified implementation - full LLM request handling would be
-    // more complex
+    // NOTE: Monitoring-only endpoint. The Scheduler no longer calls this on
+    // every LLM request (Task 14 fix — N+1 TCP storm). It is kept here so
+    // external monitoring tools can query the Supervisor for LLM request state
+    // and to maintain backward compatibility with any direct callers.
+    // The Scheduler now tracks llm_request_counts locally and uses
+    // tree_id == "TREE_HANDLER" to infer is_handler without a network round trip.
     const std::string mode = message.value("mode", "");
     const std::string tree_id = message.value("tree_id", "");
     const std::string convo_id = message.value("convo_id", "");

@@ -5,6 +5,8 @@
 
 namespace velix::llm {
 
+inline constexpr int kCompacterInternalPid = 2147483647;
+
 struct CompactResult {
     nlohmann::json history;
     bool compacted = false;

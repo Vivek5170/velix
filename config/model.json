@@ -1,6 +1,21 @@
 {
-  "active_adapter": "llama.cpp",
+  "active_adapter": "lm_studio",
   "adapters": {
+    "lm_studio": {
+      "api_style": "openai-chat-completions",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "api_key": "",
+      "host": "127.0.0.1",
+      "port": 1234,
+      "use_https": false,
+      "base_path": "/v1",
+      "chat_completions_path": "/chat/completions",
+      "model": "qwen3.5-4b-mlx-lm-nvfp4",
+      "enable_tools": true,
+      "enable_streaming": true,
+      "api_key_env": "",
+      "stop_tokens": []
+    },
     "llama.cpp": {
       "api_style": "openai-chat-completions",
       "base_url": "http://127.0.0.1:8033/v1",

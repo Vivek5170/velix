@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Tuple
 from runtime.sdk.python.velix_process import VelixProcess
 
 
+MAX_SNIPPET_CHARS = 200
+
+
 class WebSearchTool(VelixProcess):
     def __init__(self) -> None:
         super().__init__("web_search", "tool")
@@ -358,7 +361,7 @@ class WebSearchTool(VelixProcess):
                             "title": str(item.get("title", "")).strip()
                             or str(item.get("url", "")).strip(),
                             "url": str(item.get("url", "")).strip(),
-                            "snippet": str(item.get("markdown", "")).strip()[:600]
+                            "snippet": str(item.get("markdown", "")).strip()[:MAX_SNIPPET_CHARS]
                             if item.get("markdown")
                             else str(item.get("description", "")).strip(),
                         }
@@ -631,7 +634,7 @@ class WebSearchTool(VelixProcess):
         for item in items:
             title = str(item.get("title", "")).strip()
             url = str(item.get("url", "")).strip()
-            snippet = str(item.get("snippet", "")).strip()
+            snippet = str(item.get("snippet", "")).strip()[:MAX_SNIPPET_CHARS]
             if not title and not url:
                 continue
             out.append(

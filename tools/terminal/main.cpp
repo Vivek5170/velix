@@ -63,7 +63,7 @@ struct TerminalConfig {
     int         max_timeout_sec      = 600;
     int         poll_interval_ms     = 200;
     int         poll_grace_sec       = 30;  // extra seconds beyond job timeout for AM latency
-    size_t      max_output_chars     = 50000;
+    size_t      max_output_chars     = 4000;
     std::string playground_root      = "../../agent_playground";
     bool        allow_path_escape    = false;
     std::string permanent_path       = ".velix/terminal/allowlist.txt";
@@ -171,6 +171,14 @@ static TerminalConfig load_config(const std::string &path) {
          }
      } catch (const std::exception &) {
          // Config parsing failed; use defaults
+     }
+     if (const char *env_limit = std::getenv("VELIX_MAX_TOOL_OUTPUT_CHARS");
+         env_limit && *env_limit) {
+         try {
+             const auto parsed = static_cast<size_t>(std::stoull(env_limit));
+             if (parsed > 0) cfg.max_output_chars = parsed;
+         } catch (...) {
+         }
      }
      return cfg;
 }

@@ -30,6 +30,8 @@ public:
 
   json get_tool_schemas() const { return cached_schemas_; }
 
+  void reload() { load_from_tools_directory(); }
+
 private:
   std::map<std::string, ToolManifest, std::less<>> manifests_;
   json cached_schemas_ = json::array();

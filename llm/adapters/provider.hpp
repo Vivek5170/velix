@@ -2,6 +2,7 @@
 
 #include "../../communication/json_include.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <string>
@@ -58,6 +59,10 @@ struct StreamChunk {
 class ProviderAdapter {
 public:
   virtual ~ProviderAdapter() = default;
+  virtual uint64_t estimate_tokens(const std::string &text) const {
+    return std::max<uint64_t>(1, text.size() / 3);
+  }
+
   virtual std::string provider_name() const = 0;
   virtual ChatResponse call_chat(const AdapterConfig &cfg,
                                  const ChatRequest &request) const = 0;

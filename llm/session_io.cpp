@@ -56,7 +56,7 @@ std::string sanitize_for_filename(const std::string& s) {
 }
 
 std::uint64_t estimate_text_tokens(const std::string& text) {
-	return static_cast<std::uint64_t>(text.size() / 4);
+	return static_cast<std::uint64_t>(std::max<std::uint64_t>(1, text.size() / 3));
 }
 
 std::uint64_t estimate_history_tokens(const std::vector<json>& messages) {

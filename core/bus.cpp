@@ -62,7 +62,7 @@ public:
 
     try {
       const std::string bind_host =
-        velix::communication::resolve_bind_host("BUS", "0.0.0.0");
+        velix::communication::resolve_bind_host("BUS", "127.0.0.1");
       server_socket_ = std::make_unique<velix::communication::SocketWrapper>();
       server_socket_->create_tcp_socket();
       server_socket_->bind(bind_host, static_cast<uint16_t>(config_.port));
@@ -129,9 +129,21 @@ private:
       velix::communication::SocketWrapper client = server_socket->accept();
       auto client_ptr = std::make_shared<velix::communication::SocketWrapper>();
       *client_ptr = std::move(client);
-      thread_pool_.try_submit([this, client_ptr]() mutable {
+      const bool submitted = thread_pool_.try_submit([this, client_ptr]() mutable {
         handle_session(std::move(*client_ptr));
       });
+      if (!submitted) {
+        try {
+          velix::communication::send_json(
+              *client_ptr,
+              json({{"status", "error"}, {"error", "bus_capacity_reached"}})
+                  .dump());
+        } catch (const std::exception &) {
+          // Best-effort rejection path.
+        }
+        LOG_WARN_CTX("Bus rejected connection: max client threads reached",
+                     "bus", "", -1, "capacity_reached");
+      }
       return true;
     } catch (const std::exception &e) {
       if (running_) {
@@ -188,8 +200,8 @@ private:
             LOG_INFO_CTX("Process " + std::to_string(registered_pid) +
                              " connected to Bus",
                          "bus", "BUS", registered_pid, "register");
-            velix::communication::send_json(*socket_ptr,
-                                            json({{"status", "ok"}}).dump());
+velix::communication::send_json(*socket_ptr,
+                                             json({{"status", "ok"}}).dump());
           }
         } else if (msg_type == "IPM_RELAY") {
           const int requested_target_pid = msg.value("target_pid", -1);
@@ -201,6 +213,12 @@ private:
                              std::to_string(requested_target_pid),
                          "bus", "", registered_pid, "relay_target_missing");
           }
+        } else if (msg_type == "HEARTBEAT") {
+          // Task 12: Forward heartbeat to Supervisor via the Bus instead of
+          // having each process open a fresh TCP connection per heartbeat.
+          // The Bus acts as a proxy: one Bus connection per heartbeat cycle
+          // replaces N (one per process) direct Supervisor connections.
+          forward_heartbeat_to_supervisor(msg, *socket_ptr);
         }
       }
     } catch (const std::exception &) {
@@ -258,6 +276,45 @@ private:
                    "bus", "", source_pid, "relay_target_missing");
     }
   }
+
+  // Task 12: Forward a HEARTBEAT message from a process (via its persistent
+  // Bus socket) to the Supervisor, then relay the ACK back to the process.
+  // This replaces per-process TCP connections to the Supervisor with a single
+  // shared Bus thread-pool connection, eliminating the TCP storm.
+  void forward_heartbeat_to_supervisor(
+      const json &heartbeat_msg,
+      velix::communication::SocketWrapper &client_sock) {
+    try {
+      const int sup_port =
+          velix::utils::get_port("SUPERVISOR", 5173);
+      velix::communication::SocketWrapper sup_sock;
+      sup_sock.create_tcp_socket();
+      sup_sock.connect(
+          velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
+          static_cast<uint16_t>(sup_port));
+      sup_sock.set_timeout_ms(3000);
+
+      velix::communication::send_json(sup_sock, heartbeat_msg.dump());
+      const json ack = velix::communication::recv_json_parsed(sup_sock);
+
+      // Relay the supervisor ACK back to the process on its bus socket.
+      velix::communication::send_json(client_sock, ack.dump());
+    } catch (const std::exception &e) {
+      LOG_WARN_CTX(
+          std::string("Bus failed to forward heartbeat to Supervisor: ") +
+              e.what(),
+          "bus", "", heartbeat_msg.value("pid", -1), "heartbeat_forward_fail");
+      // Send a best-effort error back so the process can detect supervisor loss.
+      try {
+        velix::communication::send_json(
+            client_sock,
+            json({{"status", "error"}, {"error", "supervisor_unreachable"}})
+                .dump());
+      } catch (...) {
+      }
+    }
+  }
+
 
   BusConfig config_;
   std::atomic<bool> running_{false};

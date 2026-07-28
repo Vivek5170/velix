@@ -44,6 +44,7 @@ class VelixProcess:
 
         # Async result waiting — mirrors queue_mutex / queue_cv / response_map / pending_response_traces
         self._response_map: Dict[str, Any] = {}
+        self._queue_lock: threading.Lock = threading.Lock()
         self._response_cv: threading.Condition = threading.Condition()
         self._pending_response_traces: set = set()
 
@@ -811,7 +812,7 @@ class VelixProcess:
             self.result_reported = True
         else:
             # Async path: clear the trace ID so dispatcher stops waiting.
-            with self._queue_lock:
+            with self._response_cv:
                 if trace_id:
                     self._pending_response_traces.discard(trace_id)
                     self._response_map.pop(trace_id, None)
@@ -834,13 +835,27 @@ class VelixProcess:
                 },
             }
             try:
-                sup_port = self._resolve_port("SUPERVISOR", 5173)
-                sock = self._connect_with_retries("127.0.0.1", sup_port, 3000, 1, 0)
-                try:
-                    self._send_framed(sock, heartbeat)
-                    self._recv_framed_raw(sock)  # consume {"status": "ok"}
-                finally:
-                    sock.close()
+                # Task 12: Send heartbeat via the persistent Bus socket instead
+                # of opening a new TCP connection to the Supervisor per heartbeat.
+                # The Bus forwards the message to the Supervisor and relays the
+                # ACK back. This eliminates N fresh TCP connect/close cycles per
+                # second (one per process per heartbeat interval).
+                bus_sock = self._bus_sock
+                if bus_sock is not None:
+                    with self._bus_lock:
+                        self._send_framed(bus_sock, heartbeat)
+                        # Fire and forget. The Bus relays the Supervisor ACK back asynchronously.
+                        # If the Supervisor is unreachable, the Bus will send back an error
+                        # which the _bus_listener_loop will catch and terminate the process.
+                else:
+                    # Bus not yet connected — fall back to a direct connection.
+                    sup_port = self._resolve_port("SUPERVISOR", 5173)
+                    sock = self._connect_with_retries("127.0.0.1", sup_port, 3000, 1, 0)
+                    try:
+                        self._send_framed(sock, heartbeat)
+                        self._recv_framed_raw(sock)
+                    finally:
+                        sock.close()
             except Exception:
                 if self.is_running:
                     _log_warn("Lost supervisor connection during heartbeat. Engine terminating.")
@@ -853,7 +868,11 @@ class VelixProcess:
             while time.monotonic() < deadline and not self.force_terminate:
                 time.sleep(0.1)
 
-        # Final death rattle — mirrors the post-loop block in C++
+        # Final death rattle — mirrors the post-loop block in C++.
+        # NOTE: We use a direct Supervisor connection here because the Bus socket
+        # may already be closed by shutdown() (which closes _bus_sock before
+        # joining _hb_thread). A direct connection guarantees delivery of the
+        # terminal KILLED/FINISHED status even during teardown.
         if self.velix_pid > 0:
             try:
                 final_status = "KILLED" if self.forced_by_signal else "FINISHED"
@@ -923,6 +942,11 @@ class VelixProcess:
                                 self.on_bus_event(msg)
                             except Exception as exc:
                                 _log_warn(f"on_bus_event hook failed: {exc}")
+                    elif msg.get("status") == "error":
+                        # Task 12: Catch asynchronous heartbeat forwarding errors from the Bus
+                        raise RuntimeError(
+                            f"Supervisor unreachable via Bus: {msg.get('error', 'unknown')}"
+                        )
 
                 except (TimeoutError, OSError) as exc:
                     if _is_transient_socket_error(str(exc)):
@@ -1022,15 +1046,55 @@ class VelixProcess:
 
     @staticmethod
     def _get_current_memory_usage_mb() -> float:
-        """Dependency-free memory query. Returns 0.0 on unsupported platforms."""
+        """Cross-platform RSS memory query. Returns 0.0 only on unsupported platforms."""
         try:
-            if platform.system() == "Linux":
+            sys_name = platform.system()
+            if sys_name == "Linux":
                 with open("/proc/self/statm", "r", encoding="utf-8") as f:
                     parts = f.read().strip().split()
                 if len(parts) >= 2:
                     rss_pages = int(parts[1])
                     page_size = os.sysconf("SC_PAGE_SIZE")
                     return float(rss_pages * page_size) / (1024.0 * 1024.0)
+            elif sys_name == "Darwin":
+                # macOS: resource.getrusage ru_maxrss is in bytes (not kilobytes
+                # like POSIX suggests — Apple deviates from the spec here).
+                import resource
+                rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                return float(rss_bytes) / (1024.0 * 1024.0)
+            elif sys_name == "Windows":
+                try:
+                    import psutil
+                    return psutil.Process().memory_info().rss / (1024.0 * 1024.0)
+                except ImportError:
+                    # psutil not available — fall back to ctypes + GetProcessMemoryInfo
+                    import ctypes
+                    import ctypes.wintypes
+
+                    class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                        _fields_ = [
+                            ("cb",                         ctypes.wintypes.DWORD),
+                            ("PageFaultCount",             ctypes.wintypes.DWORD),
+                            ("PeakWorkingSetSize",         ctypes.c_size_t),
+                            ("WorkingSetSize",             ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage",    ctypes.c_size_t),
+                            ("QuotaPagedPoolUsage",        ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage",     ctypes.c_size_t),
+                            ("PagefileUsage",              ctypes.c_size_t),
+                            ("PeakPagefileUsage",          ctypes.c_size_t),
+                        ]
+
+                    pmc = PROCESS_MEMORY_COUNTERS()
+                    pmc.cb = ctypes.sizeof(pmc)
+                    psapi = ctypes.windll.psapi  # type: ignore[attr-defined]
+                    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+                    if psapi.GetProcessMemoryInfo(
+                        kernel32.GetCurrentProcess(),
+                        ctypes.byref(pmc),
+                        pmc.cb,
+                    ):
+                        return float(pmc.WorkingSetSize) / (1024.0 * 1024.0)
         except Exception:
             pass
         return 0.0

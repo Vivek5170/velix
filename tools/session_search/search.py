@@ -132,6 +132,12 @@ class SessionSearchTool(VelixProcess):
             source_version TEXT NOT NULL
         );
         """
+        meta_ddl = """
+        CREATE TABLE IF NOT EXISTS index_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
         trigger_ddl = """
         CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
             INSERT INTO turns_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -145,6 +151,7 @@ class SessionSearchTool(VelixProcess):
         END;
         """
         conn.executescript(ddl)
+        conn.executescript(meta_ddl)
         conn.executescript(trigger_ddl)
         conn.commit()
         return conn
@@ -446,6 +453,21 @@ class SessionSearchTool(VelixProcess):
                 )
         conn.commit()
 
+    @staticmethod
+    def _get_meta(conn: sqlite3.Connection, key: str, fallback: str = "") -> str:
+        row = conn.execute(
+            "SELECT value FROM index_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return str(row[0]) if row else fallback
+
+    @staticmethod
+    def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        conn.commit()
+
     def run(self) -> None:
         """Main search entrypoint. Reads VELIX_USER_ID from runtime env."""
         # Validate query parameter
@@ -496,6 +518,11 @@ class SessionSearchTool(VelixProcess):
         limit: int = int(self.params.get("limit", _DEFAULT_LIMIT))
         limit = max(1, min(limit, _MAX_LIMIT))
 
+        # Parse reindex threshold in seconds (default 60)
+        reindex_threshold_s: int = int(self.params.get("reindex_threshold_s", 60))
+        reindex_threshold_s = max(0, min(reindex_threshold_s, 3600))
+        force_reindex: bool = str(self.params.get("reindex", "false")).strip().lower() in ("true", "1")
+
         try:
             # Open per-tenant index DB
             conn = self._open_db()
@@ -509,8 +536,18 @@ class SessionSearchTool(VelixProcess):
                 conn.close()
                 return
 
-            # Update index with appropriate scope
-            self._update_index(conn, session_id, mode, is_proc, tenant_key)
+            # Task 21: Skip index rebuild if the index was built recently
+            # with the same mode, unless force_reindex is set.
+            now_ms = int(time.time() * 1000)
+            last_ms_str = self._get_meta(conn, "last_indexed_ms")
+            last_mode = self._get_meta(conn, "last_mode")
+            last_ms = int(last_ms_str) if last_ms_str else 0
+            needs_rebuild = force_reindex or not last_ms or mode != last_mode or (now_ms - last_ms) > reindex_threshold_s * 1000
+
+            if needs_rebuild:
+                self._update_index(conn, session_id, mode, is_proc, tenant_key)
+                self._set_meta(conn, "last_indexed_ms", str(now_ms))
+                self._set_meta(conn, "last_mode", mode)
 
             # Build FTS5 query with mode-based filtering
             sql = """

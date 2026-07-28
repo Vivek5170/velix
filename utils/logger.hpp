@@ -9,6 +9,13 @@
 #include <filesystem>
 #include <mutex>
 #include <string_view>
+#include <cstdio>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include "../communication/json_include.hpp"
 
 namespace velix::utils {
@@ -23,9 +30,10 @@ struct LogContext {
 class Logger {
 private:
     inline static std::string log_dir = "logs";
-    inline static std::ofstream log_file;
+    inline static FILE* log_file = nullptr;
     inline static bool initialized = false;
     inline static std::mutex write_mutex;
+    inline static std::once_flag init_flag_;
 
     // JSON escaping is now handled by nlohmann::json
 
@@ -64,9 +72,7 @@ private:
     }
 
     static void ensure_initialized() {
-        if (!initialized) {
-            init("logs");
-        }
+        std::call_once(init_flag_, []{ init("logs"); });
     }
 
 public:
@@ -76,12 +82,17 @@ public:
         std::filesystem::create_directories(log_dir);
         
         std::string log_file_path = log_dir + "/velix.log";
-        if (log_file.is_open()) {
-            log_file.close();
+        if (log_file) {
+            fclose(log_file);
         }
-        log_file.open(log_file_path, std::ios::app);
+        log_file = fopen(log_file_path.c_str(), "a");
         
-        if (!log_file.is_open()) {
+        if (log_file) {
+#ifndef _WIN32
+            int fd = fileno(log_file);
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
+        } else {
             std::cerr << "Failed to open log file: " << log_file_path << std::endl;
         }
         initialized = true;
@@ -100,9 +111,9 @@ public:
             std::cout << line << std::endl;
         }
 
-        if (log_file.is_open()) {
-            log_file << line << std::endl;
-            log_file.flush();
+        if (log_file) {
+            fprintf(log_file, "%s\n", line.c_str());
+            fflush(log_file);
         }
     }
 
@@ -140,8 +151,9 @@ public:
 
     static void close() {
         std::scoped_lock lock(write_mutex);
-        if (log_file.is_open()) {
-            log_file.close();
+        if (log_file) {
+            fclose(log_file);
+            log_file = nullptr;
         }
         initialized = false;
     }

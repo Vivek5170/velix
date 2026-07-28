@@ -5,6 +5,7 @@
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -28,7 +29,7 @@ struct CompacterConfig {
   int summary_retry_count{2};
   int summary_retry_backoff_ms{250};
   std::string summary_tree_id{"TREE_HANDLER"};
-  int summary_source_pid{1000};
+  int summary_source_pid{kCompacterInternalPid};
 };
 
 bool is_transient_summary_error(std::string_view error_text) {
@@ -137,9 +138,6 @@ CompacterConfig load_compacter_config() {
     LOG_ERROR(std::string("Failed parsing config/compacter.json: ") + e.what());
   }
 
-  if (cfg.summary_source_pid <= 0) {
-    cfg.summary_source_pid = 1000;
-  }
   if (cfg.keep_recent_turns == 0) {
     cfg.keep_recent_turns = 1;
   }
@@ -183,7 +181,7 @@ std::size_t estimate_history_tokens(const nlohmann::json &history) {
       total_chars += turn["content"].get<std::string>().size();
     }
   }
-  return total_chars / 4;
+  return std::max<std::size_t>(1, total_chars / 3);
 }
 
 std::string
