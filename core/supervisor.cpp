@@ -507,6 +507,7 @@ private:
 
   std::atomic<bool> running_{false};
   std::thread watchdog_thread_;
+  std::mutex watchdog_join_mutex_;
 
   // Handler lifecycle tracking
   std::atomic<int> handler_os_pid_{-1};
@@ -515,6 +516,7 @@ private:
   std::chrono::steady_clock::time_point handler_dead_since_;
 
   void join_watchdog() {
+    std::scoped_lock lock(watchdog_join_mutex_);
     if (watchdog_thread_.joinable()) {
       watchdog_thread_.join();
     }

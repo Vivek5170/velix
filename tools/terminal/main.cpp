@@ -356,71 +356,16 @@ static bool is_interactive_shell_request(const std::string &cmd) {
     return t == "bash" || t == "sh" || t == "zsh" || t == "fish";
 }
 
-static std::string build_pty_exec_cmd(const std::string &full_cmd,
-                                      const fs::path &sandbox_cwd,
-                                      bool force_cwd_prefix) {
-    // Priority order:
-    // 1. If force_cwd_prefix is true (explicit cwd passed), always prepend cd
-    // 2. Otherwise, use command as-is (preserve session state)
-    if (!force_cwd_prefix) return full_cmd;
-    return "cd " + velix::app_manager::shell_quote(sandbox_cwd.string()) +
-           " && " + full_cmd;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // ApplicationManager client helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-static std::string am_call(const json &request, const std::string &host, int port) {
-    velix::communication::SocketWrapper sock;
-    sock.create_tcp_socket();
-    sock.connect(host, static_cast<uint16_t>(port));
-    velix::communication::send_json(sock, request.dump());
-    return velix::communication::recv_json(sock);
-}
-
-// New helper: returns parsed JSON from ApplicationManager to avoid double-parse
 static json am_call_parsed(const json &request, const std::string &host, int port) {
     velix::communication::SocketWrapper sock;
     sock.create_tcp_socket();
     sock.connect(host, static_cast<uint16_t>(port));
     velix::communication::send_json(sock, request.dump());
     return velix::communication::recv_json_parsed(sock);
-}
-
-static std::string am_execute(const std::string &user_id,
-                              const std::string &cmd,
-                              int timeout_sec,
-                              const std::string &host,
-                              int port,
-                              const std::string &session_name,
-                              const DriverConfig &dcfg) {
-    json driver_config_json = {
-        {"type",             dcfg.type},
-        {"shell",            dcfg.shell},
-        {"ssh_host",         dcfg.ssh_host},
-        {"ssh_port",         dcfg.ssh_port},
-        {"ssh_user",         dcfg.ssh_user},
-        {"ssh_key_path",     dcfg.ssh_key_path},
-        {"docker_container", dcfg.docker_container},
-        {"docker_user",      dcfg.docker_user},
-        {"docker_shell",     dcfg.docker_shell},
-    };
-    json req = {
-        {"message_type",  "EXECUTE"},
-        {"user_id",       user_id},
-        {"cmd",           cmd},
-        {"timeout_sec",   timeout_sec},
-        {"driver_config", driver_config_json}
-    };
-    if (!session_name.empty()) req["session_name"] = session_name;
-
-    json resp = am_call_parsed(req, host, port);
-     if (resp.value("status", "") != "ok") {
-         throw std::runtime_error("ApplicationManager EXECUTE error: " +
-                                  resp.value("error", std::string("unknown")));
-     }
-     return resp.value("job_id", "");
 }
 
 // New helper: returns full EXECUTE response to check session_created flag

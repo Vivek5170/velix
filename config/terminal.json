@@ -15,8 +15,8 @@
     "max_output_chars": 4000
   },
   "sandbox": {
-    "_comment_playground_root": "Root directory for cwd_mode resolution (relative to skill workdir)",
-    "playground_root": "../../agent_playground",
+    "_comment_playground_root": "Root directory for cwd_mode resolution",
+    "playground_root": "../agent_playground",
     "_comment_allow_path_escape": "If false, any cwd that escapes playground_root is rejected",
     "allow_path_escape": true
   },

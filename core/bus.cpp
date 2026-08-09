@@ -1,13 +1,18 @@
 #include "bus.hpp"
 
+#include "../communication/asio_framing.hpp"
+#include "../communication/json_include.hpp"
 #include "../communication/network_config.hpp"
-#include "../communication/socket_wrapper.hpp"
+#include "../utils/asio_runtime.hpp"
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
-#include "../utils/thread_pool.hpp"
-#include "../communication/json_include.hpp"
+
+#include <asio.hpp>
 
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -19,6 +24,8 @@ using json = nlohmann::json;
 namespace velix::core {
 
 namespace {
+
+using asio::ip::tcp;
 
 struct TransparentStringHash {
   using is_transparent = void;
@@ -45,38 +52,77 @@ struct TransparentStringEqual {
 };
 
 struct BusConfig {
-  int max_client_threads = 64;
+  int io_threads = 4;
   int port = 5174;
+  std::uint32_t max_message_bytes = 10U * 1024U * 1024U;
+};
+
+class BusService;
+
+class BusSession : public std::enable_shared_from_this<BusSession> {
+public:
+  BusSession(BusService &service, tcp::socket socket);
+
+  void start();
+  void enqueue_json(std::string payload);
+  void close();
+
+  int registered_pid() const { return registered_pid_; }
+  const std::string &registered_tree_id() const { return registered_tree_id_; }
+
+private:
+  void read_next();
+  void handle_payload(std::string payload);
+  void write_next();
+  void close_on_strand();
+
+  BusService &service_;
+  tcp::socket socket_;
+  asio::strand<asio::any_io_executor> strand_;
+  std::deque<std::string> write_queue_;
+  int registered_pid_{-1};
+  std::string registered_tree_id_;
+  bool registered_tree_root_{false};
+  bool closed_{false};
 };
 
 class BusService {
 public:
-  BusService() = default;
+  BusService() : acceptor_(runtime_.context()) {}
 
   void start(int port_override = -1) {
-    if (running_.exchange(true))
+    if (running_.exchange(true)) {
       return;
+    }
 
     config_.port = (port_override > 0) ? port_override
                                        : velix::utils::get_port("BUS", 5174);
+    config_.io_threads = static_cast<int>(
+        velix::utils::get_config("VELIX_BUS_IO_THREADS", config_.io_threads));
+    config_.max_message_bytes = static_cast<std::uint32_t>(
+        velix::utils::get_config("VELIX_COMM_MAX_MESSAGE_SIZE",
+                                 config_.max_message_bytes));
 
     try {
       const std::string bind_host =
-        velix::communication::resolve_bind_host("BUS", "127.0.0.1");
-      server_socket_ = std::make_unique<velix::communication::SocketWrapper>();
-      server_socket_->create_tcp_socket();
-      server_socket_->bind(bind_host, static_cast<uint16_t>(config_.port));
-      server_socket_->listen(128);
+          velix::communication::resolve_bind_host("BUS", "127.0.0.1");
+      const tcp::endpoint endpoint(asio::ip::make_address(bind_host),
+                                   static_cast<unsigned short>(config_.port));
+
+      acceptor_.open(endpoint.protocol());
+      acceptor_.set_option(asio::socket_base::reuse_address(true));
+      acceptor_.bind(endpoint);
+      acceptor_.listen(asio::socket_base::max_listen_connections);
 
       LOG_INFO_CTX("Velix Bus listening on " + bind_host + ":" +
-               std::to_string(config_.port),
+                       std::to_string(config_.port),
                    "bus", "BUS_ROOT", -1, "startup");
 
-      while (running_) {
-        if (!accept_and_dispatch_once()) {
-          break;
-        }
-      }
+      accept_next();
+      runtime_.start(static_cast<std::size_t>(config_.io_threads));
+
+      std::unique_lock<std::mutex> lock(lifecycle_mutex_);
+      lifecycle_cv_.wait(lock, [this] { return !running_.load(); });
     } catch (const std::exception &e) {
       running_ = false;
       LOG_ERROR_CTX("Bus critical failure: " + std::string(e.what()), "bus", "",
@@ -85,73 +131,129 @@ public:
   }
 
   void stop() {
-    running_ = false;
+    if (!running_.exchange(false)) {
+      return;
+    }
 
+    asio::error_code ignored;
+    acceptor_.cancel(ignored);
+    acceptor_.close(ignored);
+
+    std::unordered_map<int, std::shared_ptr<BusSession>> sessions;
     {
-      std::scoped_lock lock(server_mutex_);
-      if (server_socket_) {
-        server_socket_->close();
+      std::scoped_lock lock(registry_mutex_);
+      sessions = pid_sessions_;
+      pid_sessions_.clear();
+      tree_root_pid_map_.clear();
+    }
+
+    for (auto &[_, session] : sessions) {
+      if (session) {
+        session->close();
       }
     }
 
-    {
-      std::scoped_lock lock(registry_mutex_);
-      for (auto &entry : pid_sockets_) {
-        if (entry.second && entry.second->is_open()) {
-          entry.second->close();
-        }
+    runtime_.stop();
+    lifecycle_cv_.notify_all();
+  }
+
+  std::uint32_t max_message_bytes() const { return config_.max_message_bytes; }
+  asio::io_context &io_context() { return runtime_.context(); }
+
+  void handle_message(const std::shared_ptr<BusSession> &session,
+                      const json &msg) {
+    const std::string msg_type = msg.value("message_type", "");
+
+    if (msg_type == "BUS_REGISTER") {
+      register_session(session, msg);
+      return;
+    }
+
+    if (msg_type == "IPM_RELAY") {
+      const int requested_target_pid = msg.value("target_pid", -1);
+      const int target_pid = resolve_target_pid(msg, requested_target_pid);
+      if (target_pid > 0) {
+        relay_message(session->registered_pid(), target_pid, msg);
+      } else {
+        LOG_WARN_CTX("Dropping relay due to unresolved target_pid=" +
+                         std::to_string(requested_target_pid),
+                     "bus", "", session->registered_pid(),
+                     "relay_target_missing");
       }
-      pid_sockets_.clear();
-      delivery_mutexes_.clear();
-      tree_root_pid_map_.clear();
+      return;
+    }
+
+    if (msg_type == "HEARTBEAT") {
+      forward_heartbeat_to_supervisor(session, msg);
+    }
+  }
+
+  void unregister_session(const std::shared_ptr<BusSession> &session, int pid,
+                          const std::string &tree_id) {
+    if (pid <= 0) {
+      return;
+    }
+
+    std::scoped_lock lock(registry_mutex_);
+    if (const auto it = pid_sessions_.find(pid);
+        it != pid_sessions_.end() && it->second == session) {
+      pid_sessions_.erase(it);
+    }
+
+    if (!tree_id.empty()) {
+      if (const auto it = tree_root_pid_map_.find(tree_id);
+          it != tree_root_pid_map_.end() && it->second == pid) {
+        tree_root_pid_map_.erase(it);
+      }
     }
   }
 
 private:
-  bool accept_and_dispatch_once() {
-    try {
-      velix::communication::SocketWrapper *server_socket = nullptr;
-      {
-        std::scoped_lock lock(server_mutex_);
-        if (server_socket_ && server_socket_->is_open()) {
-          server_socket = server_socket_.get();
-        }
-      }
-
-      if (server_socket == nullptr || !server_socket->is_open()) {
-        return false;
-      }
-
-      if (!server_socket->has_data(250)) {
-        return true;
-      }
-
-      velix::communication::SocketWrapper client = server_socket->accept();
-      auto client_ptr = std::make_shared<velix::communication::SocketWrapper>();
-      *client_ptr = std::move(client);
-      const bool submitted = thread_pool_.try_submit([this, client_ptr]() mutable {
-        handle_session(std::move(*client_ptr));
-      });
-      if (!submitted) {
-        try {
-          velix::communication::send_json(
-              *client_ptr,
-              json({{"status", "error"}, {"error", "bus_capacity_reached"}})
-                  .dump());
-        } catch (const std::exception &) {
-          // Best-effort rejection path.
-        }
-        LOG_WARN_CTX("Bus rejected connection: max client threads reached",
-                     "bus", "", -1, "capacity_reached");
-      }
-      return true;
-    } catch (const std::exception &e) {
-      if (running_) {
-        LOG_WARN_CTX("Bus accept error: " + std::string(e.what()), "bus", "",
-                     -1, "accept_error");
-      }
-      return running_.load();
+  void accept_next() {
+    if (!running_) {
+      return;
     }
+
+    acceptor_.async_accept(
+        asio::make_strand(runtime_.context()),
+        [this](const asio::error_code &ec, tcp::socket socket) {
+          if (!running_) {
+            return;
+          }
+
+          if (ec) {
+            if (ec != asio::error::operation_aborted) {
+              LOG_WARN_CTX("Bus accept error: " + ec.message(), "bus", "", -1,
+                           "accept_error");
+            }
+          } else {
+            std::make_shared<BusSession>(*this, std::move(socket))->start();
+          }
+
+          accept_next();
+        });
+  }
+
+  void register_session(const std::shared_ptr<BusSession> &session,
+                        const json &msg) {
+    const int registered_pid = msg.value("pid", -1);
+    if (registered_pid <= 0) {
+      return;
+    }
+
+    {
+      std::scoped_lock lock(registry_mutex_);
+      pid_sessions_[registered_pid] = session;
+      const std::string tree_id = msg.value("tree_id", std::string(""));
+      if (msg.value("is_root", false) && !tree_id.empty()) {
+        tree_root_pid_map_[tree_id] = registered_pid;
+      }
+    }
+
+    LOG_INFO_CTX("Process " + std::to_string(registered_pid) +
+                     " connected to Bus",
+                 "bus", "BUS", registered_pid, "register");
+    session->enqueue_json(json({{"status", "ok"}}).dump());
   }
 
   int resolve_target_pid(const json &msg, int requested_target_pid) {
@@ -174,102 +276,21 @@ private:
     return -1;
   }
 
-  void handle_session(velix::communication::SocketWrapper client_sock) {
-    int registered_pid = -1;
-    std::string registered_tree_id;
-    bool registered_tree_root = false;
-    auto socket_ptr = std::make_shared<velix::communication::SocketWrapper>();
-    *socket_ptr = std::move(client_sock);
-
-    try {
-      while (running_ && socket_ptr->is_open()) {
-      json msg = velix::communication::recv_json_parsed(*socket_ptr);
-
-        std::string msg_type = msg.value("message_type", "");
-
-        if (msg_type == "BUS_REGISTER") {
-          registered_pid = msg.value("pid", -1);
-          registered_tree_id = msg.value("tree_id", std::string(""));
-          registered_tree_root = msg.value("is_root", false);
-          if (registered_pid > 0) {
-            std::scoped_lock lock(registry_mutex_);
-            pid_sockets_[registered_pid] = socket_ptr;
-            if (registered_tree_root && !registered_tree_id.empty()) {
-              tree_root_pid_map_[registered_tree_id] = registered_pid;
-            }
-            LOG_INFO_CTX("Process " + std::to_string(registered_pid) +
-                             " connected to Bus",
-                         "bus", "BUS", registered_pid, "register");
-velix::communication::send_json(*socket_ptr,
-                                             json({{"status", "ok"}}).dump());
-          }
-        } else if (msg_type == "IPM_RELAY") {
-          const int requested_target_pid = msg.value("target_pid", -1);
-          const int target_pid = resolve_target_pid(msg, requested_target_pid);
-          if (target_pid > 0) {
-            relay_message(registered_pid, target_pid, msg);
-          } else {
-            LOG_WARN_CTX("Dropping relay due to unresolved target_pid=" +
-                             std::to_string(requested_target_pid),
-                         "bus", "", registered_pid, "relay_target_missing");
-          }
-        } else if (msg_type == "HEARTBEAT") {
-          // Task 12: Forward heartbeat to Supervisor via the Bus instead of
-          // having each process open a fresh TCP connection per heartbeat.
-          // The Bus acts as a proxy: one Bus connection per heartbeat cycle
-          // replaces N (one per process) direct Supervisor connections.
-          forward_heartbeat_to_supervisor(msg, *socket_ptr);
-        }
-      }
-    } catch (const std::exception &) {
-      // Disconnect handled by cleanup.
-    }
-
-    if (registered_pid > 0) {
-      std::scoped_lock lock(registry_mutex_);
-      pid_sockets_.erase(registered_pid);
-      delivery_mutexes_.erase(registered_pid);
-      if (!registered_tree_id.empty()) {
-        if (const auto it = tree_root_pid_map_.find(registered_tree_id);
-            it != tree_root_pid_map_.end() && it->second == registered_pid) {
-          tree_root_pid_map_.erase(it);
-        }
-      }
-    }
-  }
-
   void relay_message(int source_pid, int target_pid, const json &msg) {
-    std::shared_ptr<velix::communication::SocketWrapper> target_socket;
-    std::shared_ptr<std::mutex> target_lock;
-
+    std::shared_ptr<BusSession> target_session;
     {
       std::scoped_lock lock(registry_mutex_);
-      auto it = pid_sockets_.find(target_pid);
-      if (it != pid_sockets_.end()) {
-        target_socket = it->second;
-        // Get or create a delivery mutex for this PID to ensure sequential
-        // atomicity
-        if (delivery_mutexes_.count(target_pid) == 0) {
-          delivery_mutexes_[target_pid] = std::make_shared<std::mutex>();
-        }
-        target_lock = delivery_mutexes_[target_pid];
+      if (const auto it = pid_sessions_.find(target_pid);
+          it != pid_sessions_.end()) {
+        target_session = it->second;
       }
     }
 
-    if (target_socket && target_socket->is_open()) {
-      try {
-        json push_msg = msg;
-        push_msg["message_type"] = "IPM_PUSH";
-        push_msg["source_pid"] = source_pid;
-
-        // Sequence delivery: lock the per-PID mutex
-        std::scoped_lock lock(*target_lock);
-        velix::communication::send_json(*target_socket, push_msg.dump());
-      } catch (const std::exception &e) {
-        LOG_WARN_CTX("Failed to relay message to PID " +
-                         std::to_string(target_pid) + ": " + e.what(),
-                     "bus", "", source_pid, "relay_fail");
-      }
+    if (target_session) {
+      json push_msg = msg;
+      push_msg["message_type"] = "IPM_PUSH";
+      push_msg["source_pid"] = source_pid;
+      target_session->enqueue_json(push_msg.dump());
     } else {
       LOG_WARN_CTX("Dropping relay to non-registered PID " +
                        std::to_string(target_pid),
@@ -277,59 +298,182 @@ velix::communication::send_json(*socket_ptr,
     }
   }
 
-  // Task 12: Forward a HEARTBEAT message from a process (via its persistent
-  // Bus socket) to the Supervisor, then relay the ACK back to the process.
-  // This replaces per-process TCP connections to the Supervisor with a single
-  // shared Bus thread-pool connection, eliminating the TCP storm.
   void forward_heartbeat_to_supervisor(
-      const json &heartbeat_msg,
-      velix::communication::SocketWrapper &client_sock) {
+      const std::shared_ptr<BusSession> &client_session, const json &heartbeat) {
+    const int sup_port = velix::utils::get_port("SUPERVISOR", 5173);
+    const std::string sup_host =
+        velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1");
+
+    auto supervisor_socket = std::make_shared<tcp::socket>(runtime_.context());
+    auto request_frame = std::make_shared<std::string>(
+        velix::communication::make_frame(heartbeat.dump()));
+
     try {
-      const int sup_port =
-          velix::utils::get_port("SUPERVISOR", 5173);
-      velix::communication::SocketWrapper sup_sock;
-      sup_sock.create_tcp_socket();
-      sup_sock.connect(
-          velix::communication::resolve_service_host("SUPERVISOR", "127.0.0.1"),
-          static_cast<uint16_t>(sup_port));
-      sup_sock.set_timeout_ms(3000);
+      const tcp::endpoint endpoint(asio::ip::make_address(sup_host),
+                                   static_cast<unsigned short>(sup_port));
+      supervisor_socket->async_connect(
+          endpoint, [this, supervisor_socket, request_frame, client_session,
+                     heartbeat](const asio::error_code &connect_ec) {
+            if (connect_ec) {
+              send_supervisor_unreachable(client_session, heartbeat, connect_ec);
+              return;
+            }
 
-      velix::communication::send_json(sup_sock, heartbeat_msg.dump());
-      const json ack = velix::communication::recv_json_parsed(sup_sock);
+            asio::async_write(
+                *supervisor_socket, asio::buffer(*request_frame),
+                [this, supervisor_socket, client_session, heartbeat](
+                    const asio::error_code &write_ec, std::size_t) {
+                  if (write_ec) {
+                    send_supervisor_unreachable(client_session, heartbeat,
+                                                write_ec);
+                    return;
+                  }
 
-      // Relay the supervisor ACK back to the process on its bus socket.
-      velix::communication::send_json(client_sock, ack.dump());
+                  velix::communication::async_read_frame(
+                      *supervisor_socket, config_.max_message_bytes,
+                      [this, supervisor_socket, client_session, heartbeat](
+                          const asio::error_code &read_ec,
+                          std::string payload) {
+                        if (read_ec) {
+                          send_supervisor_unreachable(client_session, heartbeat,
+                                                      read_ec);
+                          return;
+                        }
+
+                        client_session->enqueue_json(std::move(payload));
+                        asio::error_code ignored;
+                        supervisor_socket->close(ignored);
+                      });
+                });
+          });
     } catch (const std::exception &e) {
-      LOG_WARN_CTX(
-          std::string("Bus failed to forward heartbeat to Supervisor: ") +
-              e.what(),
-          "bus", "", heartbeat_msg.value("pid", -1), "heartbeat_forward_fail");
-      // Send a best-effort error back so the process can detect supervisor loss.
-      try {
-        velix::communication::send_json(
-            client_sock,
-            json({{"status", "error"}, {"error", "supervisor_unreachable"}})
-                .dump());
-      } catch (...) {
-      }
+      LOG_WARN_CTX(std::string("Bus failed to start heartbeat forward: ") +
+                       e.what(),
+                   "bus", "", heartbeat.value("pid", -1),
+                   "heartbeat_forward_fail");
+      client_session->enqueue_json(
+          json({{"status", "error"}, {"error", "supervisor_unreachable"}})
+              .dump());
     }
   }
 
+  void send_supervisor_unreachable(
+      const std::shared_ptr<BusSession> &client_session, const json &heartbeat,
+      const asio::error_code &ec) {
+    LOG_WARN_CTX(std::string("Bus failed to forward heartbeat to Supervisor: ") +
+                     ec.message(),
+                 "bus", "", heartbeat.value("pid", -1),
+                 "heartbeat_forward_fail");
+    client_session->enqueue_json(
+        json({{"status", "error"}, {"error", "supervisor_unreachable"}})
+            .dump());
+  }
 
   BusConfig config_;
   std::atomic<bool> running_{false};
-  std::mutex server_mutex_;
-  std::unique_ptr<velix::communication::SocketWrapper> server_socket_;
-  velix::utils::ThreadPool thread_pool_{64, 256};
+  velix::utils::AsioRuntime runtime_;
+  tcp::acceptor acceptor_;
+  std::mutex lifecycle_mutex_;
+  std::condition_variable lifecycle_cv_;
 
   std::mutex registry_mutex_;
-  std::unordered_map<int, std::shared_ptr<velix::communication::SocketWrapper>>
-      pid_sockets_;
-  std::unordered_map<int, std::shared_ptr<std::mutex>> delivery_mutexes_;
+  std::unordered_map<int, std::shared_ptr<BusSession>> pid_sessions_;
   std::unordered_map<std::string, int, TransparentStringHash,
                      TransparentStringEqual>
       tree_root_pid_map_;
 };
+
+BusSession::BusSession(BusService &service, tcp::socket socket)
+    : service_(service), socket_(std::move(socket)),
+      strand_(asio::make_strand(socket_.get_executor())) {}
+
+void BusSession::start() { read_next(); }
+
+void BusSession::enqueue_json(std::string payload) {
+  auto self = shared_from_this();
+  asio::post(strand_, [this, self, frame = velix::communication::make_frame(
+                                     std::move(payload))]() mutable {
+    const bool write_in_progress = !write_queue_.empty();
+    write_queue_.push_back(std::move(frame));
+    if (!write_in_progress) {
+      write_next();
+    }
+  });
+}
+
+void BusSession::close() {
+  auto self = shared_from_this();
+  asio::post(strand_, [this, self] { close_on_strand(); });
+}
+
+void BusSession::read_next() {
+  auto self = shared_from_this();
+  velix::communication::async_read_frame(
+      socket_, service_.max_message_bytes(),
+      asio::bind_executor(
+          strand_, [this, self](const asio::error_code &ec,
+                                std::string payload) {
+            if (ec) {
+              close_on_strand();
+              return;
+            }
+
+            handle_payload(std::move(payload));
+            if (!closed_) {
+              read_next();
+            }
+          }));
+}
+
+void BusSession::handle_payload(std::string payload) {
+  try {
+    json msg = json::parse(payload);
+    const std::string msg_type = msg.value("message_type", "");
+    if (msg_type == "BUS_REGISTER") {
+      registered_pid_ = msg.value("pid", -1);
+      registered_tree_id_ = msg.value("tree_id", std::string(""));
+      registered_tree_root_ = msg.value("is_root", false);
+    }
+    service_.handle_message(shared_from_this(), msg);
+  } catch (const std::exception &e) {
+    LOG_WARN_CTX("Bus session received invalid message: " + std::string(e.what()),
+                 "bus", "", registered_pid_, "invalid_message");
+    close_on_strand();
+  }
+}
+
+void BusSession::write_next() {
+  if (write_queue_.empty() || closed_) {
+    return;
+  }
+
+  auto self = shared_from_this();
+  asio::async_write(
+      socket_, asio::buffer(write_queue_.front()),
+      asio::bind_executor(
+          strand_, [this, self](const asio::error_code &ec, std::size_t) {
+            if (ec) {
+              close_on_strand();
+              return;
+            }
+
+            write_queue_.pop_front();
+            write_next();
+          }));
+}
+
+void BusSession::close_on_strand() {
+  if (closed_) {
+    return;
+  }
+  closed_ = true;
+
+  asio::error_code ignored;
+  socket_.close(ignored);
+  write_queue_.clear();
+  service_.unregister_session(shared_from_this(), registered_pid_,
+                              registered_tree_id_);
+}
 
 BusService &bus_instance() {
   static BusService service;

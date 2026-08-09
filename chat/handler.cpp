@@ -628,9 +628,15 @@ private:
                     return;
                 }
                 if (reply == streamed_buffer) return;
+                if (streamed_buffer.size() >= reply.size() &&
+                    streamed_buffer.compare(
+                        streamed_buffer.size() - reply.size(),
+                        reply.size(), reply) == 0) {
+                    return;
+                }
                 if (!streamed_buffer.empty() &&
-                    reply.rfind(streamed_buffer, 0) == 0 &&
-                    reply.size() > streamed_buffer.size()) {
+                    reply.size() > streamed_buffer.size() &&
+                    reply.rfind(streamed_buffer, 0) == 0) {
                     send_to_client({{"type","token"},
                                     {"data", reply.substr(streamed_buffer.size())}});
                     return;

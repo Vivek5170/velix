@@ -10,7 +10,7 @@
       "use_https": false,
       "base_path": "/v1",
       "chat_completions_path": "/chat/completions",
-      "model": "qwen3.5-4b-mlx-lm-nvfp4",
+      "model": "qwen3.5-2b-mlx-lm-nvfp4",
       "enable_tools": true,
       "enable_streaming": true,
       "api_key_env": "",

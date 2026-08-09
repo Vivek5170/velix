@@ -5,14 +5,18 @@
 #include "storage/provider_factory.hpp"
 #include "tools/registry.hpp"
 
+#include "../communication/asio_framing.hpp"
 #include "../communication/network_config.hpp"
 #include "../communication/socket_wrapper.hpp"
+#include "../utils/asio_runtime.hpp"
 #include "../utils/config_utils.hpp"
 #include "../utils/logger.hpp"
 #include "../utils/string_utils.hpp"
 #include "../utils/thread_pool.hpp"
 #include "../utils/timer.hpp"
 #include "../communication/json_include.hpp"
+
+#include <asio.hpp>
 
 
 #include "adapters/factory.hpp"
@@ -223,13 +227,23 @@ using SignalHandler = void (*)(int);
 SignalHandler previous_sigint_handler = SIG_DFL;
 SignalHandler previous_sigterm_handler = SIG_DFL;
 
+static std::mutex scheduler_lifecycle_mutex;
+static std::condition_variable scheduler_lifecycle_cv;
+static velix::utils::AsioRuntime scheduler_runtime;
+static asio::ip::tcp::acceptor scheduler_acceptor{scheduler_runtime.context()};
+
 void shutdown_scheduler() {
   shutting_down.store(true);
   queue_cv.notify_all();
+  scheduler_lifecycle_cv.notify_all();
+  asio::error_code ec;
+  scheduler_acceptor.cancel(ec);
+  scheduler_acceptor.close(ec);
 }
 
 void handle_shutdown_signal(int signum) {
   shutting_down.store(true);
+  scheduler_lifecycle_cv.notify_all();
 
   SignalHandler previous =
       (signum == SIGINT) ? previous_sigint_handler : previous_sigterm_handler;
@@ -237,6 +251,91 @@ void handle_shutdown_signal(int signum) {
       previous != handle_shutdown_signal) {
     previous(signum);
   }
+}
+
+void handle_client_connection(velix::communication::SocketWrapper client_socket,
+                              const SchedulerConfig &cfg);
+
+void scheduler_accept_next(const SchedulerConfig &cfg,
+                           velix::utils::ThreadPool &lobby_pool) {
+  if (shutting_down.load()) {
+    return;
+  }
+  scheduler_acceptor.async_accept(
+      asio::make_strand(scheduler_runtime.context()),
+      [&cfg, &lobby_pool](const asio::error_code &ec,
+                          asio::ip::tcp::socket socket) {
+        if (shutting_down.load()) {
+          return;
+        }
+        if (ec) {
+          if (ec != asio::error::operation_aborted) {
+            LOG_WARN_CTX("Scheduler accept error: " + ec.message(), "scheduler",
+                         "", -1, "accept_error");
+          }
+        } else {
+          // Transfer ownership to a blocking SocketWrapper for the existing
+          // handle_client_connection handler. Use dup on POSIX to keep the
+          // asio socket's fd alive until the wrapper closes its copy.
+          bool dispatched = false;
+#if !defined(_WIN32) && !defined(_WIN64)
+          int raw_fd = static_cast<int>(socket.native_handle());
+          int dup_fd = ::dup(raw_fd);
+          if (dup_fd != -1) {
+            auto client_ptr =
+                std::make_shared<velix::communication::SocketWrapper>();
+            client_ptr->adopt_handle(dup_fd);
+            dispatched = lobby_pool.try_submit(
+                [client_ptr, cfg]() mutable {
+                  handle_client_connection(std::move(*client_ptr), cfg);
+                });
+            if (!dispatched) {
+              LOG_WARN(
+                  "Scheduler lobby pool capacity reached; shedding load.");
+              try {
+                json err = {{"message_type", "LLM_RESPONSE"},
+                            {"status", "error"},
+                            {"error", "scheduler_capacity_reached"}};
+                velix::communication::send_json(*client_ptr, err.dump());
+              } catch (...) {
+              }
+            }
+          } else {
+            LOG_WARN_CTX("Scheduler dup failed: " +
+                             std::string(strerror(errno)),
+                         "scheduler", "", -1, "accept_error");
+          }
+#else
+          // Windows: transfer ownership via release if available
+          try {
+            auto handle = socket.release();
+            auto client_ptr =
+                std::make_shared<velix::communication::SocketWrapper>();
+            client_ptr->adopt_handle(handle);
+            dispatched = lobby_pool.try_submit(
+                [client_ptr, cfg]() mutable {
+                  handle_client_connection(std::move(*client_ptr), cfg);
+                });
+            if (!dispatched) {
+              LOG_WARN(
+                  "Scheduler lobby pool capacity reached; shedding load.");
+              try {
+                json err = {{"message_type", "LLM_RESPONSE"},
+                            {"status", "error"},
+                            {"error", "scheduler_capacity_reached"}};
+                velix::communication::send_json(*client_ptr, err.dump());
+              } catch (...) {
+              }
+            }
+          } catch (const std::exception &e) {
+            LOG_WARN_CTX(std::string("Scheduler accept dispatch failed: ") +
+                             e.what(),
+                         "scheduler", "", -1, "accept_error");
+          }
+#endif
+        }
+        scheduler_accept_next(cfg, lobby_pool);
+      });
 }
 
 bool load_json_with_fallback(const std::vector<std::string> &paths, json &out) {
@@ -1249,7 +1348,7 @@ void release_tree_key(const std::string &queue_key) {
 }
 
 void worker_loop(const SchedulerConfig &cfg, int worker_id) {
-  LOG_INFO("Scheduler worker started: key_slot=" + std::to_string(worker_id));
+  LOG_INFO_CTX("Scheduler worker started: key_slot=" + std::to_string(worker_id), "scheduler", "", -1, "worker_start");
 
   while (true) {
     PendingRequest req;
@@ -1626,7 +1725,7 @@ void handle_client_connection(velix::communication::SocketWrapper client_socket,
     clear_request_if_current(trace_id, request_id);
 
   } catch (const std::exception &e) {
-    LOG_ERROR(std::string("Scheduler client handling error: ") + e.what());
+    LOG_ERROR_CTX(std::string("Scheduler client handling error: ") + e.what(), "scheduler", "", -1, "client_error");
     clear_request_if_current(current_trace, current_request_id);
     try {
       const json error = {{"message_type", "LLM_RESPONSE"},
@@ -1652,8 +1751,8 @@ void start_scheduler(int port) {
   const std::string bind_host =
       velix::communication::resolve_bind_host("SCHEDULER", "127.0.0.1");
 
-  LOG_INFO("Starting Scheduler on " + bind_host + ":" + std::to_string(port) +
-           " with max_llm_keys=" + std::to_string(cfg.max_llm_keys));
+  LOG_INFO_CTX("Starting Scheduler on " + bind_host + ":" + std::to_string(port) +
+           " with max_llm_keys=" + std::to_string(cfg.max_llm_keys), "scheduler", "", -1, "startup");
 
   // Task 19: Background thread that reloads tool manifests every 60 seconds
   // so newly installed tools are discovered without a full restart.
@@ -1674,48 +1773,45 @@ void start_scheduler(int port) {
     workers.emplace_back([cfg, i] { worker_loop(cfg, i); });
   }
 
-  velix::communication::SocketWrapper server_socket;
-  server_socket.create_tcp_socket();
-  server_socket.bind(bind_host, static_cast<uint16_t>(port));
-  server_socket.listen(64);
-
-  LOG_INFO("Scheduler listening on " + bind_host + ":" + std::to_string(port));
-
-  while (!shutting_down.load()) {
-    try {
-      if (!server_socket.has_data(250)) {
-        continue;
-      }
-      velix::communication::SocketWrapper client_socket =
-          server_socket.accept();
-
-      auto client_ptr = std::make_shared<velix::communication::SocketWrapper>(
-          std::move(client_socket));
-      bool submitted = lobby_pool.try_submit([client_ptr, cfg]() mutable {
-        handle_client_connection(std::move(*client_ptr), cfg);
-      });
-
-      if (!submitted) {
-        LOG_WARN("Scheduler lobby pool capacity reached; shedding load.");
-        try {
-          json error = {{"message_type", "LLM_RESPONSE"},
-                        {"status", "error"},
-                        {"error", "scheduler_capacity_reached"}};
-          // Note: accessing *client_ptr is safe here as the lambda hasn't run
-          // yet or we own the only copy if it failed
-          velix::communication::send_json(*client_ptr, error.dump());
-        } catch (...) {
-        }
-      }
-    } catch (const std::exception &e) {
-      if (shutting_down.load()) {
-        break;
-      }
-      LOG_WARN(std::string("Scheduler accept error: ") + e.what());
+  // ASIO async acceptor replaces the 250ms has_data poll loop.
+  try {
+    if (scheduler_acceptor.is_open()) {
+      asio::error_code ec;
+      scheduler_acceptor.close(ec);
     }
+    asio::ip::tcp::endpoint endpoint(
+        asio::ip::make_address(bind_host),
+        static_cast<unsigned short>(port));
+    scheduler_acceptor.open(endpoint.protocol());
+    scheduler_acceptor.set_option(asio::socket_base::reuse_address(true));
+    scheduler_acceptor.bind(endpoint);
+    scheduler_acceptor.listen(64);
+  } catch (const std::exception &e) {
+    LOG_ERROR_CTX("Scheduler failed to bind: " + std::string(e.what()),
+                  "scheduler", "", -1, "startup_failure");
+    return;
   }
 
-  shutdown_scheduler();
+  LOG_INFO_CTX("Scheduler listening on " + bind_host + ":" + std::to_string(port), "scheduler", "", -1, "listen");
+
+  scheduler_runtime.start(4);
+  scheduler_accept_next(cfg, lobby_pool);
+
+  {
+    std::unique_lock<std::mutex> lock(scheduler_lifecycle_mutex);
+    scheduler_lifecycle_cv.wait(lock,
+                                [] { return shutting_down.load(); });
+  }
+
+  {
+    asio::error_code ec;
+    scheduler_acceptor.cancel(ec);
+    scheduler_acceptor.close(ec);
+  }
+  scheduler_runtime.stop();
+
+  // Ensure queue workers wake up for shutdown.
+  queue_cv.notify_all();
 
   for (auto &worker : workers) {
     if (worker.joinable()) {

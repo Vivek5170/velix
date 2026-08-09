@@ -480,7 +480,7 @@ public:
                 server_socket_->bind(host, static_cast<uint16_t>(port));
                 server_socket_->listen(256);
             }
-            LOG_INFO("Executioner listening on " + host + ":" + std::to_string(port));
+            LOG_INFO_CTX("Executioner listening on " + host + ":" + std::to_string(port), "executioner", "", -1, "listen");
 
             while (running_) {
 #ifndef _WIN32
@@ -1087,7 +1087,7 @@ private:
             if (req.is_null()) return;
             response = handle_exec_request(req);
         } catch (const std::exception &e) {
-            LOG_WARN("handle_client exception: " + std::string(e.what()));
+            LOG_WARN_CTX("handle_client exception: " + std::string(e.what()), "executioner", "", -1, "client_error");
             response = {{"status", "error"},
                         {"error", std::string("executioner_client_exception: ") +
                                       e.what()}};

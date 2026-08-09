@@ -85,6 +85,10 @@ set(KERNEL_SOURCES
 
 # Target: integration_kernel
 add_executable(integration_kernel integration_kernel.cpp ${KERNEL_SOURCES})
+target_include_directories(integration_kernel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/asio
+)
+target_compile_definitions(integration_kernel PRIVATE ASIO_STANDALONE)
 target_link_libraries(integration_kernel PRIVATE Threads::Threads)
 target_link_libraries(integration_kernel PRIVATE ${VELIX_SQLITE_TARGET})
 if(WIN32)
@@ -111,5 +115,4 @@ target_link_libraries(chat_handler PRIVATE ${VELIX_SQLITE_TARGET})
 if(WIN32)
     target_link_libraries(chat_handler PRIVATE ws2_32)
 endif()
-
 

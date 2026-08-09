@@ -539,16 +539,17 @@ void VelixProcess::start(int override_pid,
 
       bus_listener_thread = std::thread(&VelixProcess::bus_listener_loop, this);
     } catch (const std::exception &e) {
-      LOG_WARN("Failed to connect to Velix Bus: " + std::string(e.what()));
+      LOG_WARN_CTX("Failed to connect to Velix Bus: " + std::string(e.what()), "velix_process", tree_id, velix_pid, "bus_connect_fail");
     }
   }
 
   status.store(ProcessStatus::RUNNING);
 
-  LOG_INFO("Velix Node Started | PID: " + std::to_string(os_pid) + " -> " +
+  LOG_INFO_CTX("Velix Process Started | OS PID: " + std::to_string(os_pid) + " -> Velix PID: " +
            std::to_string(velix_pid) + " | Role: " + role +
            (is_root ? " (ROOT)" : "") + " | Parent PID: " +
-           std::to_string(parent_pid) + " | Launch Intent: " + launch_intent);
+           std::to_string(parent_pid) + " | Launch Intent: " + launch_intent,
+           "velix_process", tree_id, velix_pid, "started");
 
   // Spawn the detached async Kernel IO Thread
   runtime_io_thread = std::thread(&VelixProcess::run_kernel_io_loop, this);
@@ -677,9 +678,9 @@ void VelixProcess::bus_listener_loop() {
             try {
               on_bus_event(msg);
             } catch (const std::exception &e) {
-              LOG_WARN("on_bus_event hook failed: " + std::string(e.what()));
+              LOG_WARN_CTX("on_bus_event hook failed: " + std::string(e.what()), "velix_process", tree_id, velix_pid, "hook_error");
             } catch (...) {
-              LOG_WARN("on_bus_event hook failed with unknown exception");
+              LOG_WARN_CTX("on_bus_event hook failed with unknown exception", "velix_process", tree_id, velix_pid, "hook_error");
             }
           }
         } else if (msg.value("status", std::string("")) == "error") {
@@ -700,14 +701,14 @@ void VelixProcess::bus_listener_loop() {
       }
     }
   } catch (const std::exception &e) {
-    LOG_WARN("Velix Bus connection lost: " + std::string(e.what()));
+    LOG_WARN_CTX("Velix Bus connection lost: " + std::string(e.what()), "velix_process", tree_id, velix_pid, "bus_disconnect");
     {
       std::lock_guard<std::mutex> lock(queue_mutex);
       is_running = false;
       queue_cv.notify_all();
     }
   } catch (...) {
-    LOG_WARN("Velix Bus connection lost due to unknown error");
+    LOG_WARN_CTX("Velix Bus connection lost due to unknown error", "velix_process", tree_id, velix_pid, "bus_disconnect");
     {
       std::lock_guard<std::mutex> lock(queue_mutex);
       is_running = false;

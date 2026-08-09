@@ -29,7 +29,7 @@ void request_shutdown_once() {
     return;
   }
 
-  LOG_INFO("Integration kernel shutdown requested");
+  LOG_INFO_CTX("Integration kernel shutdown requested", "kernel", "", -1, "shutdown");
   velix::core::stop_supervisor();
   velix::llm::stop_scheduler();
   velix::app_manager::stop_application_manager();
@@ -74,12 +74,12 @@ int main() {
   const int scheduler_port = velix::utils::get_port("LLM_SCHEDULER", 5171);
   const int app_manager_port = velix::utils::get_port("APP_MANAGER", 5175);
 
-  LOG_INFO("Integration kernel starting...");
-  LOG_INFO("Supervisor Port: " + std::to_string(supervisor_port));
-  LOG_INFO("Bus Port: " + std::to_string(bus_port));
-  LOG_INFO("Executioner Port: " + std::to_string(executioner_port));
-  LOG_INFO("Scheduler Port: " + std::to_string(scheduler_port));
-  LOG_INFO("ApplicationManager Port: " + std::to_string(app_manager_port));
+  LOG_INFO_CTX("Integration kernel starting...", "kernel", "", -1, "startup");
+  LOG_INFO_CTX("Supervisor Port: " + std::to_string(supervisor_port), "kernel", "", -1, "config");
+  LOG_INFO_CTX("Bus Port: " + std::to_string(bus_port), "kernel", "", -1, "config");
+  LOG_INFO_CTX("Executioner Port: " + std::to_string(executioner_port), "kernel", "", -1, "config");
+  LOG_INFO_CTX("Scheduler Port: " + std::to_string(scheduler_port), "kernel", "", -1, "config");
+  LOG_INFO_CTX("ApplicationManager Port: " + std::to_string(app_manager_port), "kernel", "", -1, "config");
 
   std::thread bus_thread([bus_port]() { velix::core::start_bus(bus_port); });
   std::thread executioner_thread([executioner_port]() {
@@ -87,7 +87,7 @@ int main() {
       velix::core::start_executioner(executioner_port);
     } catch (const std::exception &e) {
       if (!shutdown_requested().load()) {
-        LOG_ERROR("Executioner thread failed: " + std::string(e.what()));
+        LOG_ERROR_CTX("Executioner thread failed: " + std::string(e.what()), "kernel", "", -1, "startup_error");
       }
     }
   });
@@ -100,8 +100,9 @@ int main() {
       !wait_for_service("EXECUTIONER", executioner_port) ||
       !wait_for_service("SCHEDULER", scheduler_port) ||
       !wait_for_service("APP_MANAGER", app_manager_port)) {
-    LOG_ERROR(
-        "Integration kernel startup failed: timed out waiting for services");
+    LOG_ERROR_CTX(
+        "Integration kernel startup failed: timed out waiting for services",
+        "kernel", "", -1, "startup_error");
     request_shutdown_once();
 
     if (bus_thread.joinable()) {
@@ -129,7 +130,7 @@ int main() {
   try {
     velix::core::start_supervisor(supervisor_port);
   } catch (const std::exception &e) {
-    LOG_ERROR(std::string("Supervisor thread failed: ") + e.what());
+    LOG_ERROR_CTX(std::string("Supervisor thread failed: ") + e.what(), "kernel", "", -1, "startup_error");
     if (!shutdown_requested().load()) {
       request_shutdown_once();
     }

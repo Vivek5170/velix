@@ -379,6 +379,22 @@ public:
 
   bool is_open() const { return socket_handle != INVALID_SOCKET_HANDLE; }
 
+  void adopt_handle(SocketHandle handle) {
+    close();
+    socket_handle = handle;
+#ifndef _WIN32
+    if (socket_handle != INVALID_SOCKET_HANDLE) {
+      set_close_on_exec(socket_handle);
+    }
+#endif
+  }
+
+  SocketHandle release_handle() {
+    SocketHandle handle = socket_handle;
+    socket_handle = INVALID_SOCKET_HANDLE;
+    return handle;
+  }
+
   bool has_data(int timeout_ms = 0) const {
     if (socket_handle == INVALID_SOCKET_HANDLE)
       return false;
